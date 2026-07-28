@@ -35,6 +35,7 @@ from ditto.api_models import ConfirmationScoreRecord, LedgerEntry, LedgerRespons
 from ditto.api_models.upload import _SS58_PATTERN
 from ditto.api_models.validator import LedgerScoreProof
 from ditto.api_server.continual_retest_settings import aggregate_is_active
+from ditto.api_server.crn import champion_anchored_seeds
 from ditto.api_server.efficiency import effective_composite
 from ditto.api_server.endpoints.validator import (
     ChainDep,
@@ -43,7 +44,12 @@ from ditto.api_server.endpoints.validator import (
     _assert_validator_permitted,
     _verify_signature,
 )
-from ditto.api_server.koth import KothEntry, emission_set, project_koth
+from ditto.api_server.koth import (
+    TOP5_MAX_CONFIRMATION_SEEDS,
+    KothEntry,
+    emission_set,
+    project_koth,
+)
 from ditto.db.models import Score
 from ditto.db.queries.benchmark_rollout import active_bench_version
 from ditto.db.queries.confirmation_scores import (
@@ -363,6 +369,9 @@ async def scores(
     # Per agent, because ``per_agent`` membership gives each agent a different
     # eligible set. Under ``strict`` and ``participants`` every entry maps to the
     # same intersection, so this is the previous single set spelled per row.
+    # Anchored on the reigning champion so the intersection is taken over the
+    # current wave's seeds rather than the whole cross-reign trail; this ledger
+    # is what validators fold, so it has to scope identically to the board.
     eligible_seeds = fold_eligible_seeds_by_agent(
         member_ids=raw_member_ids or history.keys(),
         seeds_by_agent={
@@ -370,6 +379,15 @@ async def scores(
             for agent_id, agent_history in history.items()
         },
         mode=continual_settings.wave_membership,
+        anchored_seeds=(
+            champion_anchored_seeds(
+                raw_member_ids[0],
+                version=canonical_version,
+                max_seeds=TOP5_MAX_CONFIRMATION_SEEDS,
+            )
+            if raw_member_ids
+            else None
+        ),
     )
     generated_at = datetime.now(UTC)
     entries = [

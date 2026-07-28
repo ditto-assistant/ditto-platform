@@ -43,6 +43,7 @@ from ditto.api_models.stack_health import (
 )
 from ditto.api_models.ticket_status import TicketPurpose, TicketStatus
 from ditto.api_server.bench import CURRENT_BENCH_VERSION
+from ditto.api_server.crn import champion_anchored_seeds
 from ditto.api_server.datapipeline import DataPipelineError
 from ditto.api_server.dependencies import (
     get_dataset_generator,
@@ -51,6 +52,7 @@ from ditto.api_server.dependencies import (
 )
 from ditto.api_server.endpoints import public as public_endpoint
 from ditto.api_server.endpoints.public import _fleet_classification
+from ditto.api_server.koth import TOP5_MAX_CONFIRMATION_SEEDS
 from ditto.api_server.storage import ObjectDownloadFailedError
 from ditto.api_server.validator_names import ValidatorNamesSnapshot
 from ditto.chain import ChainError
@@ -88,6 +90,23 @@ from ditto.db.queries.scores import upsert_score
 _MINER_A = "5DhaT8U7LVwnnJNUU8VL1XEipicatoaDVVq7cHo227gogVZm"
 _MINER_B = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
 _VALIDATOR_C = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
+
+
+def _anchor_seeds(champion_id: str, count: int = 3) -> tuple[int, ...]:
+    """The first ``count`` CRN seeds the given champion's reign anchors on.
+
+    Fixtures cannot invent seed values any more. The fold is scoped to the
+    reigning champion's anchor, so rows on seeds no champion would ever issue
+    are precisely the stale-reign evidence that scoping exists to exclude --
+    a fixture using them would assert against a wave the lane cannot produce.
+    """
+    return tuple(
+        champion_anchored_seeds(
+            UUID(champion_id),
+            version=DEFAULT_BENCH_VERSION,
+            max_seeds=TOP5_MAX_CONFIRMATION_SEEDS,
+        )[:count]
+    )
 
 
 def _scorer_capabilities(now: datetime, *, versions: list[int]) -> dict:
@@ -1118,7 +1137,7 @@ class TestPublicLeaderboard:
                         None,
                     )
                     for agent_id in (champion_id, tail_id)
-                    for seed in (100, 200, 300)
+                    for seed in _anchor_seeds(champion_id)
                 ],
                 bench_version=DEFAULT_BENCH_VERSION,
                 created_at=datetime.now(UTC),
@@ -1250,7 +1269,7 @@ class TestPublicLeaderboard:
                         None,
                     )
                     for agent_id in (champion_id, tail_id)
-                    for seed in (100, 200, 300)
+                    for seed in _anchor_seeds(champion_id)
                 ],
                 bench_version=DEFAULT_BENCH_VERSION,
                 created_at=datetime.now(UTC),
@@ -1273,7 +1292,13 @@ class TestPublicLeaderboard:
         entrant_id = await _seed_k3(
             session_maker,
             miner="5Cq" + "z" * 45,
-            composites=[0.95, 0.95, 0.95],
+            # Joins the TAIL, below the incumbent: these tests are about a
+            # membership change, and only a change that leaves the champion (and
+            # therefore the anchor) in place isolates that. A dethroning entrant
+            # would also reset the fold, but for the unrelated reason that it
+            # re-anchors the seed set -- pinned separately in
+            # ``test_a_dethrone_resets_the_fold_but_keeps_the_audit_trail``.
+            composites=[0.85, 0.85, 0.85],
             details={"bench_version": DEFAULT_BENCH_VERSION},
             created_at=datetime(2026, 6, 3, tzinfo=UTC),
         )
@@ -1294,6 +1319,267 @@ class TestPublicLeaderboard:
         assert entries[tail_id]["confirmation_seed_depth"] == 3
         assert entries[entrant_id]["confirmation_seed_depth"] == 0
         assert entries[entrant_id]["confirmation_seed_composites"] == []
+
+    async def test_stale_anchor_history_does_not_empty_the_current_wave(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """A member's rows from a PREVIOUS reign must not erase the live wave.
+
+        Production, 2026-07-27: the board showed every emission recipient at
+        ``shared_seed_confirmations: 0`` and "wave pending" while the lane was
+        demonstrably running -- one member carried 39 accepted seeds against a
+        16-seed-per-reign cap, i.e. three champions' worth of trail.
+
+        The anchor is a pure function of the champion's agent id, so successive
+        reigns produce disjoint seed sets. The fold intersected the RAW trail,
+        so that deep member was admitted by the ``participants`` predicate on
+        rows the current champion never anchored, and then intersected to
+        nothing. Board-wide zero, ``official_composite`` reverted to the quorum
+        median, and the fold's accumulated evidence silently stopped counting --
+        while the lane kept spending validator slots refilling a wave that could
+        never complete.
+
+        The reproduction below is that shape exactly: two members holding the
+        live anchor's seeds, and a third holding ONLY a foreign anchor's. The
+        third is the one that did the damage -- deep enough to look like a
+        participant, holding nothing the intersection could keep.
+        """
+        from ditto.db.models import ContinualRetestSettingsRevision
+        from ditto.db.queries.confirmation_scores import (
+            ConfirmationSeedScore,
+            append_confirmation_scores,
+        )
+
+        champion_id = await _seed_k3(
+            session_maker,
+            miner=_MINER_A,
+            composites=[0.90, 0.90, 0.90],
+            details={"bench_version": DEFAULT_BENCH_VERSION},
+            created_at=datetime(2026, 6, 1, tzinfo=UTC),
+        )
+        tail_id = await _seed_k3(
+            session_maker,
+            miner=_MINER_B,
+            composites=[0.80, 0.80, 0.80],
+            details={"bench_version": DEFAULT_BENCH_VERSION},
+            created_at=datetime(2026, 6, 2, tzinfo=UTC),
+        )
+        # The lihai analogue: deep trail, none of it on the current anchor.
+        stale_only_id = await _seed_k3(
+            session_maker,
+            miner="5Cq" + "z" * 45,
+            composites=[0.70, 0.70, 0.70],
+            details={"bench_version": DEFAULT_BENCH_VERSION},
+            created_at=datetime(2026, 6, 3, tzinfo=UTC),
+        )
+        # A reign this board never had: seeds anchored on some other agent, the
+        # way a dethroned champion's trail survives in the append-only table.
+        stale_seeds = _anchor_seeds(str(uuid4()), count=8)
+        live_seeds = _anchor_seeds(champion_id)
+        assert not set(stale_seeds) & set(live_seeds)
+
+        async with session_maker() as s, s.begin():
+            now = datetime.now(UTC)
+            s.add(
+                ValidatorHeartbeat(
+                    validator_hotkey=_VALIDATOR_C,
+                    software_version="0.28.0",
+                    protocol_version=14,
+                    code_digest="ab" * 32,
+                    state="idle",
+                    reported_at=now,
+                    seen_at=now,
+                    signature="cd" * 64,
+                    capabilities=_scorer_capabilities(
+                        now, versions=[DEFAULT_BENCH_VERSION]
+                    ),
+                )
+            )
+            s.add(
+                ContinualRetestSettingsRevision(
+                    parent_revision=0,
+                    scope="*",
+                    settings={
+                        "aggregate_mode": "fleet_ready",
+                        "idle_retests_enabled": False,
+                        "wave_membership": "participants",
+                    },
+                    checksum="f" * 64,
+                    reason="anchor-scoped fold",
+                    actor="operator@example.com",
+                )
+            )
+            await append_confirmation_scores(
+                s,
+                rows=[
+                    ConfirmationSeedScore(
+                        UUID(agent_id),
+                        "5V1",
+                        seed,
+                        0.60,
+                        f"r{agent_id}-{seed}",
+                        None,
+                    )
+                    for agent_id in (champion_id, tail_id)
+                    for seed in live_seeds
+                ]
+                + [
+                    ConfirmationSeedScore(
+                        UUID(stale_only_id),
+                        "5V1",
+                        seed,
+                        0.10,
+                        f"stale-{stale_only_id}-{seed}",
+                        None,
+                    )
+                    for seed in stale_seeds
+                ],
+                bench_version=DEFAULT_BENCH_VERSION,
+                created_at=datetime.now(UTC),
+            )
+        _install_db(app, session_maker)
+        app.state.session_maker = session_maker
+        app.state.continual_retest_settings.invalidate()
+
+        body = (await client.get("/api/v1/public/leaderboard")).json()
+        entries = {entry["agent_id"]: entry for entry in body["entries"]}
+
+        # The live wave counts. Before the anchor filter the stale-only member
+        # emptied the intersection and this was 0 board-wide.
+        assert entries[champion_id]["completed_wave_count"] == 3
+        assert entries[tail_id]["completed_wave_count"] == 3
+        assert entries[champion_id]["aggregate_method"] == "continual_mean"
+        assert entries[tail_id]["aggregate_method"] == "continual_mean"
+        # Equal sample composition: both averaged the same three live seeds.
+        assert entries[champion_id]["completed_wave_composites"] == pytest.approx(
+            [0.60, 0.60, 0.60]
+        )
+        assert entries[tail_id]["completed_wave_composites"] == pytest.approx(
+            [0.60, 0.60, 0.60]
+        )
+        # The stale-only member holds nothing on this anchor, so it stays on the
+        # quorum median -- its 0.10 rows never reach any aggregate.
+        assert entries[stale_only_id]["completed_wave_count"] == 0
+        assert entries[stale_only_id]["aggregate_method"] == "canonical_median"
+        assert entries[stale_only_id]["official_composite"] == pytest.approx(0.70)
+        # ...but the append-only audit trail is still reported in full.
+        assert entries[stale_only_id]["confirmation_seed_depth"] == 8
+
+    async def test_a_dethrone_resets_the_fold_but_keeps_the_audit_trail(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """The companion boundary: a dethrone genuinely does reset the wave.
+
+        The anchor moves with the crown, so the incoming champion's seed set is
+        disjoint from the outgoing one and none of the accumulated evidence is
+        comparable any more. Collapsing to the quorum median is the honest
+        answer here -- unlike a tail membership change, where ``participants``
+        keeps the wave alive because the anchor never moved.
+
+        The audit trail must survive it regardless (#485).
+        """
+        from ditto.db.models import ContinualRetestSettingsRevision
+        from ditto.db.queries.confirmation_scores import (
+            ConfirmationSeedScore,
+            append_confirmation_scores,
+        )
+
+        champion_id = await _seed_k3(
+            session_maker,
+            miner=_MINER_A,
+            composites=[0.90, 0.90, 0.90],
+            details={"bench_version": DEFAULT_BENCH_VERSION},
+            created_at=datetime(2026, 6, 1, tzinfo=UTC),
+        )
+        tail_id = await _seed_k3(
+            session_maker,
+            miner=_MINER_B,
+            composites=[0.80, 0.80, 0.80],
+            details={"bench_version": DEFAULT_BENCH_VERSION},
+            created_at=datetime(2026, 6, 2, tzinfo=UTC),
+        )
+        async with session_maker() as s, s.begin():
+            now = datetime.now(UTC)
+            s.add(
+                ValidatorHeartbeat(
+                    validator_hotkey=_VALIDATOR_C,
+                    software_version="0.28.0",
+                    protocol_version=14,
+                    code_digest="ab" * 32,
+                    state="idle",
+                    reported_at=now,
+                    seen_at=now,
+                    signature="cd" * 64,
+                    capabilities=_scorer_capabilities(
+                        now, versions=[DEFAULT_BENCH_VERSION]
+                    ),
+                )
+            )
+            s.add(
+                ContinualRetestSettingsRevision(
+                    parent_revision=0,
+                    scope="*",
+                    settings={
+                        "aggregate_mode": "fleet_ready",
+                        "idle_retests_enabled": False,
+                        "wave_membership": "participants",
+                    },
+                    checksum="a" * 64,
+                    reason="anchor-scoped fold",
+                    actor="operator@example.com",
+                )
+            )
+            await append_confirmation_scores(
+                s,
+                rows=[
+                    ConfirmationSeedScore(
+                        UUID(agent_id),
+                        "5V1",
+                        seed,
+                        0.60,
+                        f"r{agent_id}-{seed}",
+                        None,
+                    )
+                    for agent_id in (champion_id, tail_id)
+                    for seed in _anchor_seeds(champion_id)
+                ],
+                bench_version=DEFAULT_BENCH_VERSION,
+                created_at=datetime.now(UTC),
+            )
+        _install_db(app, session_maker)
+        app.state.session_maker = session_maker
+        app.state.continual_retest_settings.invalidate()
+
+        before = (await client.get("/api/v1/public/leaderboard")).json()
+        settled = {entry["agent_id"]: entry for entry in before["entries"]}
+        assert settled[champion_id]["completed_wave_count"] == 3
+        assert settled[champion_id]["aggregate_method"] == "continual_mean"
+
+        # Takes the crown outright: 0.95 clears 0.90 by far more than the margin.
+        usurper_id = await _seed_k3(
+            session_maker,
+            miner="5Cq" + "z" * 45,
+            composites=[0.95, 0.95, 0.95],
+            details={"bench_version": DEFAULT_BENCH_VERSION},
+            created_at=datetime(2026, 6, 3, tzinfo=UTC),
+        )
+
+        after = (await client.get("/api/v1/public/leaderboard")).json()
+        entries = {entry["agent_id"]: entry for entry in after["entries"]}
+        assert entries[usurper_id]["rank"] == 1
+        # Re-anchored: nothing accumulated under the old crown is comparable.
+        assert entries[champion_id]["completed_wave_count"] == 0
+        assert entries[champion_id]["aggregate_method"] == "canonical_median"
+        assert entries[champion_id]["official_composite"] == pytest.approx(0.90)
+        # ...but the accepted rows were never deleted.
+        assert entries[champion_id]["confirmation_seed_depth"] == 3
+        assert entries[tail_id]["confirmation_seed_depth"] == 3
 
     async def test_participants_membership_keeps_the_fold_on_the_continual_mean(
         self,
@@ -1379,7 +1665,7 @@ class TestPublicLeaderboard:
                         None,
                     )
                     for agent_id in (champion_id, tail_id)
-                    for seed in (100, 200, 300)
+                    for seed in _anchor_seeds(champion_id)
                 ],
                 bench_version=DEFAULT_BENCH_VERSION,
                 created_at=datetime.now(UTC),
@@ -1391,7 +1677,13 @@ class TestPublicLeaderboard:
         entrant_id = await _seed_k3(
             session_maker,
             miner="5Cq" + "z" * 45,
-            composites=[0.95, 0.95, 0.95],
+            # Joins the TAIL, below the incumbent: these tests are about a
+            # membership change, and only a change that leaves the champion (and
+            # therefore the anchor) in place isolates that. A dethroning entrant
+            # would also reset the fold, but for the unrelated reason that it
+            # re-anchors the seed set -- pinned separately in
+            # ``test_a_dethrone_resets_the_fold_but_keeps_the_audit_trail``.
+            composites=[0.85, 0.85, 0.85],
             details={"bench_version": DEFAULT_BENCH_VERSION},
             created_at=datetime(2026, 6, 3, tzinfo=UTC),
         )
@@ -1412,7 +1704,7 @@ class TestPublicLeaderboard:
         # the same estimator every agent outside the emission set already uses.
         assert entries[entrant_id]["completed_wave_count"] == 0
         assert entries[entrant_id]["aggregate_method"] == "canonical_median"
-        assert entries[entrant_id]["official_composite"] == pytest.approx(0.95)
+        assert entries[entrant_id]["official_composite"] == pytest.approx(0.85)
         # And the raw audit trail from #485 is still there underneath.
         assert entries[champion_id]["confirmation_seed_depth"] == 3
 
@@ -1488,7 +1780,7 @@ class TestPublicLeaderboard:
                         None,
                     )
                     for agent_id, value in wave_scores.items()
-                    for seed in (100, 200, 300)
+                    for seed in _anchor_seeds(median_leader_id)
                 ],
                 bench_version=DEFAULT_BENCH_VERSION,
                 created_at=datetime.now(UTC),
@@ -1615,7 +1907,7 @@ class TestPublicLeaderboard:
                         None,
                     )
                     for agent_id in (champion_id, tail_id)
-                    for seed in (100, 200, 300)
+                    for seed in _anchor_seeds(champion_id)
                 ],
                 bench_version=DEFAULT_BENCH_VERSION,
                 created_at=datetime.now(UTC),
@@ -1627,7 +1919,13 @@ class TestPublicLeaderboard:
         await _seed_k3(
             session_maker,
             miner="5Cq" + "z" * 45,
-            composites=[0.95, 0.95, 0.95],
+            # Joins the TAIL, below the incumbent: these tests are about a
+            # membership change, and only a change that leaves the champion (and
+            # therefore the anchor) in place isolates that. A dethroning entrant
+            # would also reset the fold, but for the unrelated reason that it
+            # re-anchors the seed set -- pinned separately in
+            # ``test_a_dethrone_resets_the_fold_but_keeps_the_audit_trail``.
+            composites=[0.85, 0.85, 0.85],
             details={"bench_version": DEFAULT_BENCH_VERSION},
             created_at=datetime(2026, 6, 3, tzinfo=UTC),
         )
