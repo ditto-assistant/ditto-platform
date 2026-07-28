@@ -4482,7 +4482,7 @@ class TestRequestJob:
             assert await _fresh_submission_lane_due(
                 session,
                 validator_hotkey=validator_hotkey,
-                bench_version=3,
+                bench_version=_BENCH_VERSION,
                 rollout_started_at=started_at,
                 settings=QueuePolicySettings(),
             )
@@ -4502,7 +4502,7 @@ class TestRequestJob:
                 session.add(
                     ValidatorTicket(
                         agent_id=agent_id,
-                        bench_version=3,
+                        bench_version=_BENCH_VERSION,
                         validator_hotkey=validator_hotkey,
                         status=TicketStatus.SCORED,
                         issued_at=started_at,
@@ -4515,7 +4515,7 @@ class TestRequestJob:
                 due = await _fresh_submission_lane_due(
                     session,
                     validator_hotkey=validator_hotkey,
-                    bench_version=3,
+                    bench_version=_BENCH_VERSION,
                     rollout_started_at=started_at,
                     settings=QueuePolicySettings(),
                 )
@@ -4840,14 +4840,16 @@ class TestRequestJob:
             assert legacy_ticket is not None
             assert legacy_ticket.status == TicketStatus.EXPIRED
 
-    async def test_after_activation_new_submission_finalizes_on_three_v3_scores(
+    async def test_after_activation_new_submission_finalizes_on_three_scores(
         self,
         app: FastAPI,
         client: httpx.AsyncClient,
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
         agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
-        await self._activate_benchmark(session_maker, agent_id, bench_version=3)
+        await self._activate_benchmark(
+            session_maker, agent_id, bench_version=_BENCH_VERSION
+        )
         capabilities = self._v8_capabilities()
         for keypair in _KEYPAIRS:
             await _seed_validator_heartbeat(
@@ -4867,7 +4869,7 @@ class TestRequestJob:
                 json=_job_payload(keypair),
             )
             assert job.status_code == 200, job.text
-            assert job.json()["bench_version"] == 3
+            assert job.json()["bench_version"] == _BENCH_VERSION
             assert job.json()["minimum_screening_policy_version"] == 9
             assert job.json()["requires_screened_image"] is True
             deadline = datetime.fromisoformat(job.json()["deadline"])
@@ -4878,7 +4880,7 @@ class TestRequestJob:
                     run_id=f"v3-{index}",
                     keypair=keypair,
                     ticket_deadline=deadline,
-                    bench_version=3,
+                    bench_version=_BENCH_VERSION,
                     n=114,
                     details={"bench_version": 3},
                 ),
@@ -4892,7 +4894,8 @@ class TestRequestJob:
                 (
                     await session.execute(
                         select(Score).where(
-                            Score.agent_id == agent_id, Score.bench_version == 3
+                            Score.agent_id == agent_id,
+                            Score.bench_version == _BENCH_VERSION,
                         )
                     )
                 )
