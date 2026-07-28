@@ -4698,6 +4698,39 @@ class TestRequestJob:
         )
         assert resp.status_code == 204
 
+    async def test_no_work_is_counted_as_an_empty_queue_not_a_refusal(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """An idle fleet has to be readable off the metric, not off raw SQL.
+
+        This poll clears every gate and finds nothing to hand out, which is the
+        one decline an operator must be able to tell apart from dispatch
+        refusing to issue -- the reasons look identical over the wire.
+        """
+        from prometheus_client import REGISTRY
+
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        def counted(reason: str) -> float:
+            return (
+                REGISTRY.get_sample_value(
+                    "ditto_validator_dispatch_declined_total", {"reason": reason}
+                )
+                or 0.0
+            )
+
+        before = counted("no_candidate")
+        resp = await client.post(
+            "/api/v1/validator/job", headers=_AUTH_HEADER, json=_job_payload()
+        )
+
+        assert resp.status_code == 204
+        assert counted("no_candidate") == before + 1
+
     async def test_caps_at_quorum_across_validators(
         self,
         app: FastAPI,
