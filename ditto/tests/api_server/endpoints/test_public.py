@@ -1320,6 +1320,123 @@ class TestPublicLeaderboard:
         assert entries[entrant_id]["confirmation_seed_depth"] == 0
         assert entries[entrant_id]["confirmation_seed_composites"] == []
 
+    async def test_reports_the_depth_a_non_member_actually_folded(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """What the board reports must be what the arithmetic used.
+
+        Production, 2026-07-28: nine agents showed ``completed_wave_count: 0``
+        and ``aggregate_method: canonical_median`` while their
+        ``official_composite`` had demonstrably moved off the quorum median --
+        maybe-v0 sat at rank 4 on a folded 0.8697 against a raw 0.8350, with ten
+        wave composites in the payload and a zero beside them. Miners read that
+        as "my retests are being discarded"; the runs had in fact all counted.
+
+        The cause is that the fold has two different member sets.
+        ``by_seed`` is filtered per agent and never restricted to the emission
+        set, so any agent holding the shared seeds folds them. The depth was
+        keyed off ``raw_members`` -- the RAW-composite top five -- and an agent
+        outside it got a hard zero regardless of what it had averaged. The two
+        sets legitimately differ (emissions project from effective composites,
+        the intersection from raw), so the depth has to come from the eligible
+        seeds themselves, not from membership in either one.
+        """
+        from ditto.db.models import ContinualRetestSettingsRevision
+        from ditto.db.queries.confirmation_scores import (
+            ConfirmationSeedScore,
+            append_confirmation_scores,
+        )
+
+        # Six distinct miners: the RAW top five plus one below the cut.
+        ladder = [
+            (f"5Ck{chr(ord('a') + index)}" + "y" * 44, composite)
+            for index, composite in enumerate([0.90, 0.88, 0.86, 0.84, 0.82, 0.80])
+        ]
+        agent_ids = [
+            await _seed_k3(
+                session_maker,
+                miner=miner,
+                composites=[composite] * 3,
+                details={"bench_version": DEFAULT_BENCH_VERSION},
+                created_at=datetime(2026, 6, 1, tzinfo=UTC) + timedelta(days=index),
+            )
+            for index, (miner, composite) in enumerate(ladder)
+        ]
+        champion_id, *rest = agent_ids
+        outsider_id = agent_ids[-1]
+        live_seeds = _anchor_seeds(champion_id)
+
+        async with session_maker() as s, s.begin():
+            now = datetime.now(UTC)
+            s.add(
+                ValidatorHeartbeat(
+                    validator_hotkey=_VALIDATOR_C,
+                    software_version="0.28.0",
+                    protocol_version=14,
+                    code_digest="ab" * 32,
+                    state="idle",
+                    reported_at=now,
+                    seen_at=now,
+                    signature="cd" * 64,
+                    capabilities=_scorer_capabilities(
+                        now, versions=[DEFAULT_BENCH_VERSION]
+                    ),
+                )
+            )
+            s.add(
+                ContinualRetestSettingsRevision(
+                    parent_revision=0,
+                    scope="*",
+                    settings={
+                        "aggregate_mode": "fleet_ready",
+                        "idle_retests_enabled": False,
+                        "wave_membership": "participants",
+                    },
+                    checksum="b" * 64,
+                    reason="report folded depth",
+                    actor="operator@example.com",
+                )
+            )
+            # Every agent, INCLUDING the one below the raw cut, runs the wave.
+            await append_confirmation_scores(
+                s,
+                rows=[
+                    ConfirmationSeedScore(
+                        UUID(agent_id),
+                        "5V1",
+                        seed,
+                        0.60,
+                        f"r{agent_id}-{seed}",
+                        None,
+                    )
+                    for agent_id in agent_ids
+                    for seed in live_seeds
+                ],
+                bench_version=DEFAULT_BENCH_VERSION,
+                created_at=datetime.now(UTC),
+            )
+        _install_db(app, session_maker)
+        app.state.session_maker = session_maker
+        app.state.continual_retest_settings.invalidate()
+
+        body = (await client.get("/api/v1/public/leaderboard")).json()
+        entries = {entry["agent_id"]: entry for entry in body["entries"]}
+        outsider = entries[outsider_id]
+
+        # It folded the wave, so it must say so. This was 0/canonical_median.
+        assert len(outsider["completed_wave_composites"]) == 3
+        assert outsider["completed_wave_count"] == 3
+        assert outsider["aggregate_method"] == "continual_mean"
+        assert outsider["aggregate_sample_count"] == 3 + 3
+        # And the report agrees with the arithmetic: mean(0.80 x3, 0.60 x3).
+        assert outsider["official_composite"] == pytest.approx(0.70)
+        # The emission-set members are unaffected.
+        assert entries[champion_id]["completed_wave_count"] == 3
+        assert entries[rest[0]]["completed_wave_count"] == 3
+
     async def test_stale_anchor_history_does_not_empty_the_current_wave(
         self,
         app: FastAPI,

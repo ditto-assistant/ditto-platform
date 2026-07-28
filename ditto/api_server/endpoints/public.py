@@ -1732,17 +1732,24 @@ def _completed_wave_data(
         }
         for agent_id, values in by_seed.items()
     }
-    depths = dict.fromkeys(depths, 0)
     # Depth is reported per agent from the seeds that actually entered that
     # agent's aggregate. Under ``strict`` and ``participants`` every member
     # shares one set, so this is the intersection size for all of them --
     # identical to what the old shared counter produced. Under ``per_agent``
     # the members genuinely differ and a single shared number would be a lie.
+    #
+    # Reported for EVERY agent that folded something, not only the emission-set
+    # members. ``by_seed`` above is filtered per agent and never restricted to
+    # members, so a non-member holding the shared seeds already receives a
+    # continual mean; zeroing its depth here only desynchronised the report from
+    # the arithmetic. The two projections that produce those two answers do not
+    # have to agree on membership -- the fold's intersection is taken over the
+    # RAW top five, while emissions are projected from effective composites, and
+    # an agent can be in one and not the other -- so a member-keyed depth was
+    # never a safe stand-in for "what did this agent actually average".
+    depths = dict.fromkeys(depths, 0)
     depths.update(
-        {
-            member.agent_id: len(eligible_by_agent.get(member.agent_id, frozenset()))
-            for member in raw_members
-        }
+        {agent_id: len(seeds) for agent_id, seeds in eligible_by_agent.items()}
     )
     return candidates, by_seed, depths
 
