@@ -32,8 +32,8 @@ from ditto.db.models import (
     Score,
 )
 from ditto.db.queries.agents import get_agent_by_id
-from ditto.score_order import score_order_key, score_order_terms
 from ditto.db.queries.inference import LeaseModelUsage
+from ditto.score_order import score_order_key, score_order_terms
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence

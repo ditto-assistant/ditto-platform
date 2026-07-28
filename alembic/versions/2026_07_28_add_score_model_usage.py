@@ -1,7 +1,7 @@
 """record what a scored run actually spent on the language model
 
 Revision ID: a7c41f8b2e93
-Revises: c7a4f1e2b903
+Revises: 7b41d0e29c85
 Create Date: 2026-07-27
 
 Whether a submission used the reader model at all is currently answerable only
@@ -33,7 +33,7 @@ from collections.abc import Sequence
 from ditto.db.migration_lock import safe_add_column, safe_drop_column
 
 revision: str = "a7c41f8b2e93"
-down_revision: str | Sequence[str] | None = "c7a4f1e2b903"
+down_revision: str | Sequence[str] | None = "7b41d0e29c85"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
