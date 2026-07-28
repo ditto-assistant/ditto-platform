@@ -2038,7 +2038,12 @@ class ValidatorTicket(Base):
     deadline: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False)
     """When an unscored ticket expires and its slot re-opens (UTC)."""
 
-    bench_version: Mapped[int] = mapped_column(Integer, nullable=False, default=2)
+    # Defaulted to the floor for the same reason as ``Score.bench_version``: a
+    # default of 2 is a value this table's own
+    # ``validator_tickets_bench_version_floor`` trigger refuses, so it could
+    # only ever produce a runtime error at INSERT. Every production caller
+    # passes this explicitly.
+    bench_version: Mapped[int] = mapped_column(Integer, nullable=False, default=7)
     """Benchmark version whose retry budget this ticket consumes."""
 
     seed: Mapped[int | None] = mapped_column(BigInteger, nullable=True)

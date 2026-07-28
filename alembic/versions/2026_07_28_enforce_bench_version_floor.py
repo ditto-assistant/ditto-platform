@@ -185,9 +185,28 @@ def upgrade() -> None:
         EXECUTE FUNCTION guard_validator_ticket_bench_floor()
         """
     )
+    # Both tables still carried a server-side ``DEFAULT 2`` from the migrations
+    # that introduced the column, when 2 was the only benchmark there was. Under
+    # the floor that default is not merely stale, it is unreachable: any INSERT
+    # that omitted the column would take it and then immediately fail the CHECK
+    # (or the trigger). A default whose only possible effect is an error is
+    # worse than no default, because it reads as though omitting the column is
+    # supported. Drop both -- the column stays NOT NULL, so omitting it is now
+    # an honest, immediate "null value in column" instead.
+    op.execute("ALTER TABLE scores ALTER COLUMN bench_version DROP DEFAULT")
+    op.execute(
+        "ALTER TABLE validator_tickets ALTER COLUMN bench_version DROP DEFAULT"
+    )
 
 
 def downgrade() -> None:
+    # Restore the historical server-side defaults exactly as they were before
+    # this migration, so a downgrade leaves the schema byte-for-byte reversible
+    # rather than only functionally so.
+    op.execute("ALTER TABLE scores ALTER COLUMN bench_version SET DEFAULT 2")
+    op.execute(
+        "ALTER TABLE validator_tickets ALTER COLUMN bench_version SET DEFAULT 2"
+    )
     op.execute(
         "DROP TRIGGER IF EXISTS validator_tickets_bench_version_floor "
         "ON validator_tickets"

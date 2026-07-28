@@ -24,6 +24,7 @@ from ditto.api_server.endpoints import admin_benchmark_rollout
 from ditto.api_server.endpoints.admin_benchmark_rollout import (
     MINIMUM_ROLLOUT_START_VALIDATORS,
 )
+from ditto.api_server.inference_routing import benchmark_model
 from ditto.api_server.middleware.error_envelope import (
     ERROR_CODE_HTTP_EXCEPTION,
     ERROR_CODE_UNHANDLED,
@@ -31,6 +32,8 @@ from ditto.api_server.middleware.error_envelope import (
 from ditto.db.models import (
     Agent,
     BenchmarkRollout,
+    InferenceProviderRoute,
+    InferenceRoutingPolicy,
     Score,
     ValidatorHeartbeat,
 )
@@ -39,15 +42,21 @@ from ditto.db.queries.benchmark_rollout import (
     RolloutSnapshotMember,
     create_rollout_snapshot,
 )
+from ditto.tests.legacy_era import retired_era_writes_allowed
 
 pytestmark = pytest.mark.asyncio
 
 _TOKEN = "test-admin-token-at-least-32-characters"
 _HEADERS = {"Authorization": f"Bearer {_TOKEN}"}
-_TARGET = 4
-# The message the deployed generate-service actually returned when the v4
-# rollout was started from the operator console against a datagen release
-# that only ships v2 and v3.
+# The rollout these tests start. It has to be v7: the retired-era floor refuses
+# any rollout row whose target is below it, so v4 -- the version this scenario
+# was originally written against -- can no longer be opened at all. Nothing here
+# is about v4 specifically; it is the "some target ahead of the active version"
+# slot, and v7 is the only value that still fills it.
+_TARGET = 7
+# The message the deployed generate-service actually returned when the rollout
+# was started from the operator console against a datagen release that only
+# ships v2 and v3. Quoted verbatim, so it keeps naming the versions it named.
 _LAGGING = "bench_version query param required (supported: 2, 3)"
 
 
@@ -76,8 +85,30 @@ def instrumented_maker(
     return async_sessionmaker(engine, expire_on_commit=False), statements
 
 
+_V7_MODEL = benchmark_model(_TARGET)
+_MANIFEST = "c" * 64
+
+
 def _install(app: FastAPI, maker: async_sessionmaker[AsyncSession]) -> None:
-    app.state.config = replace(app.state.config, admin_api_token=_TOKEN)
+    """Point the app at the test database with a v7-ready inference proxy.
+
+    The proxy settings are part of the fixture now because the target is v7:
+    starting a v7 rollout is gated on an enabled proxy holding a provider key
+    and a reviewed calibration manifest, and the default test config has none
+    of the three. Leaving them unset would make every start below fail on that
+    gate instead of on the generate-service behaviour under test.
+    """
+    app.state.config = replace(
+        app.state.config,
+        admin_api_token=_TOKEN,
+        inference_proxy=replace(
+            app.state.config.inference_proxy,
+            enabled=True,
+            openrouter_api_key="test-openrouter-key",
+            routing_mode="adaptive",
+            reviewed_calibration_manifest_sha256=_MANIFEST,
+        ),
+    )
 
     async def _session() -> AsyncIterator[AsyncSession]:
         async with maker() as session:
@@ -112,6 +143,11 @@ class _StubGenerator:
 
 def _capabilities(now: datetime) -> tuple[dict[str, Any], dict[str, Any]]:
     revision = "a" * 40
+    # A v7-capable validator has to advertise more than the version number:
+    # ticket inference, signed score quorum and a calibration manifest naming
+    # the routes it can actually reach. Without them ``verified_scorer_for_version``
+    # counts this heartbeat as incapable and the start fails on the capacity
+    # gate rather than on anything these tests are about.
     capabilities = {
         "screened_images": True,
         "require_screened_image": False,
@@ -119,6 +155,8 @@ def _capabilities(now: datetime) -> tuple[dict[str, Any], dict[str, Any]]:
         "full_stack_managed": False,
         "stack_updater": False,
         "sandbox_egress_restricted": True,
+        "ticket_inference": True,
+        "signed_score_quorum": True,
         "executor_isolation": "privileged_dind",
         "scorer_benchmarks": {
             "status": "fresh_verified",
@@ -126,6 +164,16 @@ def _capabilities(now: datetime) -> tuple[dict[str, Any], dict[str, Any]]:
             "observed_at": int(now.timestamp()),
             "software_version": "1.3.0",
             "source_revision": revision,
+            "v7_calibration": {
+                "manifest_sha256": _MANIFEST,
+                "supported_routes": [
+                    {
+                        "provider": "Groq",
+                        "profile_revision": "openrouter-route-test-v1",
+                        "model": _V7_MODEL,
+                    }
+                ],
+            },
         },
     }
     stack = {
@@ -154,7 +202,13 @@ def _capabilities(now: datetime) -> tuple[dict[str, Any], dict[str, Any]]:
 def _add_cohort_agent(
     session: AsyncSession, *, position: int, composite: float, now: datetime
 ) -> RolloutSnapshotMember:
-    """Add one SCORED agent with a full v2 quorum, top-five eligible."""
+    """Add one SCORED agent with a full v2 quorum, top-five eligible.
+
+    The quorum is v2 because that is the era a rollout starts FROM here, and it
+    is below the retired-era floor. Callers must therefore seed inside
+    ``retired_era_writes_allowed``: these are the inherited rows production
+    grandfathered, and they are what the cohort is ranked out of.
+    """
     agent_id = uuid4()
     miner = f"miner-{position}"
     digest = f"{position:x}" * 64
@@ -198,12 +252,62 @@ def _add_cohort_agent(
     )
 
 
+def _add_ready_route(session: AsyncSession, now: datetime) -> None:
+    """One healthy, reviewed-calibration route for the v7 consensus model.
+
+    The second half of the v7 start gate: past the config check the handler
+    still requires a live route whose calibration manifest is the reviewed one.
+    Same shape the rollout-query tests use, pinned to the manifest ``_install``
+    configures so the two halves agree.
+    """
+    session.add(
+        InferenceRoutingPolicy(
+            model=_V7_MODEL,
+            enabled=True,
+            speed_weight=0.65,
+            cost_weight=0.25,
+            exploration_weight=0.10,
+            exploration_ticket_budget=3,
+            min_tool_accuracy=0.55,
+            min_composite=0.15,
+            min_calibration_samples=20,
+            max_error_rate=0.25,
+            max_timeout_rate=0.15,
+            cooldown_seconds=30,
+            ewma_alpha=0.20,
+            updated_at=now,
+        )
+    )
+    session.add(
+        InferenceProviderRoute(
+            model=_V7_MODEL,
+            provider="Groq",
+            profile_revision="openrouter-route-test-v1",
+            status="healthy",
+            calibration_status="eligible",
+            calibration_tool_accuracy=0.65,
+            calibration_composite=0.20,
+            calibration_sample_count=60,
+            calibration_manifest_sha256=_MANIFEST,
+            ewma_error_rate=0,
+            ewma_timeout_rate=0,
+            sample_count=60,
+            selected_ticket_count=0,
+            exploration_ticket_count=0,
+            discovered_at=now,
+            last_observed_at=now,
+            updated_at=now,
+        )
+    )
+
+
 async def _seed_start_ready(
     maker: async_sessionmaker[AsyncSession], now: datetime
 ) -> list[RolloutSnapshotMember]:
     """Seed the five-miner cohort and just enough capable validators to start."""
     capabilities, stack = _capabilities(now)
-    async with maker() as session, session.begin():
+    async with maker() as session, retired_era_writes_allowed(session), session.begin():
+        _add_ready_route(session, now)
         members = [
             _add_cohort_agent(
                 session, position=position, composite=0.5 + position / 100, now=now
@@ -215,7 +319,10 @@ async def _seed_start_ready(
                 ValidatorHeartbeat(
                     validator_hotkey=f"validator-{index}",
                     software_version="1.0.0",
-                    protocol_version=8,
+                    # Protocol 12 is the wire-format floor for advertising v7 at
+                    # all; a protocol-8 heartbeat is rejected before its
+                    # capabilities are even read.
+                    protocol_version=12,
                     code_digest="d" * 64,
                     state="polling",
                     first_seen_at=now,
@@ -476,7 +583,11 @@ async def test_reposting_an_existing_rollout_also_502s_on_a_lagging_generator(
     _install(app, session_maker)
     now = datetime.now(UTC).replace(microsecond=0)
     members = await _seed_start_ready(session_maker, now)
-    async with session_maker() as session, session.begin():
+    async with (
+        session_maker() as session,
+        retired_era_writes_allowed(session),
+        session.begin(),
+    ):
         await create_rollout_snapshot(
             session,
             members=members,

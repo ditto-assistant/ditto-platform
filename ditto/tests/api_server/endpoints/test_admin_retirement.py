@@ -10,6 +10,7 @@ looked at it.
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from contextlib import AsyncExitStack
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
@@ -32,6 +33,8 @@ from ditto.db.models import (
     SubmissionRetirement,
     ValidatorTicket,
 )
+from ditto.db.queries.benchmark_rollout import MIN_SCOREABLE_BENCH_VERSION
+from ditto.tests.legacy_era import retired_era_writes_allowed
 
 _TOKEN = "test-admin-token-at-least-32-characters"
 _HEADERS = {"Authorization": f"Bearer {_TOKEN}", "X-Admin-Actor": "peyton"}
@@ -86,56 +89,75 @@ async def _seed(
     created_at: datetime | None = None,
     live_ticket: bool = False,
 ) -> UUID:
+    """Seed one submission's tickets and scores at ``bench_version``.
+
+    The closed generation is the whole subject of this endpoint, so most calls
+    here ask for v6 -- a version the score ledger and the ticket trigger now
+    refuse outright. That is not a test smell to renumber away: retirement only
+    ever runs against work left behind by an era that has ENDED, so a v7-only
+    fixture would have nothing to retire. These rows are the ones production
+    grandfathered when the floor landed, so they are written the same way, with
+    the floor lifted only for the insert and restored immediately after.
+
+    Current-generation calls (``bench_version=_ACTIVE_VERSION``) take the plain
+    path and stay under the live floor, which is what proves the refusal cases
+    are refused by the endpoint rather than by the database.
+    """
     agent_id = uuid4()
-    async with maker() as session, session.begin():
-        session.add(
-            Agent(
-                agent_id=agent_id,
-                miner_hotkey=f"5Miner-{name}",
-                name=name,
-                version=1,
-                sha256=agent_id.hex * 2,
-                status=status,
-                screening_policy_version=SCREENING_POLICY_VERSION,
-                created_at=created_at or (_ROLLOUT_START - timedelta(days=2)),
-            )
-        )
-        for index in range(3):
-            scored = index < score_count
-            if live_ticket and index == 2:
-                ticket_status = TicketStatus.ISSUED
-            else:
-                ticket_status = TicketStatus.SCORED if scored else TicketStatus.EXPIRED
+    async with maker() as session, AsyncExitStack() as stack:
+        if bench_version < MIN_SCOREABLE_BENCH_VERSION:
+            await stack.enter_async_context(retired_era_writes_allowed(session))
+        async with session.begin():
             session.add(
-                ValidatorTicket(
+                Agent(
                     agent_id=agent_id,
-                    validator_hotkey=f"validator-{index}",
-                    status=ticket_status,
-                    issued_at=_T0 - timedelta(hours=5 - index),
-                    deadline=_T0 + timedelta(hours=5)
-                    if ticket_status == TicketStatus.ISSUED
-                    else _T0 - timedelta(hours=4 - index),
-                    bench_version=bench_version,
-                    attempt_count=1,
-                    manual_retry_grants=0,
+                    miner_hotkey=f"5Miner-{name}",
+                    name=name,
+                    version=1,
+                    sha256=agent_id.hex * 2,
+                    status=status,
+                    screening_policy_version=SCREENING_POLICY_VERSION,
+                    created_at=created_at or (_ROLLOUT_START - timedelta(days=2)),
                 )
             )
-            if scored:
+            for index in range(3):
+                scored = index < score_count
+                if live_ticket and index == 2:
+                    ticket_status = TicketStatus.ISSUED
+                else:
+                    ticket_status = (
+                        TicketStatus.SCORED if scored else TicketStatus.EXPIRED
+                    )
                 session.add(
-                    Score(
+                    ValidatorTicket(
                         agent_id=agent_id,
-                        bench_version=bench_version,
                         validator_hotkey=f"validator-{index}",
-                        run_id=f"{name}-{index}",
-                        seed=7,
-                        composite=0.6,
-                        tool_mean=0.6,
-                        memory_mean=0.6,
-                        median_ms=100,
-                        n=114,
-                        generated_at=_T0 - timedelta(hours=3),
+                        status=ticket_status,
+                        issued_at=_T0 - timedelta(hours=5 - index),
+                        deadline=_T0 + timedelta(hours=5)
+                        if ticket_status == TicketStatus.ISSUED
+                        else _T0 - timedelta(hours=4 - index),
+                        bench_version=bench_version,
+                        attempt_count=1,
+                        manual_retry_grants=0,
                     )
                 )
+                if scored:
+                    session.add(
+                        Score(
+                            agent_id=agent_id,
+                            bench_version=bench_version,
+                            validator_hotkey=f"validator-{index}",
+                            run_id=f"{name}-{index}",
+                            seed=7,
+                            composite=0.6,
+                            tool_mean=0.6,
+                            memory_mean=0.6,
+                            median_ms=100,
+                            n=114,
+                            generated_at=_T0 - timedelta(hours=3),
+                        )
+                    )
     return agent_id
 
 

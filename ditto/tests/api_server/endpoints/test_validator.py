@@ -96,6 +96,8 @@ from ditto.db.models import (
     ConfirmationScore,
     ContinualRetestSettingsRevision,
     InferenceGrant,
+    InferenceProviderRoute,
+    InferenceRoutingPolicy,
     Score,
     ScreenerHeartbeat,
     ValidatorHeartbeat,
@@ -119,6 +121,7 @@ from ditto.db.queries.retry_budget import (
     MAX_AGENT_INFRA_RETRY_GRANTS,
     MAX_INFRA_RETRY_GRANTS,
 )
+from ditto.tests.legacy_era import retired_era_writes_allowed
 
 # Real dev keypairs: sign for real so _verify_signature runs end to end. The k=3
 # quorum needs three distinct permitted validators before an agent finalizes.
@@ -133,6 +136,21 @@ _DAVE = bittensor.Keypair.create_from_uri("//Dave")
 _MINER_HOTKEY = "5DhaT8U7LVwnnJNUU8VL1XEipicatoaDVVq7cHo227gogVZm"
 _SHA256 = "ab" * 32
 _TICKET_DEADLINE = datetime(2030, 1, 1, tzinfo=UTC)
+# The generic "a benchmark version" fixture value. It used to be 2 simply
+# because 2 was the oldest number available; nothing in the tests that use it
+# is about v2. Since the floor landed, v2-v6 cannot be written at all -- the
+# ``scores_bench_version_floor`` CHECK and the ``validator_tickets`` insert
+# trigger refuse them -- so the arbitrary value has to sit at or above
+# MIN_SCOREABLE_BENCH_VERSION. Tests that need several distinct versions count
+# up from here (7/8/9); tests that are genuinely about the retired era say so
+# and reach for ``retired_era_writes_allowed``.
+_BENCH_VERSION = 7
+# The one calibrated route the v7 fixtures agree on. The scorer advertises this
+# pair in its heartbeat and ``select_route`` matches the stored route against
+# it, so the same literal has to appear on both sides or the grant comes back
+# ``None`` and the lane answers 503 with nothing pointing at the mismatch.
+_V7_ROUTE_PROFILE = "openrouter-route-test-v1"
+_V7_CALIBRATION_MANIFEST = "c" * 64
 
 
 def test_v4_heartbeat_canonical_vector() -> None:
@@ -381,6 +399,13 @@ def _score_payload(
         "n": 30,
         "generated_at": "2026-06-08T12:04:30Z",
         "per_case": [],
+        # Bound explicitly, because a version-less report is no longer a
+        # generic one. ``report.bench_version or LEGACY_BENCH_VERSION`` reads
+        # an omitted version as v2, and v2 is beneath the scoreable floor, so
+        # the endpoint now answers 410 before it ever looks for a lease. Pass
+        # ``bench_version=None`` to get the legacy-shaped payload back for the
+        # handful of tests that are about that path.
+        "bench_version": _BENCH_VERSION,
     }
     report.update(overrides)
     hotkey = keypair.ss58_address
@@ -687,18 +712,26 @@ def _install_db(app: FastAPI, maker: async_sessionmaker[AsyncSession]) -> None:
     app.dependency_overrides[get_session] = _session
 
 
-async def _enable_retired_era_backfill(
+async def _widest_carryover_policy(
     app: FastAPI, maker: async_sessionmaker[AsyncSession]
 ) -> None:
-    """Re-open the retired-era source-backfill lane the way an operator would.
+    """Write the most permissive previous-generation policy still expressible.
 
-    Writes a real queue-policy revision and lets the endpoint's own resolver
-    pick it up, rather than patching the resolved policy in. A knob is only a
-    knob if the path from the settings board to the lane is unbroken, and that
-    path is what this exercises.
+    This used to be ``_enable_retired_era_backfill``, and it set exactly one
+    field: ``allow_retired_era_backfill``. That field is gone, along with the
+    branch that read it, so the helper's job has inverted. It now writes every
+    remaining carryover knob wide open and lets the endpoint's own resolver
+    pick the revision up, which is what makes "no setting can re-open a retired
+    era" a claim about the settings board rather than about a default.
     """
     settings = QueuePolicySettings(
-        prev_gen_carryover=PrevGenCarryoverSettings(allow_retired_era_backfill=True)
+        prev_gen_carryover=PrevGenCarryoverSettings(
+            enabled=True,
+            include_exhausted=True,
+            dedupe_scope="none",
+            require_cohort_complete=False,
+            require_desired_era_drained=False,
+        )
     )
     payload = settings.model_dump(mode="json")
     async with maker() as session, session.begin():
@@ -710,12 +743,200 @@ async def _enable_retired_era_backfill(
             checksum=hashlib.sha256(
                 json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
             ).hexdigest(),
-            reason="test: reopen the retired-era source backfill",
+            reason="test: widest previous-generation carryover policy",
             actor="test",
         )
     # The resolver reads through app.state, not the request session override.
     app.state.session_maker = maker
     app.state.queue_policy_settings.invalidate()
+
+
+async def _seed_activated_era(
+    maker: async_sessionmaker[AsyncSession],
+    *,
+    version: int = _BENCH_VERSION,
+    activated_at: datetime | None = None,
+) -> UUID:
+    """Record the activation that puts the fleet on ``version``.
+
+    With no rollout row at all ``active_bench_version`` still answers
+    ``DEFAULT_BENCH_VERSION``, which is 2 -- and 2 is now beneath the ticket
+    floor, so every lease the job endpoint tries to cut is refused by the
+    ``validator_tickets_bench_version_floor`` trigger and surfaces as a 500
+    that says nothing about benchmarks. Production is never in that state: it
+    has the v6 -> v7 activation on record. A test that asks the platform to
+    issue work has to say the same thing.
+
+    Activated an hour in the past so agents seeded with ``created_at=now`` are
+    submissions of this era and pass ``benchmark_admission_predicate``.
+    """
+    rollout_id = uuid4()
+    when = activated_at or (datetime.now(UTC) - timedelta(hours=1))
+    async with maker() as session:
+        # An activation into a RETIRED era is history, and history is exactly
+        # what production holds: `benchmark_rollout_desired_floor` is NOT VALID,
+        # so the real v2->v3 and v3->v4 rows are grandfathered. A fresh test
+        # database has nothing to grandfather, so it has to write them the same
+        # way -- beneath a lifted floor, which is then restored.
+        if version < 7:
+            async with retired_era_writes_allowed(session), session.begin():
+                session.add(
+                    BenchmarkRollout(
+                        rollout_id=rollout_id,
+                        from_version=version - 1,
+                        desired_version=version,
+                        status="activated",
+                        cohort_size=5,
+                        created_at=when,
+                        activated_at=when,
+                    )
+                )
+        else:
+            async with session.begin():
+                session.add(
+                    BenchmarkRollout(
+                        rollout_id=rollout_id,
+                        from_version=version - 1,
+                        desired_version=version,
+                        status="activated",
+                        cohort_size=5,
+                        created_at=when,
+                        activated_at=when,
+                    )
+                )
+    return rollout_id
+
+
+# The one healthy, accepting slot the v7 job fixtures lease through. Any
+# heartbeat at protocol >= 10 is required to publish capacity, and ``request_job``
+# answers 204 for a slot that is not in ``healthy_slots`` or for an admission
+# that is not ``accepting`` -- so this is the minimum shape that still issues.
+_ACCEPTING_CAPACITY: dict[str, object] = {
+    "configured_slots": 1,
+    "healthy_slots": ["slot-0"],
+    "admission": "accepting",
+    "active": [],
+}
+# The slot those fixtures claim. Protocol >= 10 claims MUST name a slot (409
+# otherwise), which is why the v7 job tests pass ``slot_id`` where the v2 ones
+# could send a bare claim.
+_SLOT_ID = "slot-0"
+
+
+async def _seed_capable_pool(
+    maker: async_sessionmaker[AsyncSession],
+    *,
+    version: int = _BENCH_VERSION,
+    keypairs: Sequence[bittensor.Keypair] = _KEYPAIRS,
+) -> None:
+    """Heartbeats the allocator will actually count as capable of ``version``.
+
+    At v2 a validator needed no heartbeat at all to be handed work, so most of
+    these fixtures never seeded one. From v7 the bar is concrete and stacked:
+    ``verified_scorer_for_version`` wants ticket inference, a signed score
+    quorum and a v7 calibration manifest; ``request_job`` additionally refuses
+    to treat inference as ready below protocol 11 (10 for pre-v7 targets); and
+    protocol >= 10 makes published capacity and a named slot mandatory.
+
+    Protocol 13 with ``_ACCEPTING_CAPACITY`` clears all of it. Claims against
+    this pool have to name ``_SLOT_ID``.
+    """
+    capabilities = _scorer_capable_capabilities(
+        now=datetime.now(UTC), versions=(version,)
+    )
+    for keypair in keypairs:
+        await _seed_validator_heartbeat(
+            maker,
+            keypair=keypair,
+            protocol_version=13,
+            capabilities=capabilities,
+            stack=_V7_STACK,
+            benchmark_capacity=_ACCEPTING_CAPACITY,
+        )
+
+
+async def _install_ticket_inference(
+    app: FastAPI,
+    maker: async_sessionmaker[AsyncSession],
+    *,
+    version: int = _BENCH_VERSION,
+) -> None:
+    """Make a ticket-scoped inference grant actually mintable for ``version``.
+
+    v7 is not simply a larger number on the lease. ``request_job`` and the
+    top-five lane both refuse outright -- 503 ``ticket inference capability is
+    unavailable`` -- unless ``ensure_inference_grant`` can produce a grant, and
+    that needs the proxy enabled, a routing policy for the era's model, and one
+    calibration-eligible route whose profile and manifest match what the
+    scorer advertises. None of this existed below v7, which is why fixtures
+    that only ever leased v2 never had to state it.
+    """
+    from ditto.api_server.inference_routing import benchmark_model
+
+    now = datetime.now(UTC)
+    model = benchmark_model(version)
+    async with maker() as session, session.begin():
+        session.add(
+            InferenceRoutingPolicy(
+                model=model,
+                enabled=True,
+                speed_weight=0.65,
+                cost_weight=0.25,
+                exploration_weight=0.10,
+                exploration_ticket_budget=3,
+                min_tool_accuracy=0.55,
+                min_composite=0.15,
+                min_calibration_samples=20,
+                max_error_rate=0.25,
+                max_timeout_rate=0.15,
+                cooldown_seconds=30,
+                ewma_alpha=0.20,
+                updated_at=now,
+            )
+        )
+        session.add(
+            InferenceProviderRoute(
+                model=model,
+                provider="Groq",
+                profile_revision=_V7_ROUTE_PROFILE,
+                status="healthy",
+                calibration_status="eligible",
+                calibration_tool_accuracy=0.65,
+                calibration_composite=0.20,
+                calibration_sample_count=60,
+                calibration_manifest_sha256=_V7_CALIBRATION_MANIFEST,
+                ewma_error_rate=0,
+                ewma_timeout_rate=0,
+                sample_count=60,
+                selected_ticket_count=0,
+                exploration_ticket_count=0,
+                discovered_at=now,
+                last_observed_at=now,
+                updated_at=now,
+            )
+        )
+    app.state.config = replace(
+        app.state.config,
+        inference_proxy=replace(
+            app.state.config.inference_proxy,
+            enabled=True,
+            openrouter_api_key="test-only",
+            allowed_models=(model,),
+            routing_mode="adaptive",
+        ),
+    )
+
+
+def _install_dataset_generator(app: FastAPI) -> MagicMock:
+    """A deterministic full-run dataset generator, keyed by (version, seed)."""
+    generator = MagicMock(run_size="full")
+    generator.generate = AsyncMock(
+        side_effect=lambda seed, *, bench_version: hashlib.sha256(
+            f"{bench_version}:{seed}".encode()
+        ).hexdigest()
+    )
+    app.dependency_overrides[get_dataset_generator] = lambda: generator
+    return generator
 
 
 def _install_chain(
@@ -770,8 +991,29 @@ async def _seed_agent(
     sha256: str = _SHA256,
     size_bytes: int = 524288,
     screening_policy_version: int = SCREENING_POLICY_VERSION,
+    screened_image: bool = True,
+    dataset_version: int | None = _BENCH_VERSION,
 ) -> UUID:
+    """Seed a submission in the shape the current era admits.
+
+    ``screened_image`` defaults on because every contract from v3 up sets
+    ``requires_screened_image``, and the allocator's candidate filter drops a
+    submission without a verified one. While the only fixture era was v2 that
+    never mattered -- v2 is the one contract that does not require it -- so an
+    agent seeded with none was still leasable. Pass ``False`` where the absence
+    is the point.
+
+    ``dataset_version`` pins the versioned dataset the allocator requires for
+    the same reason. ``queue_candidate_predicate`` demands a
+    ``benchmark_datasets`` row for the era being leased on every version except
+    2 -- literally ``if bench_version != 2`` -- so the one era these fixtures
+    used to run in was also the one era that needed no pin. Now that the floor
+    puts them on v7, an agent without one is silently unleasable: it is simply
+    absent from the candidate set, and the endpoint answers 204 with nothing
+    pointing at the dataset. Pass ``None`` where the missing pin is the point.
+    """
     aid = agent_id or uuid4()
+    now = datetime.now(UTC)
     async with maker() as s, s.begin():
         s.add(
             Agent(
@@ -782,9 +1024,31 @@ async def _seed_agent(
                 size_bytes=size_bytes,
                 status=status,
                 screening_policy_version=screening_policy_version,
-                created_at=created_at or datetime.now(UTC),
+                created_at=created_at or now,
+                screened_image_sha256="12" * 32 if screened_image else None,
+                screened_image_size_bytes=123 if screened_image else None,
+                screened_image_id=("sha256:" + "34" * 32) if screened_image else None,
+                screened_image_ref=(
+                    f"ditto-screen/{aid}:latest" if screened_image else None
+                ),
+                screened_image_upload_id=uuid4() if screened_image else None,
+                screened_image_verified_at=now if screened_image else None,
             )
         )
+        if dataset_version is not None:
+            # After the agent row exists: benchmark_datasets carries an FK onto
+            # agents, and nothing relates the two mappers, so the unit of work
+            # is free to order the inserts the other way round.
+            await s.flush()
+            s.add(
+                BenchmarkDataset(
+                    agent_id=aid,
+                    bench_version=dataset_version,
+                    seed=8675309,
+                    sha256="cd" * 32,
+                    run_size="full",
+                )
+            )
     return aid
 
 
@@ -792,7 +1056,7 @@ async def _seed_revoked_grant(
     maker: async_sessionmaker[AsyncSession],
     agent_id: UUID,
     *,
-    bench_version: int = 2,
+    bench_version: int = _BENCH_VERSION,
     deadline: datetime = _TICKET_DEADLINE,
     status: str = "revoked",
     keypair: bittensor.Keypair = _KEYPAIR,
@@ -834,7 +1098,7 @@ async def _seed_ticket(
     *,
     keypair: bittensor.Keypair = _KEYPAIR,
     deadline: datetime = _TICKET_DEADLINE,
-    bench_version: int = 2,
+    bench_version: int = _BENCH_VERSION,
     issued_at: datetime | None = None,
     slot_id: str = "slot-0",
     purpose: TicketPurpose = TicketPurpose.CANONICAL_QUORUM,
@@ -896,7 +1160,12 @@ async def _seed_validator_heartbeat(
 ) -> None:
     now = seen_at or datetime.now(UTC)
     async with maker() as s, s.begin():
-        s.add(
+        # ``merge``, not ``add``: the v7 lane fixtures seed a capable heartbeat
+        # for the whole pool up front, and a test that wants a DIFFERENT shape
+        # for one hotkey (v2-only, stale, capability-less) has to be able to say
+        # so by seeding over it. With ``add`` that second call is a primary-key
+        # violation on ``validator_hotkey`` instead of an override.
+        await s.merge(
             ValidatorHeartbeat(
                 validator_hotkey=keypair.ss58_address,
                 software_version=software_version,
@@ -969,7 +1238,16 @@ _V7_STACK: dict[str, object] = {
 
 _V9_SCORER: dict[str, object] = {
     "status": "fresh_verified",
-    "supported_bench_versions": [2, 3],
+    # The era the fleet is on, not [2, 3].
+    #
+    # These were arbitrary "some versions the scorer supports" and the telemetry
+    # tests using this blob are not about version support. They became
+    # load-bearing once the active era stopped defaulting to 2: a scorer that
+    # advertises only retired versions cannot serve the active benchmark, and
+    # `bench_serviceability != "serving"` is ranked CRITICAL in the fleet
+    # health roll-up -- correctly, but it swamped every unrelated health
+    # assertion in this file.
+    "supported_bench_versions": [_BENCH_VERSION],
     "observed_at": 1_784_020_800,
     "software_version": "1.2.2",
     "source_revision": "2" * 40,
@@ -1032,9 +1310,24 @@ _IDLE_CAPACITY: dict[str, object] = {
 
 
 def _quorum_capabilities() -> dict[str, object]:
-    """A fresh, mutable v12+ capability set (signed score quorum is required)."""
+    """A fresh, mutable v12+ capability set that can serve the current era.
+
+    Serving the era is new here, and it is not decoration. The public fleet view
+    grades a validator ``critical`` when it cannot serve the benchmark being
+    scored, ahead of every host-metric and stack finding -- and with no rollout
+    row at all the era is now the floor (v7), not ``DEFAULT_BENCH_VERSION``. A
+    capability set advertising only ``[2, 3]`` therefore reads as
+    ``software_obsolete``, which swamps the badge the probe and stall tests are
+    actually asserting on. Protocol 12 is exactly the floor at which a heartbeat
+    may advertise v7, so a "v12+ capability set" that could not is a fixture
+    describing a validator that cannot exist.
+    """
     capabilities = json.loads(json.dumps(_V9_CAPABILITIES))
     capabilities["signed_score_quorum"] = True
+    capabilities["ticket_inference"] = True
+    capabilities["scorer_benchmarks"] = _scorer_capable_capabilities(
+        now=datetime.now(UTC), versions=(_BENCH_VERSION,)
+    )["scorer_benchmarks"]
     return dict(capabilities)
 
 
@@ -1237,13 +1530,13 @@ class TestHeartbeat:
                 {
                     "slot_id": "slot-0",
                     "agent_id": str(first),
-                    "bench_version": 2,
+                    "bench_version": _BENCH_VERSION,
                     "progress": first_progress,
                 },
                 {
                     "slot_id": "slot-1",
                     "agent_id": str(second),
-                    "bench_version": 2,
+                    "bench_version": _BENCH_VERSION,
                     "progress": second_progress,
                 },
             ],
@@ -1295,7 +1588,7 @@ class TestHeartbeat:
 
         async with session_maker() as session:
             ticket = await session.get(
-                ValidatorTicket, (agent_id, 2, _VALIDATOR_HOTKEY)
+                ValidatorTicket, (agent_id, _BENCH_VERSION, _VALIDATOR_HOTKEY)
             )
             assert ticket is not None
             assert ticket.first_reported_at is None
@@ -1321,7 +1614,7 @@ class TestHeartbeat:
                             {
                                 "slot_id": "slot-0",
                                 "agent_id": str(agent_id),
-                                "bench_version": 2,
+                                "bench_version": _BENCH_VERSION,
                                 "progress": progress,
                             }
                         ],
@@ -1333,7 +1626,7 @@ class TestHeartbeat:
         await _beat(3)
         async with session_maker() as session:
             ticket = await session.get(
-                ValidatorTicket, (agent_id, 2, _VALIDATOR_HOTKEY)
+                ValidatorTicket, (agent_id, _BENCH_VERSION, _VALIDATOR_HOTKEY)
             )
             assert ticket is not None
             assert ticket.first_reported_at is not None
@@ -1342,7 +1635,7 @@ class TestHeartbeat:
         await _beat(7)
         async with session_maker() as session:
             ticket = await session.get(
-                ValidatorTicket, (agent_id, 2, _VALIDATOR_HOTKEY)
+                ValidatorTicket, (agent_id, _BENCH_VERSION, _VALIDATOR_HOTKEY)
             )
             assert ticket is not None
             assert ticket.first_reported_at == stamped
@@ -1388,7 +1681,7 @@ class TestHeartbeat:
                         {
                             "slot_id": "slot-0",
                             "agent_id": str(agent_id),
-                            "bench_version": 2,
+                            "bench_version": _BENCH_VERSION,
                             "progress": None,
                         }
                     ],
@@ -1644,7 +1937,7 @@ class TestHeartbeat:
                     {
                         "slot_id": "slot-0",
                         "agent_id": str(agent),
-                        "bench_version": 2,
+                        "bench_version": _BENCH_VERSION,
                         "progress": progress,
                     }
                 ],
@@ -2094,9 +2387,21 @@ class TestHeartbeat:
         client: httpx.AsyncClient,
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
-        # A benchmark wedged in building_harness far longer than that stage should
-        # take must be surfaced: stalled=True on the run and health downgraded to
-        # "warning" even though the host metrics are otherwise fine.
+        """A wedged early stage is surfaced on the run, whatever the badge says.
+
+        ``stalled=True`` on the active benchmark is the claim, and it is
+        unchanged. The fleet-health badge that used to accompany it is not:
+        this validator reports protocol 4, and ``protocol_serves_version`` puts
+        the floor for advertising v7 at protocol 12, so it now cannot serve the
+        era being scored at all. The public view grades that ``critical`` ahead
+        of every host-metric and stall finding, deliberately -- a validator that
+        can complete no lease is a worse problem than a slow one, and must not
+        read like a warning.
+
+        So "warning" is not reachable for this fixture any more, and asserting
+        it would only be asserting that the era is still v2. The stall is still
+        proven, on the run itself and in the reasons.
+        """
         agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
         issued = datetime.now(UTC) - timedelta(minutes=20)
         await _seed_ticket(session_maker, agent_id, issued_at=issued)
@@ -2118,7 +2423,12 @@ class TestHeartbeat:
         ][0]
         assert validator["active_benchmark"]["stage"] == "building_harness"
         assert validator["active_benchmark"]["stalled"] is True
-        assert validator["health"] == "warning"
+        assert validator["health"] == "critical"
+        # The stall is still named, so it is surfaced rather than swallowed by
+        # the obsolescence verdict that outranks it.
+        assert any("stalled" in reason for reason in validator["health_reasons"]), (
+            validator["health_reasons"]
+        )
 
     async def test_v2_reports_current_agent_publicly(
         self,
@@ -2151,7 +2461,7 @@ class TestHeartbeat:
             "slot_id": "slot-0",
             "agent_id": str(agent_id),
             "agent_name": "alpha-agent",
-            "bench_version": 2,
+            "bench_version": _BENCH_VERSION,
             "stage": None,
             "completed_checks": None,
             "total_checks": None,
@@ -2184,8 +2494,12 @@ class TestHeartbeat:
         assert response.status_code == 200
         assert response.headers["Cache-Control"] == "public, max-age=8"
         snapshot = response.json()
-        assert snapshot["active_bench_version"] == 2
-        assert snapshot["desired_bench_version"] == 2
+        # No rollout row at all, so this is the floor: with nothing durable on
+        # record ``persisted_active_bench_version`` answers
+        # MIN_SCOREABLE_BENCH_VERSION rather than DEFAULT_BENCH_VERSION, which
+        # is frozen at 2 and names an era that can no longer be scored.
+        assert snapshot["active_bench_version"] == _BENCH_VERSION
+        assert snapshot["desired_bench_version"] == _BENCH_VERSION
         assert snapshot["benchmark_rollout_status"] == "inactive"
         assert snapshot["generated_at"] == snapshot["activity"]["generated_at"]
         assert snapshot["generated_at"] == snapshot["validators"]["generated_at"]
@@ -2204,16 +2518,16 @@ class TestHeartbeat:
             session.add(
                 BenchmarkRollout(
                     rollout_id=rollout_id,
-                    from_version=2,
-                    desired_version=3,
+                    from_version=_BENCH_VERSION,
+                    desired_version=_BENCH_VERSION + 1,
                     status="collecting",
                     cohort_size=5,
                     created_at=now,
                 )
             )
         rollout_snapshot = (await client.get("/api/v1/public/operations")).json()
-        assert rollout_snapshot["active_bench_version"] == 2
-        assert rollout_snapshot["desired_bench_version"] == 3
+        assert rollout_snapshot["active_bench_version"] == _BENCH_VERSION
+        assert rollout_snapshot["desired_bench_version"] == _BENCH_VERSION + 1
         assert rollout_snapshot["benchmark_rollout_status"] == "collecting"
 
     async def test_operations_snapshot_keeps_live_work_and_bounds_history(
@@ -2393,7 +2707,7 @@ class TestHeartbeat:
                 assert shown == {
                     "agent_id": str(agent_id),
                     "agent_name": "alpha-agent",
-                    "bench_version": 2,
+                    "bench_version": _BENCH_VERSION,
                     "stage": "running_benchmark",
                     "completed_checks": 51,
                     "total_checks": 114,
@@ -2506,7 +2820,7 @@ class TestHeartbeat:
             "slot_id": "slot-0",
             "agent_id": str(agent_id),
             "agent_name": "alpha-agent",
-            "bench_version": 2,
+            "bench_version": _BENCH_VERSION,
             "stage": None,
             "completed_checks": None,
             "total_checks": None,
@@ -2589,7 +2903,7 @@ class TestHeartbeat:
         )
         async with session_maker() as session, session.begin():
             previous = await session.get(
-                ValidatorTicket, (agent_id, 2, _VALIDATOR_HOTKEY)
+                ValidatorTicket, (agent_id, _BENCH_VERSION, _VALIDATOR_HOTKEY)
             )
             assert previous is not None
             previous.status = TicketStatus.SCORED
@@ -2729,7 +3043,7 @@ class TestHeartbeat:
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
         agent_id = await _seed_agent(session_maker, status=status)
-        await _seed_ticket(session_maker, agent_id, bench_version=3)
+        await _seed_ticket(session_maker, agent_id, bench_version=_BENCH_VERSION)
         _install_db(app, session_maker)
         _install_chain(app)
 
@@ -2751,13 +3065,13 @@ class TestHeartbeat:
         validator = fleet["validators"][0]
         assert validator["active_agent_id"] == str(agent_id)
         assert validator["active_benchmark"]["stage"] == "running_benchmark"
-        assert validator["active_benchmark"]["bench_version"] == 3
+        assert validator["active_benchmark"]["bench_version"] == _BENCH_VERSION
 
         pipeline = (
             await client.get(f"/api/v1/public/agent/{agent_id}/pipeline")
         ).json()
         attempt = pipeline["validation_attempts"][0]
-        assert attempt["bench_version"] == 3
+        assert attempt["bench_version"] == _BENCH_VERSION
         assert attempt["actively_running"] is True
         assert attempt["benchmark_progress"]["completed_checks"] == 51
 
@@ -2844,7 +3158,7 @@ class TestHeartbeat:
             assert heartbeat.active_agent_id is None
             assert heartbeat.benchmark_progress_reported is False
             ticket = await session.get(
-                ValidatorTicket, (agent_id, 2, _VALIDATOR_HOTKEY)
+                ValidatorTicket, (agent_id, _BENCH_VERSION, _VALIDATOR_HOTKEY)
             )
             assert ticket is not None
             assert ticket.status == TicketStatus.ISSUED
@@ -2891,7 +3205,7 @@ class TestHeartbeat:
 
         async with session_maker() as session:
             ticket = await session.get(
-                ValidatorTicket, (agent_id, 2, _VALIDATOR_HOTKEY)
+                ValidatorTicket, (agent_id, _BENCH_VERSION, _VALIDATOR_HOTKEY)
             )
             heartbeat = await session.get(ValidatorHeartbeat, _VALIDATOR_HOTKEY)
             assert ticket is not None
@@ -2909,6 +3223,17 @@ class TestHeartbeat:
         client: httpx.AsyncClient,
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
+        """v3 binds the coarse metrics it sent, and the public copy is redacted.
+
+        Both halves are unchanged. What changed is the health badge that used to
+        ride along: a protocol-3 heartbeat cannot advertise v7 -- the floor for
+        that is protocol 12 -- and with no rollout row the era is now the
+        scoreable floor rather than ``DEFAULT_BENCH_VERSION``. The public view
+        grades a validator that cannot serve the era being scored ``critical``
+        ahead of any host-metric reading, so "healthy" here would now only be
+        asserting that v2 is still live. The metrics binding and the redaction,
+        which is what this test is for, are untouched.
+        """
         _install_db(app, session_maker)
         _install_chain(app)
         timestamp = int(datetime.now(UTC).timestamp())
@@ -2924,7 +3249,11 @@ class TestHeartbeat:
         public = (await client.get("/api/v1/public/validators")).json()
         entry = public["validators"][0]
         assert entry["availability"] == "available"
-        assert entry["health"] == "healthy"
+        assert entry["health"] == "critical"
+        # Obsolete software, not a sick host: the reason has to say which.
+        assert entry["health_reasons"] == [
+            f"software too old for bench v{_BENCH_VERSION} (heartbeat protocol 3)"
+        ]
         assert entry["first_seen_at"] is not None
         assert entry["system_metrics"] == {
             "cpu_percent": 15,
@@ -3101,10 +3430,18 @@ class TestHeartbeat:
             v for v in validators["validators"] if v["protocol_version"] == 3
         )
         assert old["availability"] == "available"
-        assert old["health"] == "unknown"
         assert old["system_metrics"] is None
         assert current["availability"] == "available"
-        assert current["health"] == "healthy"
+        # Both are legacy reporters (protocol 2 and 3) and the floor for
+        # advertising v7 is protocol 12, so neither can serve the era being
+        # scored and both are graded on that before their host metrics are
+        # considered at all. The metric-driven split this pair used to show --
+        # "unknown" with nothing reported, "healthy" with good numbers -- is no
+        # longer expressible by any protocol old enough to omit them. What the
+        # metrics still decide is whether they are PUBLISHED, which is asserted
+        # above and is the redaction claim this test carries.
+        assert old["health"] == "critical"
+        assert current["health"] == "critical"
 
         screeners = (await client.get("/api/v1/public/screeners")).json()
         assert screeners["reported_count"] == 2
@@ -3161,7 +3498,7 @@ class TestArtifactFetchAudit:
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
         agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
-        await _seed_ticket(session_maker, agent_id, bench_version=3)
+        await _seed_ticket(session_maker, agent_id, bench_version=_BENCH_VERSION)
         _install_db(app, session_maker)
         _install_chain(app)
         _install_storage(app)
@@ -3182,7 +3519,7 @@ class TestArtifactFetchAudit:
         # The whole point: the fetch is attributable to a specific hotkey.
         assert row.requester_id == _KEYPAIR.ss58_address
         assert row.artifact_sha256 == _SHA256
-        assert row.bench_version == 3
+        assert row.bench_version == _BENCH_VERSION
         assert row.fetched_at is not None
 
     async def test_each_fetch_appends_its_own_row(
@@ -3200,7 +3537,7 @@ class TestArtifactFetchAudit:
         did not have.
         """
         agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
-        await _seed_ticket(session_maker, agent_id, bench_version=3)
+        await _seed_ticket(session_maker, agent_id, bench_version=_BENCH_VERSION)
         _install_db(app, session_maker)
         _install_chain(app)
         _install_storage(app)
@@ -3234,7 +3571,7 @@ class TestArtifactFetchAudit:
         full disk. Fail open, and make the gap loud instead of silent.
         """
         agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
-        await _seed_ticket(session_maker, agent_id, bench_version=3)
+        await _seed_ticket(session_maker, agent_id, bench_version=_BENCH_VERSION)
         _install_db(app, session_maker)
         _install_chain(app)
         _install_storage(app)
@@ -3296,8 +3633,15 @@ class TestArtifact:
         client: httpx.AsyncClient,
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
-        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
-        await _seed_ticket(session_maker, agent_id, bench_version=3)
+        # The source-artifact half of this endpoint, so the submission is seeded
+        # WITHOUT a screened image on purpose. ``_seed_agent`` provides one by
+        # default now (every contract from v3 up requires it), which would make
+        # the two screened-image assertions below unreachable -- the sibling
+        # test covers that response shape.
+        agent_id = await _seed_agent(
+            session_maker, status=AgentStatus.EVALUATING, screened_image=False
+        )
+        await _seed_ticket(session_maker, agent_id, bench_version=_BENCH_VERSION)
         _install_db(app, session_maker)
         _install_chain(app)
         storage = _install_storage(app)
@@ -3313,7 +3657,7 @@ class TestArtifact:
         assert body["download_url"].startswith("https://")
         assert body["screened_image_url"] is None
         assert body["screened_image_sha256"] is None
-        assert body["bench_version"] == 3
+        assert body["bench_version"] == _BENCH_VERSION
         storage.presigned_get_url.assert_awaited_once()
         assert (
             storage.presigned_get_url.await_args.kwargs["key"]
@@ -3370,7 +3714,7 @@ class TestArtifact:
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
         agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
-        await _seed_ticket(session_maker, agent_id, bench_version=3)
+        await _seed_ticket(session_maker, agent_id, bench_version=_BENCH_VERSION)
         upload_id = uuid4()
         async with session_maker() as session, session.begin():
             agent = await session.get(Agent, agent_id)
@@ -3397,7 +3741,7 @@ class TestArtifact:
         assert body["screened_image_size_bytes"] == 123
         assert body["screened_image_id"] == "sha256:" + "34" * 32
         assert body["screened_image_ref"] == f"ditto-screen/{agent_id}:latest"
-        assert body["bench_version"] == 3
+        assert body["bench_version"] == _BENCH_VERSION
         assert storage.presigned_get_url.await_args_list[1].kwargs["key"] == (
             f"{agent_id}/screened-images/{upload_id}.tar"
         )
@@ -3529,6 +3873,27 @@ class TestArtifact:
 
 
 class TestRequestJob:
+    @pytest.fixture(autouse=True)
+    async def _current_era(
+        self, app: FastAPI, session_maker: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """Put the fleet on the era these tests lease work in.
+
+        Two things that used to come for free at v2 have to be stated now.
+        ``active_bench_version`` answers ``DEFAULT_BENCH_VERSION`` (2) when no
+        rollout row exists, and 2 is beneath the ticket floor, so the allocator
+        cuts a lease the database refuses -- a 500 with nothing in it about
+        benchmarks. And every v7 lease must carry an inference grant, so the
+        routing policy has to exist before a job can be issued at all.
+
+        The third precondition -- a heartbeat the fleet counts as v7-capable --
+        is deliberately NOT seeded here: several tests in these classes are
+        about the absence or the wrong shape of that heartbeat. Tests that want
+        a job issued call ``_seed_capable_pool``.
+        """
+        await _seed_activated_era(session_maker)
+        await _install_ticket_inference(app, session_maker)
+
     async def test_source_backfill_declines_while_the_new_era_has_work(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -3644,13 +4009,17 @@ class TestRequestJob:
         # Refused on the era, before the priority question is even asked.
         outstanding.assert_not_awaited()
 
-    async def test_operator_can_reopen_the_retired_era_backfill(
+    async def test_no_operator_setting_can_reopen_the_retired_era_backfill(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The same poll issues once the operator asks for the retired era.
+        """There is no field left that turns a retired era back on.
 
-        Same fleet, same rollout, one field different. Without this the fix is a
-        hard-coded behaviour change that needs a deploy to undo.
+        This test used to assert the opposite: one field
+        (``allow_retired_era_backfill``) re-opened the lane, so the fix was
+        undoable without a deploy. That knob was reachable from Backroom, which
+        made "v6 is closed" a statement about a default rather than about the
+        system. v2-v6 are retired for good, so the widest carryover settings the
+        model can still express must not move this lane at all.
         """
         now = datetime.now(UTC)
         rollout = MagicMock(
@@ -3695,25 +4064,40 @@ class TestRequestJob:
             validator_running_benchmark=False,
             slot_id="slot-1",
             carryover_settings=PrevGenCarryoverSettings(
-                enabled=True, allow_retired_era_backfill=True
+                enabled=True,
+                include_exhausted=True,
+                dedupe_scope="none",
+                require_cohort_complete=False,
+                require_desired_era_drained=False,
             ),
         )
 
-        assert ticket is issued
-        assert issue.await_args is not None
-        assert issue.await_args.kwargs["bench_version"] == 6
+        assert ticket is None
+        issue.assert_not_awaited()
 
-    async def test_source_backfill_resumes_a_live_lease_despite_the_gate(
+    async def test_source_backfill_will_not_resume_a_retired_era_lease(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The gates guard new admission, never a benchmark already running.
+        """Resumption is not exempt from the floor. This was the live v6 hole.
 
-        Declining to resume would strand the lease until it expired and burn a
-        retry attempt for a submission that did nothing wrong. Run against a
-        RETIRED era (``active_version`` has moved past ``from_version``) with the
-        lane switched off, because that is the state the fleet is in now: the
-        v6 benchmarks already mid-flight when this shipped keep their leases and
-        finish or expire on their own. Stopping new issuance is the whole fix.
+        The inverse of this test used to pass, and the reasoning behind it was
+        sound in isolation: refusing to resume a running benchmark strands the
+        lease and burns a retry attempt for a submission that did nothing
+        wrong. The problem is what "resume" turned into once the era retired.
+
+        The resume lookup sat ABOVE the retired-era gate, and ``request_job``
+        resurrects the ACTIVATED v7 rollout to feed this lane -- and that row's
+        ``from_version`` is 6. So an unexpired v6 lease re-issued itself on
+        every poll, with no rollout open and no flag set, and the score at the
+        end of it was validated against ``ticket.bench_version`` rather than
+        the active version. v6 was scoreable in production the whole time.
+
+        A lease for an era that can no longer be scored is not work in
+        progress. The score it is heading toward will be refused by the ledger
+        (410, ``ERROR_CODE_BENCH_VERSION_RETIRED``), so resuming it only holds
+        a slot the live era does not get. In-flight leases now drain instead:
+        they expire at their own deadline, at most ~90 minutes out, and nothing
+        re-leases them.
         """
         now = datetime.now(UTC)
         rollout = MagicMock(
@@ -3753,7 +4137,9 @@ class TestRequestJob:
             carryover_settings=PrevGenCarryoverSettings(enabled=True),
         )
 
-        assert ticket is issued
+        assert ticket is None
+        issue.assert_not_awaited()
+        # Refused on the era, before the resume lookup or the priority question.
         outstanding.assert_not_awaited()
 
     async def test_source_backfill_waits_for_top_ten_then_reuses_v6_allocator(
@@ -4175,7 +4561,16 @@ class TestRequestJob:
         bench_version: int,
     ) -> None:
         now = datetime.now(UTC)
-        async with session_maker() as session, session.begin():
+        # These fixtures activate v3/v4 -- eras that are retired now. In
+        # production those rollout rows are real and grandfathered by the
+        # NOT VALID floor; a fresh test database has to write them beneath a
+        # lifted floor, which the helper restores on exit. The tests themselves
+        # then run against a live floor, which is the state that matters.
+        async with (
+            session_maker() as session,
+            retired_era_writes_allowed(session),
+            session.begin(),
+        ):
             agent = await session.get(Agent, agent_id)
             assert agent is not None
             agent.screening_policy_version = 9
@@ -4287,7 +4682,11 @@ class TestRequestJob:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
-        await _seed_validator_heartbeat(session_maker)
+        # A bare heartbeat used to be enough to be handed work. The point here is
+        # that a validator clearing the compatibility gate gets a job, so the
+        # heartbeat has to clear the v7 capability bar too -- otherwise the 204
+        # would come from capability, not from the gate under test.
+        await _seed_capable_pool(session_maker, keypairs=(_KEYPAIR,))
         _install_db(app, session_maker)
         _install_chain(app)
         self._enable_compatibility_gate(app)
@@ -4298,10 +4697,12 @@ class TestRequestJob:
         )
 
         response = await client.post(
-            "/api/v1/validator/job", headers=_AUTH_HEADER, json=_job_payload()
+            "/api/v1/validator/job",
+            headers=_AUTH_HEADER,
+            json=_job_payload(slot_id=_SLOT_ID),
         )
 
-        assert response.status_code == 200
+        assert response.status_code == 200, response.text
         assert response.json()["agent_id"] == str(agent_id)
         refresh.assert_not_awaited()
 
@@ -4335,22 +4736,25 @@ class TestRequestJob:
         )
         assert legacy.status_code == 204
 
+        # The upgraded shape. The floor in this test's name moved: ticket
+        # inference is only treated as ready from protocol 11 for a v7 target
+        # (10 below it), and a heartbeat cannot advertise v7 at all below
+        # protocol 12. So "the v10 slot that can do ticket inference" is a v12+
+        # slot now, and it has to carry the full v7 scorer capability rather
+        # than a ticket_inference flag bolted onto the v9 blob.
         async with session_maker() as session, session.begin():
             heartbeat = await session.get(ValidatorHeartbeat, _VALIDATOR_HOTKEY)
             assert heartbeat is not None
-            heartbeat.protocol_version = 10
-            heartbeat.capabilities = {**_V9_CAPABILITIES, "ticket_inference": True}
-            heartbeat.benchmark_capacity = {
-                "configured_slots": 1,
-                "healthy_slots": ["slot-0"],
-                "admission": "accepting",
-                "active": [],
-            }
+            heartbeat.protocol_version = 13
+            heartbeat.capabilities = _scorer_capable_capabilities(
+                now=datetime.now(UTC), versions=(_BENCH_VERSION,)
+            )
+            heartbeat.benchmark_capacity = dict(_ACCEPTING_CAPACITY)
 
         issued = await client.post(
             "/api/v1/validator/job",
             headers=_AUTH_HEADER,
-            json=_job_payload(slot_id="slot-0"),
+            json=_job_payload(slot_id=_SLOT_ID),
         )
         assert issued.status_code == 200, issued.text
         assert issued.json()["agent_id"] == str(agent_id)
@@ -4503,7 +4907,11 @@ class TestRequestJob:
         client: httpx.AsyncClient,
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
-        await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        # No verified screened image: that is what makes this work source-only,
+        # and ``_seed_agent`` now supplies one unless asked not to.
+        await _seed_agent(
+            session_maker, status=AgentStatus.EVALUATING, screened_image=False
+        )
         capabilities = {
             **_V7_CAPABILITIES,
             "require_screened_image": True,
@@ -4525,10 +4933,10 @@ class TestRequestJob:
         assert response.status_code == 204
 
     @pytest.mark.parametrize(
-        ("state", "expected_status"),
+        ("slot_reported_active", "expected_status"),
         [
-            ("polling", TicketStatus.EXPIRED),
-            ("running_benchmark", TicketStatus.ISSUED),
+            (False, TicketStatus.EXPIRED),
+            (True, TicketStatus.ISSUED),
         ],
     )
     async def test_v7_screened_only_does_not_resume_source_only_live_ticket(
@@ -4536,29 +4944,75 @@ class TestRequestJob:
         app: FastAPI,
         client: httpx.AsyncClient,
         session_maker: async_sessionmaker[AsyncSession],
-        state: str,
+        slot_reported_active: bool,
         expected_status: TicketStatus,
     ) -> None:
-        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        """A screened-only validator releases an idle source-only lease.
+
+        The claim is unchanged -- an idle slot gives the lease back, a working
+        slot keeps it -- but at v7 the fixture can no longer say "idle" the way
+        it used to, so the parameter had to move.
+
+        This test used to parametrize the heartbeat's whole-validator ``state``,
+        which is the only occupancy signal a pre-v10 reporter has. A validator
+        cannot advertise v7 at all below protocol 12 (``protocol_serves_version``
+        is an explicit ``version >= 7 and protocol_version < 12``), and at
+        protocol >= 10 ``request_job`` stops reading ``state`` entirely: slot
+        occupancy comes from the per-slot capacity blob, and ``lease_liveness``
+        follows it there. So a protocol-7 heartbeat now fails the capability gate
+        before ``issue_ticket`` -- and with it the release path -- is ever
+        reached, and the lease would sit untouched in BOTH parameters: the
+        ``running_benchmark`` case would still have passed, for entirely the
+        wrong reason.
+
+        Parametrizing ``capacity.active`` instead asks the same question of the
+        signal that now answers it.
+        """
+        # Source-only is a property of the SUBMISSION: no verified screened
+        # image, so a screened-only validator cannot serve it. ``_seed_agent``
+        # provides one by default now, which would make this lease resumable and
+        # invert the test.
+        agent_id = await _seed_agent(
+            session_maker, status=AgentStatus.EVALUATING, screened_image=False
+        )
+        now = datetime.now(UTC)
+        # Scorer-capable AND screened-only. Both halves are load-bearing: the
+        # release lives inside ``issue_ticket``, which a validator that cannot
+        # serve the canonical era never reaches.
         capabilities = {
-            **_V7_CAPABILITIES,
+            **_scorer_capable_capabilities(now=now, versions=(_BENCH_VERSION,)),
             "require_screened_image": True,
             "source_build_fallback": False,
         }
         await _seed_validator_heartbeat(
             session_maker,
-            protocol_version=7,
+            protocol_version=13,
             capabilities=capabilities,
             stack=_V7_STACK,
-            state=state,
+            state=("running_benchmark" if slot_reported_active else "polling"),
+            benchmark_capacity={
+                **_ACCEPTING_CAPACITY,
+                "active": (
+                    [
+                        {
+                            "slot_id": _SLOT_ID,
+                            "agent_id": str(agent_id),
+                            "bench_version": _BENCH_VERSION,
+                            "progress": None,
+                        }
+                    ]
+                    if slot_reported_active
+                    else []
+                ),
+            },
         )
-        now = datetime.now(UTC)
         async with session_maker() as session, session.begin():
             session.add(
                 ValidatorTicket(
                     agent_id=agent_id,
-                    bench_version=2,
+                    bench_version=_BENCH_VERSION,
                     validator_hotkey=_VALIDATOR_HOTKEY,
+                    slot_id=_SLOT_ID,
                     status=TicketStatus.ISSUED,
                     # Reported once already, so a heartbeat now reporting no
                     # work is evidence of idleness rather than a run still
@@ -4574,13 +5028,15 @@ class TestRequestJob:
         _install_chain(app)
 
         response = await client.post(
-            "/api/v1/validator/job", headers=_AUTH_HEADER, json=_job_payload()
+            "/api/v1/validator/job",
+            headers=_AUTH_HEADER,
+            json=_job_payload(slot_id=_SLOT_ID),
         )
 
         assert response.status_code == 204
         async with session_maker() as session:
             ticket = await session.get(
-                ValidatorTicket, (agent_id, 2, _VALIDATOR_HOTKEY)
+                ValidatorTicket, (agent_id, _BENCH_VERSION, _VALIDATOR_HOTKEY)
             )
             assert ticket is not None
             assert ticket.status == expected_status
@@ -4614,7 +5070,7 @@ class TestRequestJob:
             session.add(
                 ValidatorTicket(
                     agent_id=agent_id,
-                    bench_version=2,
+                    bench_version=_BENCH_VERSION,
                     validator_hotkey=_VALIDATOR_HOTKEY,
                     status=TicketStatus.ISSUED,
                     issued_at=now - timedelta(minutes=19),
@@ -4633,7 +5089,7 @@ class TestRequestJob:
         assert response.status_code == 204
         async with session_maker() as session:
             ticket = await session.get(
-                ValidatorTicket, (agent_id, 2, _VALIDATOR_HOTKEY)
+                ValidatorTicket, (agent_id, _BENCH_VERSION, _VALIDATOR_HOTKEY)
             )
             assert ticket is not None
             assert ticket.status == TicketStatus.ISSUED
@@ -4672,14 +5128,17 @@ class TestRequestJob:
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
         agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await _seed_capable_pool(session_maker)
         _install_db(app, session_maker)
         _install_chain(app)
         before = datetime.now(UTC)
         resp = await client.post(
-            "/api/v1/validator/job", headers=_AUTH_HEADER, json=_job_payload()
+            "/api/v1/validator/job",
+            headers=_AUTH_HEADER,
+            json=_job_payload(slot_id=_SLOT_ID),
         )
         after = datetime.now(UTC)
-        assert resp.status_code == 200
+        assert resp.status_code == 200, resp.text
         body = resp.json()
         assert body["agent_id"] == str(agent_id)
         deadline = datetime.fromisoformat(body["deadline"].replace("Z", "+00:00"))
@@ -4829,6 +5288,10 @@ class TestRequestJob:
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
         await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        # Dave included: the fourth validator must be refused for want of a SLOT,
+        # not for want of a capable heartbeat, or the closing 204 would prove
+        # nothing about the quorum cap.
+        await _seed_capable_pool(session_maker, keypairs=(*_KEYPAIRS, _DAVE))
         _install_db(app, session_maker)
         _install_chain(app, extra_keypairs=(_DAVE,))
         # Three distinct validators each get the single agent (fills the pool).
@@ -4836,14 +5299,14 @@ class TestRequestJob:
             r = await client.post(
                 "/api/v1/validator/job",
                 headers={"X-Validator-Hotkey": kp.ss58_address},
-                json=_job_payload(kp),
+                json=_job_payload(kp, slot_id=_SLOT_ID),
             )
-            assert r.status_code == 200
+            assert r.status_code == 200, r.text
         # A further request finds no open slot -> no job.
         r = await client.post(
             "/api/v1/validator/job",
             headers={"X-Validator-Hotkey": _DAVE.ss58_address},
-            json=_job_payload(_DAVE),
+            json=_job_payload(_DAVE, slot_id=_SLOT_ID),
         )
         assert r.status_code == 204
 
@@ -4884,16 +5347,19 @@ class TestRequestJob:
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
         await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        # The first claim has to genuinely succeed for the second to be a REPLAY
+        # rather than a second miss, so the pool is seeded v7-capable.
+        await _seed_capable_pool(session_maker, keypairs=(_KEYPAIR,))
         _install_db(app, session_maker)
         _install_chain(app)
-        claim = _job_payload()
+        claim = _job_payload(slot_id=_SLOT_ID)
         first = await client.post(
             "/api/v1/validator/job", headers=_AUTH_HEADER, json=claim
         )
         replay = await client.post(
             "/api/v1/validator/job", headers=_AUTH_HEADER, json=claim
         )
-        assert first.status_code == 200
+        assert first.status_code == 200, first.text
         assert replay.status_code == 409
 
     async def test_stale_job_claim_is_rejected(
@@ -4913,6 +5379,27 @@ class TestRequestJob:
 
 
 class TestFailJob:
+    @pytest.fixture(autouse=True)
+    async def _current_era(
+        self, app: FastAPI, session_maker: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """Put the fleet on the era these tests lease work in.
+
+        Two things that used to come for free at v2 have to be stated now.
+        ``active_bench_version`` answers ``DEFAULT_BENCH_VERSION`` (2) when no
+        rollout row exists, and 2 is beneath the ticket floor, so the allocator
+        cuts a lease the database refuses -- a 500 with nothing in it about
+        benchmarks. And every v7 lease must carry an inference grant, so the
+        routing policy has to exist before a job can be issued at all.
+
+        The third precondition -- a heartbeat the fleet counts as v7-capable --
+        is deliberately NOT seeded here: several tests in these classes are
+        about the absence or the wrong shape of that heartbeat. Tests that want
+        a job issued call ``_seed_capable_pool``.
+        """
+        await _seed_activated_era(session_maker)
+        await _install_ticket_inference(app, session_maker)
+
     async def test_closes_live_ticket_for_immediate_reissue(
         self,
         app: FastAPI,
@@ -4934,7 +5421,9 @@ class TestFailJob:
         assert body == {"agent_id": str(agent_id), "reopened": True}
 
         async with session_maker() as s:
-            ticket = await s.get(ValidatorTicket, (agent_id, 2, _VALIDATOR_HOTKEY))
+            ticket = await s.get(
+                ValidatorTicket, (agent_id, _BENCH_VERSION, _VALIDATOR_HOTKEY)
+            )
             assert ticket is not None
             # A scoring_error closes for immediate reissue: expired now with
             # retry_after=now, not the 6h cooldown, so the next request_job mints
@@ -4999,7 +5488,9 @@ class TestFailJob:
         assert failed.status_code == 200, failed.text
 
         async with session_maker() as s:
-            ticket = await s.get(ValidatorTicket, (agent_id, 2, _VALIDATOR_HOTKEY))
+            ticket = await s.get(
+                ValidatorTicket, (agent_id, _BENCH_VERSION, _VALIDATOR_HOTKEY)
+            )
             assert ticket is not None
             now = datetime.now(UTC)
             retry_after = ticket.retry_after
@@ -5036,7 +5527,9 @@ class TestFailJob:
         assert failed.json()["reopened"] is True
 
         async with session_maker() as s:
-            ticket = await s.get(ValidatorTicket, (agent_id, 2, _VALIDATOR_HOTKEY))
+            ticket = await s.get(
+                ValidatorTicket, (agent_id, _BENCH_VERSION, _VALIDATOR_HOTKEY)
+            )
             assert ticket is not None
             assert ticket.status == TicketStatus.EXPIRED
             assert ticket.failure_reason == "sandbox_oom"
@@ -5077,7 +5570,9 @@ class TestFailJob:
         assert failed.status_code == 200, failed.text
         assert failed.json()["reopened"] is True
         async with session_maker() as s:
-            ticket = await s.get(ValidatorTicket, (agent_id, 2, _VALIDATOR_HOTKEY))
+            ticket = await s.get(
+                ValidatorTicket, (agent_id, _BENCH_VERSION, _VALIDATOR_HOTKEY)
+            )
             assert ticket is not None
             assert ticket.infra_retry_grants == 1
 
@@ -5100,7 +5595,9 @@ class TestFailJob:
         )
         assert failed.status_code == 200, failed.text
         async with session_maker() as s:
-            ticket = await s.get(ValidatorTicket, (agent_id, 2, _VALIDATOR_HOTKEY))
+            ticket = await s.get(
+                ValidatorTicket, (agent_id, _BENCH_VERSION, _VALIDATOR_HOTKEY)
+            )
             assert ticket is not None
             assert ticket.infra_retry_grants == 0
 
@@ -5129,7 +5626,9 @@ class TestFailJob:
         )
         assert failed.status_code == 200, failed.text
         async with session_maker() as s:
-            ticket = await s.get(ValidatorTicket, (agent_id, 2, _VALIDATOR_HOTKEY))
+            ticket = await s.get(
+                ValidatorTicket, (agent_id, _BENCH_VERSION, _VALIDATOR_HOTKEY)
+            )
             assert ticket is not None
             assert ticket.infra_retry_grants == 1
             # The diagnosis is preserved verbatim; only the billing changed.
@@ -5159,7 +5658,9 @@ class TestFailJob:
         )
         assert failed.status_code == 200, failed.text
         async with session_maker() as s:
-            ticket = await s.get(ValidatorTicket, (agent_id, 2, _VALIDATOR_HOTKEY))
+            ticket = await s.get(
+                ValidatorTicket, (agent_id, _BENCH_VERSION, _VALIDATOR_HOTKEY)
+            )
             assert ticket is not None
             assert ticket.infra_retry_grants == 0
 
@@ -5174,7 +5675,9 @@ class TestFailJob:
         agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
         await _seed_ticket(session_maker, agent_id)
         async with session_maker() as s, s.begin():
-            ticket = await s.get(ValidatorTicket, (agent_id, 2, _VALIDATOR_HOTKEY))
+            ticket = await s.get(
+                ValidatorTicket, (agent_id, _BENCH_VERSION, _VALIDATOR_HOTKEY)
+            )
             assert ticket is not None
             ticket.infra_retry_grants = MAX_INFRA_RETRY_GRANTS
         _install_db(app, session_maker)
@@ -5187,7 +5690,9 @@ class TestFailJob:
         )
         assert failed.status_code == 200, failed.text
         async with session_maker() as s:
-            ticket = await s.get(ValidatorTicket, (agent_id, 2, _VALIDATOR_HOTKEY))
+            ticket = await s.get(
+                ValidatorTicket, (agent_id, _BENCH_VERSION, _VALIDATOR_HOTKEY)
+            )
             assert ticket is not None
             assert ticket.infra_retry_grants == MAX_INFRA_RETRY_GRANTS
 
@@ -5218,7 +5723,9 @@ class TestFailJob:
         )
         assert failed.status_code == 200, failed.text
         async with session_maker() as s:
-            ticket = await s.get(ValidatorTicket, (agent_id, 2, _VALIDATOR_HOTKEY))
+            ticket = await s.get(
+                ValidatorTicket, (agent_id, _BENCH_VERSION, _VALIDATOR_HOTKEY)
+            )
             assert ticket is not None
             assert ticket.failure_reason == "infrastructure"
             assert ticket.failure_detail == "sandbox_network_unavailable"
@@ -5248,7 +5755,9 @@ class TestFailJob:
         assert failed.status_code == 200, failed.text
         assert failed.json()["reopened"] is True
         async with session_maker() as s:
-            ticket = await s.get(ValidatorTicket, (agent_id, 2, _VALIDATOR_HOTKEY))
+            ticket = await s.get(
+                ValidatorTicket, (agent_id, _BENCH_VERSION, _VALIDATOR_HOTKEY)
+            )
             assert ticket is not None
             assert ticket.status == TicketStatus.EXPIRED
             assert ticket.failure_reason == "scoring_error"
@@ -5402,7 +5911,9 @@ class TestFailJob:
         await _seed_ticket(session_maker, agent_id)
         await _seed_ticket(session_maker, agent_id, keypair=_KEYPAIRS[1])
         async with session_maker() as s, s.begin():
-            first = await s.get(ValidatorTicket, (agent_id, 2, _VALIDATOR_HOTKEY))
+            first = await s.get(
+                ValidatorTicket, (agent_id, _BENCH_VERSION, _VALIDATOR_HOTKEY)
+            )
             assert first is not None
             first.infra_retry_grants = MAX_AGENT_INFRA_RETRY_GRANTS
         _install_db(app, session_maker)
@@ -5421,7 +5932,9 @@ class TestFailJob:
         )
         assert failed.status_code == 200, failed.text
         async with session_maker() as s:
-            ticket = await s.get(ValidatorTicket, (agent_id, 2, second_hotkey))
+            ticket = await s.get(
+                ValidatorTicket, (agent_id, _BENCH_VERSION, second_hotkey)
+            )
             assert ticket is not None
             # Refused: this failure bills the miner, so the ticket walks its
             # ordinary budget down to `exhausted` and the artifact surfaces on
@@ -5450,7 +5963,9 @@ class TestFailJob:
         await _seed_ticket(session_maker, agent_id)
         await _seed_ticket(session_maker, agent_id, keypair=_KEYPAIRS[1])
         async with session_maker() as s, s.begin():
-            first = await s.get(ValidatorTicket, (agent_id, 2, _VALIDATOR_HOTKEY))
+            first = await s.get(
+                ValidatorTicket, (agent_id, _BENCH_VERSION, _VALIDATOR_HOTKEY)
+            )
             assert first is not None
             first.infra_retry_grants = MAX_AGENT_INFRA_RETRY_GRANTS - 1
         _install_db(app, session_maker)
@@ -5466,7 +5981,9 @@ class TestFailJob:
         )
         assert failed.status_code == 200, failed.text
         async with session_maker() as s:
-            ticket = await s.get(ValidatorTicket, (agent_id, 2, second_hotkey))
+            ticket = await s.get(
+                ValidatorTicket, (agent_id, _BENCH_VERSION, second_hotkey)
+            )
             assert ticket is not None
             assert ticket.infra_retry_grants == 1
 
@@ -5486,7 +6003,9 @@ class TestFailJob:
         await _seed_ticket(session_maker, agent_id, keypair=_KEYPAIRS[1])
         await _seed_revoked_grant(session_maker, agent_id, keypair=_KEYPAIRS[1])
         async with session_maker() as s, s.begin():
-            first = await s.get(ValidatorTicket, (agent_id, 2, _VALIDATOR_HOTKEY))
+            first = await s.get(
+                ValidatorTicket, (agent_id, _BENCH_VERSION, _VALIDATOR_HOTKEY)
+            )
             assert first is not None
             first.infra_retry_grants = MAX_AGENT_INFRA_RETRY_GRANTS
         _install_db(app, session_maker)
@@ -5502,7 +6021,9 @@ class TestFailJob:
         )
         assert failed.status_code == 200, failed.text
         async with session_maker() as s:
-            ticket = await s.get(ValidatorTicket, (agent_id, 2, second_hotkey))
+            ticket = await s.get(
+                ValidatorTicket, (agent_id, _BENCH_VERSION, second_hotkey)
+            )
             assert ticket is not None
             assert ticket.infra_retry_grants == 1
 
@@ -5545,7 +6066,9 @@ class TestFailJob:
         assert resp.status_code == 200, resp.text
         assert resp.json()["reopened"] is False
         async with session_maker() as s:
-            ticket = await s.get(ValidatorTicket, (agent_id, 2, _VALIDATOR_HOTKEY))
+            ticket = await s.get(
+                ValidatorTicket, (agent_id, _BENCH_VERSION, _VALIDATOR_HOTKEY)
+            )
             assert ticket is not None
             assert ticket.status == TicketStatus.ISSUED
 
@@ -5679,7 +6202,7 @@ class TestSubmitScore:
         assert response.status_code == 200, response.text
         async with session_maker() as session:
             ticket = await session.get(
-                ValidatorTicket, (agent_id, 2, _VALIDATOR_HOTKEY)
+                ValidatorTicket, (agent_id, _BENCH_VERSION, _VALIDATOR_HOTKEY)
             )
         assert ticket is not None
         assert ticket.purpose == TicketPurpose.CANONICAL_QUORUM
@@ -5816,7 +6339,10 @@ class TestSubmitScore:
         )
         assert response.status_code == 409
         async with session_maker() as session:
-            assert await session.get(Score, (agent_id, 2, _VALIDATOR_HOTKEY)) is None
+            assert (
+                await session.get(Score, (agent_id, _BENCH_VERSION, _VALIDATOR_HOTKEY))
+                is None
+            )
 
     async def test_records_score_and_finalizes(
         self,
@@ -5850,7 +6376,7 @@ class TestSubmitScore:
 
         # A scores row landed and the agent transitioned.
         async with session_maker() as s:
-            score = await s.get(Score, (agent_id, 2, _VALIDATOR_HOTKEY))
+            score = await s.get(Score, (agent_id, _BENCH_VERSION, _VALIDATOR_HOTKEY))
             assert score is not None
             assert score.composite == pytest.approx(0.82)
             agent = await s.get(Agent, agent_id)
@@ -5903,7 +6429,9 @@ class TestSubmitScore:
         )
         assert requested.status_code == 200, requested.text
         async with session_maker() as session:
-            preserved = await session.get(Score, (agent_id, 2, _VALIDATOR_HOTKEY))
+            preserved = await session.get(
+                Score, (agent_id, _BENCH_VERSION, _VALIDATOR_HOTKEY)
+            )
             agent = await session.get(Agent, agent_id)
         assert preserved is not None and preserved.run_id == "original_0"
         assert agent is not None and agent.status == AgentStatus.SCORED
@@ -5924,7 +6452,9 @@ class TestSubmitScore:
         assert replacement.status_code == 200, replacement.text
         assert replacement.json()["status"] == AgentStatus.SCORED
         async with session_maker() as session:
-            swapped = await session.get(Score, (agent_id, 2, _VALIDATOR_HOTKEY))
+            swapped = await session.get(
+                Score, (agent_id, _BENCH_VERSION, _VALIDATOR_HOTKEY)
+            )
             scores = list(
                 (
                     await session.scalars(
@@ -6020,14 +6550,14 @@ class TestSubmitScore:
         assert response.status_code == 200
 
         async with session_maker() as s:
-            score = await s.get(Score, (agent_id, 2, _VALIDATOR_HOTKEY))
+            score = await s.get(Score, (agent_id, _BENCH_VERSION, _VALIDATOR_HOTKEY))
             assert score is not None
             assert score.details is not None
             # The payload now declares bench_version explicitly, so stamping
             # preserves it rather than overwriting with CURRENT: a report that
             # genuinely ran an older contract stays honestly labelled, and the
             # label matches the row's key.
-            assert score.details["bench_version"] == 2
+            assert score.details["bench_version"] == _BENCH_VERSION
             assert score.details["ticket_deadline"] == (
                 _TICKET_DEADLINE.isoformat(timespec="microseconds")
             )
@@ -6051,10 +6581,10 @@ class TestSubmitScore:
         assert response.status_code == 200
 
         async with session_maker() as s:
-            score = await s.get(Score, (agent_id, 2, _VALIDATOR_HOTKEY))
+            score = await s.get(Score, (agent_id, _BENCH_VERSION, _VALIDATOR_HOTKEY))
             assert score is not None
             assert score.details is not None
-            assert score.details["bench_version"] == 2
+            assert score.details["bench_version"] == _BENCH_VERSION
 
     async def test_one_ticket_one_score_no_rescore(
         self,
@@ -6559,6 +7089,27 @@ class TestAntiCopyGate:
 class TestPublicMirror:
     """The finalize hook mirrors the run record to the public bucket."""
 
+    @pytest.fixture(autouse=True)
+    async def _current_era(
+        self, app: FastAPI, session_maker: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """Put the fleet on the era these tests lease work in.
+
+        Two things that used to come for free at v2 have to be stated now.
+        ``active_bench_version`` answers ``DEFAULT_BENCH_VERSION`` (2) when no
+        rollout row exists, and 2 is beneath the ticket floor, so the allocator
+        cuts a lease the database refuses -- a 500 with nothing in it about
+        benchmarks. And every v7 lease must carry an inference grant, so the
+        routing policy has to exist before a job can be issued at all.
+
+        The third precondition -- a heartbeat the fleet counts as v7-capable --
+        is deliberately NOT seeded here: several tests in these classes are
+        about the absence or the wrong shape of that heartbeat. Tests that want
+        a job issued call ``_seed_capable_pool``.
+        """
+        await _seed_activated_era(session_maker)
+        await _install_ticket_inference(app, session_maker)
+
     async def test_finalize_publishes_when_public_bucket_configured(
         self,
         app: FastAPI,
@@ -6576,7 +7127,7 @@ class TestPublicMirror:
         )
         assert storage.put_object.await_count == 2
         versioned, current = storage.put_object.await_args_list
-        assert versioned.kwargs["key"] == f"scored/{agent_id}/v2.json"
+        assert versioned.kwargs["key"] == f"scored/{agent_id}/v{_BENCH_VERSION}.json"
         kwargs = current.kwargs
         assert kwargs["bucket"] == "ditto-public"
         assert kwargs["key"] == f"scored/{agent_id}.json"
@@ -6615,17 +7166,9 @@ class TestPublicMirror:
         storage = _install_storage(app)
         storage.public_bucket = "ditto-public"
         storage.put_object = AsyncMock()
+        # The v7 dataset pin this test used to add by hand now comes from
+        # ``_seed_agent``, which pins one for the fixture era.
         agent_id = await _seed_agent(session_maker, status=AgentStatus.SCORED)
-        async with session_maker() as session, session.begin():
-            session.add(
-                BenchmarkDataset(
-                    agent_id=agent_id,
-                    bench_version=7,
-                    seed=8675309,
-                    sha256="cd" * 32,
-                    run_size="full",
-                )
-            )
 
         for index, keypair in enumerate(_KEYPAIRS):
             await _seed_ticket(
@@ -6888,6 +7431,20 @@ class TestTranscriptPublication:
 
 
 class TestMultiValidatorConsensus:
+    @pytest.fixture(autouse=True)
+    async def _current_era(
+        self, app: FastAPI, session_maker: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """Put the fleet on the era these tests lease work in.
+
+        Same reason as the identical fixture on ``TestFailJob``: with no
+        rollout row the platform reports the floor, and every v7 lease has to
+        carry an inference grant, so the routing policy must exist before a job
+        can be issued at all. At v2 both came for free.
+        """
+        await _seed_activated_era(session_maker)
+        await _install_ticket_inference(app, session_maker)
+
     """The k=3 consensus semantics the decentralized design promises: the
     canonical score is the MEDIAN of the (differing) independent validator
     composites, the full per-validator record is exposed publicly, and an
@@ -6947,6 +7504,7 @@ class TestMultiValidatorConsensus:
         client: httpx.AsyncClient,
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
+        await _seed_capable_pool(session_maker, keypairs=[*_KEYPAIRS, _DAVE])
         agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
         _install_db(app, session_maker)
         _install_chain(app, extra_keypairs=(_DAVE,))
@@ -6956,7 +7514,7 @@ class TestMultiValidatorConsensus:
             r = await client.post(
                 "/api/v1/validator/job",
                 headers={"X-Validator-Hotkey": kp.ss58_address},
-                json=_job_payload(kp),
+                json=_job_payload(kp, slot_id="slot-0"),
             )
             assert r.status_code == 200, r.text
         # A fourth, never-assigned validator is shut out (pool full, not
@@ -6964,21 +7522,25 @@ class TestMultiValidatorConsensus:
         dave_hdr = {"X-Validator-Hotkey": _DAVE.ss58_address}
         assert (
             await client.post(
-                "/api/v1/validator/job", headers=dave_hdr, json=_job_payload(_DAVE)
+                "/api/v1/validator/job",
+                headers=dave_hdr,
+                json=_job_payload(_DAVE, slot_id="slot-0"),
             )
         ).status_code == 204
 
         # One validator's ticket lapses past its deadline, re-opening its slot.
         async with session_maker() as s, s.begin():
             lapsed = await s.get(
-                ValidatorTicket, (agent_id, 2, _KEYPAIRS[0].ss58_address)
+                ValidatorTicket, (agent_id, _BENCH_VERSION, _KEYPAIRS[0].ss58_address)
             )
             assert lapsed is not None
             lapsed.deadline = datetime.now(UTC) - timedelta(minutes=1)
 
         # The fourth validator now picks up the re-opened slot.
         reopened = await client.post(
-            "/api/v1/validator/job", headers=dave_hdr, json=_job_payload(_DAVE)
+            "/api/v1/validator/job",
+            headers=dave_hdr,
+            json=_job_payload(_DAVE, slot_id="slot-0"),
         )
         assert reopened.status_code == 200, reopened.text
         assert reopened.json()["agent_id"] == str(agent_id)
@@ -6989,6 +7551,7 @@ class TestMultiValidatorConsensus:
         client: httpx.AsyncClient,
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
+        await _seed_capable_pool(session_maker)
         agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
         _install_db(app, session_maker)
         _install_chain(app)
@@ -6996,12 +7559,16 @@ class TestMultiValidatorConsensus:
         headers = {"X-Validator-Hotkey": keypair.ss58_address}
 
         claimed = await client.post(
-            "/api/v1/validator/job", headers=headers, json=_job_payload(keypair)
+            "/api/v1/validator/job",
+            headers=headers,
+            json=_job_payload(keypair, slot_id="slot-0"),
         )
         assert claimed.status_code == 200, claimed.text
 
         async with session_maker() as s, s.begin():
-            lapsed = await s.get(ValidatorTicket, (agent_id, 2, keypair.ss58_address))
+            lapsed = await s.get(
+                ValidatorTicket, (agent_id, _BENCH_VERSION, keypair.ss58_address)
+            )
             assert lapsed is not None
             lapsed.deadline = datetime.now(UTC) - timedelta(minutes=1)
 
@@ -7011,7 +7578,9 @@ class TestMultiValidatorConsensus:
         assert cooling_down.status_code == 204
 
         async with session_maker() as s, s.begin():
-            lapsed = await s.get(ValidatorTicket, (agent_id, 2, keypair.ss58_address))
+            lapsed = await s.get(
+                ValidatorTicket, (agent_id, _BENCH_VERSION, keypair.ss58_address)
+            )
             assert lapsed is not None
             lapsed.retry_after = datetime.now(UTC) - timedelta(seconds=1)
 
@@ -7116,11 +7685,20 @@ def _install_chain_with_block(
 async def _seed_top5_emission_set(
     maker: async_sessionmaker[AsyncSession],
     *,
-    bench_version: int = 2,
+    bench_version: int = _BENCH_VERSION,
     composites: list[float] | None = None,
     composite_stderr: float = 0.03,
     seed_heartbeats: bool = True,
 ) -> list[UUID]:
+    """Seed a scored emission set on ``bench_version`` AND make it the era.
+
+    The activation row is not decoration. Every reader of this ledger -- the
+    confirmation lane, the KOTH fold, the public projection -- keys on
+    ``active_bench_version``, which with no rollout row at all still answers
+    ``DEFAULT_BENCH_VERSION`` (2). While these scores lived at v2 that happened
+    to line up; now that the floor forces them to v7 it does not, and without
+    the activation the whole set would be an island nothing reads.
+    """
     composites = composites or [0.90, 0.88, 0.86, 0.84, 0.82, 0.80]
     agent_ids = [
         await _seed_agent(
@@ -7133,7 +7711,19 @@ async def _seed_top5_emission_set(
         )
         for rank in range(len(composites))
     ]
+    activated_at = datetime.now(UTC) - timedelta(hours=2)
     async with maker() as session, session.begin():
+        session.add(
+            BenchmarkRollout(
+                rollout_id=uuid4(),
+                from_version=bench_version - 1,
+                desired_version=bench_version,
+                status="activated",
+                cohort_size=5,
+                created_at=activated_at,
+                activated_at=activated_at,
+            )
+        )
         for agent_id, composite in zip(agent_ids, composites, strict=True):
             for index, keypair in enumerate(_KEYPAIRS):
                 session.add(
@@ -7157,11 +7747,20 @@ async def _seed_top5_emission_set(
                     )
                 )
     if seed_heartbeats:
+        # Capability-bearing, not bare. Above v6 the confirmation lane refuses
+        # (428) any validator whose heartbeat cannot show ticket inference and
+        # a v7 calibration, so a heartbeat with no capabilities at all -- which
+        # is all these fixtures used to need -- now reads as incapable.
+        capabilities = _scorer_capable_capabilities(
+            now=datetime.now(UTC), versions=(bench_version,)
+        )
         for keypair in _KEYPAIRS:
             await _seed_validator_heartbeat(
                 maker,
                 keypair=keypair,
                 protocol_version=13,
+                capabilities=capabilities,
+                stack=_V7_STACK,
             )
     return agent_ids
 
@@ -7181,7 +7780,7 @@ async def _seed_confirmation_wave(
     agent_ids: Sequence[UUID],
     *,
     seed: int,
-    bench_version: int = 2,
+    bench_version: int = _BENCH_VERSION,
     composite: float = 0.90,
 ) -> None:
     """Record one already-scored wave seed for ``agent_ids``.
@@ -7264,7 +7863,7 @@ def _top5_score_payload(
 ) -> dict[str, object]:
     report: dict[str, object] = {
         "run_id": "top5-confirmation-run",
-        "bench_version": 2,
+        "bench_version": _BENCH_VERSION,
         "seed": seeds[0],
         "composite": statistics.median(composites),
         "tool_mean": statistics.median(composites),
@@ -7280,7 +7879,8 @@ def _top5_score_payload(
     pairs = json.dumps(list(zip(seeds, composites, strict=True)), separators=(",", ":"))
     message = (
         "validator-top5-confirmation-score:v1:"
-        f"{_VALIDATOR_HOTKEY}:{agent_id}:{lease}:top5-confirmation-run:2:{pairs}"
+        f"{_VALIDATOR_HOTKEY}:{agent_id}:{lease}:top5-confirmation-run:"
+        f"{_BENCH_VERSION}:{pairs}"
     ).encode()
     return {
         "validator_hotkey": _VALIDATOR_HOTKEY,
@@ -7291,6 +7891,22 @@ def _top5_score_payload(
 
 
 class TestTop5ConfirmationLane:
+    @pytest.fixture(autouse=True)
+    async def _v7_lane(
+        self, app: FastAPI, session_maker: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """Everything the lane needs once the era it retests is v7.
+
+        The emission sets below used to sit on v2, where a confirmation claim
+        needed no dataset generator and no inference grant at all. Neither is
+        optional now: ``top5-confirmation-job`` pins a dataset per seed and
+        refuses (503) any lease it cannot attach a grant to. Wiring both here
+        keeps every test in the class about what it was about -- claims,
+        cohorts, bands, waves -- instead of about v7 plumbing.
+        """
+        _install_dataset_generator(app)
+        await _install_ticket_inference(app, session_maker)
+
     async def test_emission_set_uses_completed_wave_mean_for_champion(
         self,
         session_maker: async_sessionmaker[AsyncSession],
@@ -7306,21 +7922,22 @@ class TestTop5ConfirmationLane:
 
         agent_ids = await _seed_top5_emission_set(
             session_maker,
-            bench_version=6,
             composites=[0.90, 0.92, 0.86, 0.84, 0.82, 0.80],
         )
         # The fold is scoped to the reigning champion's CRN anchor, so the wave
         # has to be recorded on seeds that champion's reign would really issue.
         # The incumbent keeps the crown here: 0.92 leads the raw median but at
         # ``composite_stderr=0.03`` it is well inside the dethrone band.
-        seed = champion_anchored_seeds(agent_ids[0], version=6, max_seeds=16)[0]
+        seed = champion_anchored_seeds(
+            agent_ids[0], version=_BENCH_VERSION, max_seeds=16
+        )[0]
         async with session_maker() as session, session.begin():
             for index, agent_id in enumerate(agent_ids[:5]):
                 session.add(
                     ConfirmationScore(
                         agent_id=agent_id,
                         validator_hotkey=_VALIDATOR_HOTKEY,
-                        bench_version=6,
+                        bench_version=_BENCH_VERSION,
                         seed=seed,
                         composite=1.0 if index == 0 else 0.0,
                         run_id=f"completed-wave-{index}",
@@ -7331,7 +7948,9 @@ class TestTop5ConfirmationLane:
         from ditto.api_server.endpoints.validator import _current_emission_set
 
         async with session_maker() as session:
-            members = await _current_emission_set(session, canonical_version=6)
+            members = await _current_emission_set(
+                session, canonical_version=_BENCH_VERSION
+            )
 
         assert members[0].agent_id == agent_ids[0]
         assert members[0].quorum_composites == (0.90, 0.90, 0.90)
@@ -7442,6 +8061,10 @@ class TestTop5ConfirmationLane:
             session_maker,
             keypair=_DAVE,
             protocol_version=13,
+            capabilities=_scorer_capable_capabilities(
+                now=datetime.now(UTC), versions=(_BENCH_VERSION,)
+            ),
+            stack=_V7_STACK,
         )
         _install_db(app, session_maker)
         _install_chain_with_block(app, block_number=1, extra_keypairs=(_DAVE,))
@@ -7454,10 +8077,12 @@ class TestTop5ConfirmationLane:
 
         assert response.status_code == 200, response.text
         async with session_maker() as session:
-            canonical = await session.get(Score, (champion, 2, _DAVE.ss58_address))
+            canonical = await session.get(
+                Score, (champion, _BENCH_VERSION, _DAVE.ss58_address)
+            )
             ticket = await session.get(
                 ValidatorTicket,
-                (champion, 2, _DAVE.ss58_address),
+                (champion, _BENCH_VERSION, _DAVE.ss58_address),
             )
         assert canonical is None
         assert ticket is not None
@@ -7475,7 +8100,7 @@ class TestTop5ConfirmationLane:
             session.add(
                 ValidatorTicket(
                     agent_id=champion,
-                    bench_version=2,
+                    bench_version=_BENCH_VERSION,
                     validator_hotkey=_VALIDATOR_HOTKEY,
                     status=TicketStatus.EXPIRED,
                     purpose=TicketPurpose.CONTINUAL_RETEST,
@@ -7498,7 +8123,7 @@ class TestTop5ConfirmationLane:
         async with session_maker() as session, session.begin():
             ticket = await session.get(
                 ValidatorTicket,
-                (champion, 2, _VALIDATOR_HOTKEY),
+                (champion, _BENCH_VERSION, _VALIDATOR_HOTKEY),
             )
             assert ticket is not None
             ticket.retry_after = datetime.now(UTC) - timedelta(seconds=1)
@@ -7516,39 +8141,22 @@ class TestTop5ConfirmationLane:
         client: httpx.AsyncClient,
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
-        # At v6 the 0.006 lead clears the decayed band around the older 0.900
-        # incumbent, but it does not clear the legacy flat 0.007 band. The
-        # validator ledger fold and public projection both carry bench_version;
-        # the claim verifier must do the same or it rejects the real champion.
+        # The band decay is keyed on ``KOTH_BAND_DECAY_MIN_BENCH_VERSION`` (6),
+        # so it is live for every era the ledger can still be written in: the
+        # 0.006 lead clears the decayed band around the older 0.900 incumbent
+        # but not the legacy flat 0.007 band. The fixture moved from v6 to the
+        # current era when the floor retired v6; the branch under test is the
+        # same one, because ">= 6" covers both.  The validator ledger fold and
+        # public projection both carry bench_version; the claim verifier must
+        # do the same or it rejects the real champion.
         agent_ids = await _seed_top5_emission_set(
             session_maker,
-            bench_version=6,
             composites=[0.900, 0.906, 0.86, 0.84, 0.82, 0.80],
             composite_stderr=0.0,
         )
         champion = agent_ids[1]
-        now = datetime.now(UTC)
-        async with session_maker() as session, session.begin():
-            session.add(
-                BenchmarkRollout(
-                    rollout_id=uuid4(),
-                    from_version=2,
-                    desired_version=6,
-                    status="activated",
-                    cohort_size=5,
-                    created_at=now,
-                    activated_at=now,
-                )
-            )
         _install_db(app, session_maker)
         _install_chain_with_block(app, block_number=1)
-        generator = MagicMock(run_size="full")
-        generator.generate = AsyncMock(
-            side_effect=lambda seed, *, bench_version: hashlib.sha256(
-                f"{bench_version}:{seed}".encode()
-            ).hexdigest()
-        )
-        app.dependency_overrides[get_dataset_generator] = lambda: generator
 
         response = await client.post(
             "/api/v1/validator/top5-confirmation-job",
@@ -7583,7 +8191,7 @@ class TestTop5ConfirmationLane:
         cohort = agent_ids[:5]
         completed_seeds = champion_anchored_seeds(
             old_champion,
-            version=2,
+            version=_BENCH_VERSION,
             max_seeds=16,
         )[:2]
         async with session_maker() as session, session.begin():
@@ -7601,7 +8209,7 @@ class TestTop5ConfirmationLane:
                     for agent_id in cohort
                     for seed in completed_seeds
                 ],
-                bench_version=2,
+                bench_version=_BENCH_VERSION,
                 created_at=datetime.now(UTC),
             )
         _install_db(app, session_maker)
@@ -7761,7 +8369,9 @@ class TestTop5ConfirmationLane:
         assert response.status_code == 200, response.text
         assert response.json()["agent_id"] == str(member)
         async with session_maker() as session:
-            ticket = await session.get(ValidatorTicket, (member, 2, _VALIDATOR_HOTKEY))
+            ticket = await session.get(
+                ValidatorTicket, (member, _BENCH_VERSION, _VALIDATOR_HOTKEY)
+            )
             assert ticket is not None
             assert ticket.purpose == TicketPurpose.CONTINUAL_RETEST
             # The lowest free slot, NOT the ``slot-0`` column default: the
@@ -7907,7 +8517,7 @@ class TestTop5ConfirmationLane:
             session.add(
                 ValidatorTicket(
                     agent_id=finished_agent,
-                    bench_version=2,
+                    bench_version=_BENCH_VERSION,
                     validator_hotkey=_KEYPAIRS[1].ss58_address,
                     status=TicketStatus.SCORED,
                     purpose=TicketPurpose.CANONICAL_QUORUM,
@@ -7954,7 +8564,9 @@ class TestTop5ConfirmationLane:
         )
         _install_db(app, session_maker)
         _install_chain_with_block(app, block_number=0)
-        seeds = list(champion_anchored_seeds(champion, version=2, max_seeds=16)[:2])
+        seeds = list(
+            champion_anchored_seeds(champion, version=_BENCH_VERSION, max_seeds=16)[:2]
+        )
 
         response = await client.post(
             f"/api/v1/validator/agent/{member}/top5-confirmation-score",
@@ -7993,7 +8605,9 @@ class TestTop5ConfirmationLane:
         )
         _install_db(app, session_maker)
         _install_chain_with_block(app, block_number=0)
-        seeds = list(champion_anchored_seeds(champion, version=2, max_seeds=16)[:2])
+        seeds = list(
+            champion_anchored_seeds(champion, version=_BENCH_VERSION, max_seeds=16)[:2]
+        )
 
         response = await client.post(
             f"/api/v1/validator/agent/{member}/top5-confirmation-score",
@@ -8007,7 +8621,9 @@ class TestTop5ConfirmationLane:
 
         assert response.status_code == 200, response.text
         async with session_maker() as session:
-            ticket = await session.get(ValidatorTicket, (member, 2, _VALIDATOR_HOTKEY))
+            ticket = await session.get(
+                ValidatorTicket, (member, _BENCH_VERSION, _VALIDATOR_HOTKEY)
+            )
         assert ticket is not None
         assert ticket.purpose == TicketPurpose.CONTINUAL_RETEST
         assert ticket.purpose_revision == 1
@@ -8022,7 +8638,6 @@ class TestTop5ConfirmationLane:
     ) -> None:
         agent_ids = await _seed_top5_emission_set(
             session_maker,
-            bench_version=7,
             seed_heartbeats=False,
         )
         champion, member = agent_ids[0], agent_ids[1]
@@ -8055,18 +8670,9 @@ class TestTop5ConfirmationLane:
             capabilities=capabilities,
             stack=_V7_STACK,
         )
+        # The activation is recorded by ``_seed_top5_emission_set`` now, and
+        # ``benchmark_rollouts_transition_idx`` refuses a second 6 -> 7 row.
         async with session_maker() as session, session.begin():
-            session.add(
-                BenchmarkRollout(
-                    rollout_id=uuid4(),
-                    from_version=6,
-                    desired_version=7,
-                    status="activated",
-                    cohort_size=5,
-                    created_at=now,
-                    activated_at=now,
-                )
-            )
             for agent_id in agent_ids:
                 agent = await session.get(Agent, agent_id)
                 assert agent is not None
@@ -8157,27 +8763,38 @@ class TestTop5ConfirmationLane:
         )
         assert job.status_code == 200, job.text
         deadline = datetime.fromisoformat(job.json()["deadline"])
-        seeds = list(champion_anchored_seeds(champion, version=2, max_seeds=16)[:2])
+        # One lease, one seed. From v3 onward the lane pins a dataset onto the
+        # ticket and refuses any report that does not name exactly that seed;
+        # a v2 retest lease carried no seed at all, which is why this used to
+        # be free to submit the first two of the champion's anchored plan.
+        seeds = [pin["seed"] for pin in job.json()["confirmation_datasets"]]
+        assert seeds == list(
+            champion_anchored_seeds(champion, version=_BENCH_VERSION, max_seeds=16)[:1]
+        )
         submitted = await client.post(
             f"/api/v1/validator/agent/{member}/top5-confirmation-score",
             json=_top5_score_payload(
                 member,
                 deadline=deadline,
                 seeds=seeds,
-                composites=[0.81, 0.83],
+                composites=[0.81],
             ),
         )
         assert submitted.status_code == 200, submitted.text
 
         async with session_maker() as session:
-            canonical = await session.get(Score, (member, 2, _VALIDATOR_HOTKEY))
+            canonical = await session.get(
+                Score, (member, _BENCH_VERSION, _VALIDATOR_HOTKEY)
+            )
             confirmations = await session.scalar(
                 select(func.count()).where(ConfirmationScore.agent_id == member)
             )
-            ticket = await session.get(ValidatorTicket, (member, 2, _VALIDATOR_HOTKEY))
+            ticket = await session.get(
+                ValidatorTicket, (member, _BENCH_VERSION, _VALIDATOR_HOTKEY)
+            )
         assert canonical is not None
         assert canonical.run_id.startswith("top5-")
-        assert confirmations == 2
+        assert confirmations == 1
         assert ticket is not None and ticket.status == TicketStatus.SCORED
         assert ticket.purpose == TicketPurpose.CONTINUAL_RETEST
 
@@ -8211,7 +8828,9 @@ class TestTop5ConfirmationLane:
 
         agent_ids = await _seed_ranked_pool(session_maker, size=10)
         champion, sixth = agent_ids[0], agent_ids[5]
-        wave_seed = champion_anchored_seeds(champion, version=2, max_seeds=16)[0]
+        wave_seed = champion_anchored_seeds(
+            champion, version=_BENCH_VERSION, max_seeds=16
+        )[0]
         # Every emission-set member but the champion already holds this seed;
         # the champion is leased below. Nothing in the top five is left waiting,
         # so the extended cohort is what the spare slot is for.
@@ -8238,7 +8857,7 @@ class TestTop5ConfirmationLane:
         assert extended.status_code == 200, extended.text
         async with session_maker() as session:
             ticket = await session.get(
-                ValidatorTicket, (sixth, 2, _KEYPAIRS[1].ss58_address)
+                ValidatorTicket, (sixth, _BENCH_VERSION, _KEYPAIRS[1].ss58_address)
             )
         assert ticket is not None
         assert ticket.purpose == TicketPurpose.CONTINUAL_RETEST
@@ -8285,7 +8904,9 @@ class TestTop5ConfirmationLane:
             composites=[0.90, 0.89, 0.88, 0.87, 0.86, 0.86, 0.80],
         )
         champion, sixth = agent_ids[0], agent_ids[5]
-        wave_seed = champion_anchored_seeds(champion, version=2, max_seeds=16)[0]
+        wave_seed = champion_anchored_seeds(
+            champion, version=_BENCH_VERSION, max_seeds=16
+        )[0]
         # Clear the emission set off the open seed so the spare slot is genuinely
         # available to the extended member rather than contended.
         await _seed_confirmation_wave(session_maker, agent_ids[1:5], seed=wave_seed)
@@ -8317,7 +8938,7 @@ class TestTop5ConfirmationLane:
         assert tied.status_code == 200, tied.text
         async with session_maker() as session:
             ticket = await session.get(
-                ValidatorTicket, (sixth, 2, _KEYPAIRS[1].ss58_address)
+                ValidatorTicket, (sixth, _BENCH_VERSION, _KEYPAIRS[1].ss58_address)
             )
         assert ticket is not None
         assert ticket.purpose == TicketPurpose.CONTINUAL_RETEST
@@ -8363,7 +8984,7 @@ class TestTop5ConfirmationLane:
                 await latest_continual_retest_settings_revision(session)
             )
             emission, cohort = await _current_retest_cohort(
-                session, canonical_version=2, settings=settings
+                session, canonical_version=_BENCH_VERSION, settings=settings
             )
 
         assert len(emission) == 5
@@ -8415,7 +9036,7 @@ class TestTop5ConfirmationLane:
 
         agent_ids = await _seed_ranked_pool(session_maker, size=10)
         champion = agent_ids[0]
-        seeds = champion_anchored_seeds(champion, version=2, max_seeds=16)
+        seeds = champion_anchored_seeds(champion, version=_BENCH_VERSION, max_seeds=16)
         await _seed_confirmation_wave(session_maker, agent_ids[:5], seed=seeds[0])
         await _set_retest_cohort_size(session_maker, 10)
         _install_db(app, session_maker)
@@ -8432,16 +9053,41 @@ class TestTop5ConfirmationLane:
         assert advanced.status_code == 200, advanced.text
 
 
-def _v3_capable_capabilities(*, now: datetime) -> dict[str, object]:
-    """Capabilities that satisfy ``heartbeat_supports_version`` for v3."""
+def _scorer_capable_capabilities(
+    *,
+    now: datetime,
+    versions: Sequence[int] = (_BENCH_VERSION, _BENCH_VERSION + 1),
+) -> dict[str, object]:
+    """Capabilities that satisfy ``heartbeat_supports_version`` for ``versions``.
+
+    This used to advertise ``[2, 3]`` and nothing else, because below v7 the
+    version list was the whole story. It is not any more:
+    ``verified_scorer_for_version`` additionally demands ticket inference, the
+    signed score quorum and a v7 calibration manifest before it will call a
+    scorer capable of v7 or later. Renumbering the list alone would have
+    produced a fixture that reads as capable and is silently refused, which
+    shows up as an unexplained 409 rather than as a capability problem.
+    """
     return {
         **_V7_CAPABILITIES,
+        "ticket_inference": True,
+        "signed_score_quorum": True,
         "scorer_benchmarks": {
             "status": "fresh_verified",
-            "supported_bench_versions": [2, 3],
+            "supported_bench_versions": list(versions),
             "observed_at": int(now.timestamp()),
             "software_version": "1.2.2",
             "source_revision": "2" * 40,
+            "v7_calibration": {
+                "manifest_sha256": _V7_CALIBRATION_MANIFEST,
+                "supported_routes": [
+                    {
+                        "provider": "openrouter",
+                        "profile_revision": _V7_ROUTE_PROFILE,
+                        "model": "openai/gpt-oss-20b",
+                    }
+                ],
+            },
         },
     }
 
@@ -8452,19 +9098,27 @@ async def _seed_top5_rollout_standdown_fixture(
     rollout_status: str | None = "collecting",
     desired_version_capable: bool = True,
     settings: dict[str, object] | None = None,
-    emission_bench_version: int = 2,
 ) -> tuple[UUID, UUID]:
-    """A due top-five cohort plus an optional open 2 -> 3 rollout."""
-    agent_ids = await _seed_top5_emission_set(
-        maker, bench_version=emission_bench_version, seed_heartbeats=False
-    )
+    """A due top-five cohort plus an optional rollout off the current era.
+
+    The open shapes are a rollout from the canonical version to the next one,
+    which is what the stand-down is about. ``"activated"`` is different in kind
+    and no longer needs a row of its own: the activation that put the fleet on
+    the canonical version is already on record from ``_seed_top5_emission_set``,
+    and it is the only activated transition the ledger can hold, since
+    ``benchmark_rollouts_transition_idx`` is unique on (from, desired).
+    """
+    agent_ids = await _seed_top5_emission_set(maker, seed_heartbeats=False)
     now = datetime.now(UTC)
     capabilities = (
-        _v3_capable_capabilities(now=now)
+        _scorer_capable_capabilities(now=now)
         if desired_version_capable
         # A validator that cannot serve the desired version can never take
-        # cohort work, so the rollout is not competing with it at all.
-        else {**_V7_CAPABILITIES, "scorer_benchmarks": None}
+        # cohort work, so the rollout is not competing with it at all. It must
+        # still be able to serve the CANONICAL version, or the lane refuses it
+        # on capability (428) before the stand-down question is reached -- a
+        # distinction that did not exist while the canonical era was v2.
+        else _scorer_capable_capabilities(now=now, versions=(_BENCH_VERSION,))
     )
     for keypair in _KEYPAIRS:
         await _seed_validator_heartbeat(
@@ -8478,12 +9132,14 @@ async def _seed_top5_rollout_standdown_fixture(
         champion_row = await session.get(Agent, agent_ids[0])
         assert champion_row is not None
         champion_row.dataset_seed_block = 1
-        if rollout_status is not None:
+        # "activated" is already on record (see the docstring), so only the
+        # open shapes add a row.
+        if rollout_status is not None and rollout_status != "activated":
             session.add(
                 BenchmarkRollout(
                     rollout_id=uuid4(),
-                    from_version=2,
-                    desired_version=3,
+                    from_version=_BENCH_VERSION,
+                    desired_version=_BENCH_VERSION + 1,
                     status=rollout_status,
                     cohort_size=5,
                     created_at=now - timedelta(hours=1),
@@ -8506,6 +9162,22 @@ async def _seed_top5_rollout_standdown_fixture(
 
 class TestTop5RolloutStanddown:
     """Continual retests yield scarce validator slots to an open rollout."""
+
+    @pytest.fixture(autouse=True)
+    async def _v7_lane(
+        self, app: FastAPI, session_maker: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """Everything the lane needs once the era it retests is v7.
+
+        The emission sets below used to sit on v2, where a confirmation claim
+        needed no dataset generator and no inference grant at all. Neither is
+        optional now: ``top5-confirmation-job`` pins a dataset per seed and
+        refuses (503) any lease it cannot attach a grant to. Wiring both here
+        keeps every test in the class about what it was about -- claims,
+        cohorts, bands, waves -- instead of about v7 plumbing.
+        """
+        _install_dataset_generator(app)
+        await _install_ticket_inference(app, session_maker)
 
     @staticmethod
     def _install(app: FastAPI, session_maker: async_sessionmaker[AsyncSession]) -> None:
@@ -8533,7 +9205,7 @@ class TestTop5RolloutStanddown:
         message = response.json()["message"]
         # The refusal must name the rollout, or an operator reads it as a bug.
         assert "standing down" in message
-        assert "benchmark version 3" in message
+        assert f"benchmark version {_BENCH_VERSION + 1}" in message
         async with session_maker() as session:
             issued = await session.scalar(
                 select(func.count()).where(
@@ -8568,9 +9240,16 @@ class TestTop5RolloutStanddown:
         client: httpx.AsyncClient,
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
-        """Activation retires the rollout, and retests confirm the new era."""
+        """Activation retires the rollout, and retests confirm the new era.
+
+        The activated transition here is the one that made the canonical
+        version canonical -- a rollout that has already landed is terminal, so
+        there is nothing left for the lane to stand down for. That is a
+        different statement from ``rollout_status=None``, which is the fleet
+        having never rolled at all.
+        """
         champion, member = await _seed_top5_rollout_standdown_fixture(
-            session_maker, rollout_status="activated", emission_bench_version=3
+            session_maker, rollout_status="activated"
         )
         self._install(app, session_maker)
         generator = MagicMock(run_size="full")
@@ -8718,13 +9397,19 @@ class TestTop5RolloutStanddown:
         )
         assert leased.status_code == 200, leased.text
         deadline = datetime.fromisoformat(leased.json()["deadline"])
-        seeds = list(champion_anchored_seeds(champion, version=2, max_seeds=16)[:2])
+        # The lease pins its own seed above v2, and the report has to name that
+        # one; taking it from the job response keeps this test about the
+        # stand-down rather than about seed derivation.
+        seeds = [pin["seed"] for pin in leased.json()["confirmation_datasets"]]
+        assert seeds == list(
+            champion_anchored_seeds(champion, version=_BENCH_VERSION, max_seeds=16)[:1]
+        )
         async with session_maker() as session, session.begin():
             session.add(
                 BenchmarkRollout(
                     rollout_id=uuid4(),
-                    from_version=2,
-                    desired_version=3,
+                    from_version=_BENCH_VERSION,
+                    desired_version=_BENCH_VERSION + 1,
                     status="collecting",
                     cohort_size=5,
                     created_at=datetime.now(UTC),
@@ -8737,7 +9422,7 @@ class TestTop5RolloutStanddown:
                 member,
                 deadline=deadline,
                 seeds=seeds,
-                composites=[0.81, 0.83],
+                composites=[0.81],
             ),
         )
 
@@ -9030,7 +9715,7 @@ async def _seed_catchup_board(
     pool_composites: Sequence[float] = (0.90, 0.88, 0.86, 0.84, 0.82),
     extra_keypairs: Sequence[bittensor.Keypair] = (),
     benchmark_capacity: dict[str, object] | None = None,
-    bench_version: int = 3,
+    bench_version: int = _BENCH_VERSION,
 ) -> tuple[UUID, UUID, list[int]]:
     """Reproduce today's incident: a promotion into a settled emission set.
 
@@ -9058,7 +9743,7 @@ async def _seed_catchup_board(
             maker,
             keypair=keypair,
             protocol_version=13,
-            capabilities=_v3_capable_capabilities(now=now),
+            capabilities=_scorer_capable_capabilities(now=now),
             stack=_V7_STACK,
             benchmark_capacity=benchmark_capacity,
         )
@@ -9078,18 +9763,6 @@ async def _seed_catchup_board(
         champion_row = await session.get(Agent, champion)
         assert champion_row is not None
         champion_row.dataset_seed_block = 1
-        if bench_version > 2:
-            session.add(
-                BenchmarkRollout(
-                    rollout_id=uuid4(),
-                    from_version=2,
-                    desired_version=bench_version,
-                    status="activated",
-                    cohort_size=5,
-                    created_at=now - timedelta(hours=1),
-                    activated_at=now,
-                )
-            )
         for index, keypair in enumerate(_KEYPAIRS):
             session.add(
                 Score(
@@ -9156,7 +9829,7 @@ async def _leased_retest_seeds(
         rows = await session.execute(
             select(ValidatorTicket.validator_hotkey, ValidatorTicket.seed).where(
                 ValidatorTicket.agent_id == agent_id,
-                ValidatorTicket.bench_version == 3,
+                ValidatorTicket.bench_version == _BENCH_VERSION,
                 ValidatorTicket.purpose == TicketPurpose.CONTINUAL_RETEST,
                 ValidatorTicket.status == TicketStatus.ISSUED,
             )
@@ -9175,6 +9848,22 @@ class TestTop5CatchUpConvergence:
     coverage gap claimable at once so the degraded window is brief.
     """
 
+    @pytest.fixture(autouse=True)
+    async def _v7_lane(
+        self, app: FastAPI, session_maker: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """Everything the lane needs once the era it retests is v7.
+
+        The emission sets below used to sit on v2, where a confirmation claim
+        needed no dataset generator and no inference grant at all. Neither is
+        optional now: ``top5-confirmation-job`` pins a dataset per seed and
+        refuses (503) any lease it cannot attach a grant to. Wiring both here
+        keeps every test in the class about what it was about -- claims,
+        cohorts, bands, waves -- instead of about v7 plumbing.
+        """
+        _install_dataset_generator(app)
+        await _install_ticket_inference(app, session_maker)
+
     async def test_promotion_makes_the_whole_backlog_claimable_at_once(
         self,
         app: FastAPI,
@@ -9189,7 +9878,9 @@ class TestTop5CatchUpConvergence:
         champion, newcomer, settled = await _seed_catchup_board(app, session_maker)
 
         async with session_maker() as session:
-            members = await _current_emission_set(session, canonical_version=3)
+            members = await _current_emission_set(
+                session, canonical_version=_BENCH_VERSION
+            )
         member_ids = [member.agent_id for member in members]
         assert members[0].agent_id == champion
         assert newcomer in member_ids, "the newcomer must have been promoted"
@@ -9210,7 +9901,7 @@ class TestTop5CatchUpConvergence:
                 champion_agent_id=champion,
                 member_agent_id=newcomer,
                 wave_member_ids=tuple(member_ids),
-                canonical_version=3,
+                canonical_version=_BENCH_VERSION,
             )
 
         # Every missing pair at once -- not the single open wave seed that took
@@ -9245,7 +9936,9 @@ class TestTop5CatchUpConvergence:
         async with session_maker() as session:
             before = {
                 member.agent_id: member.completed_wave_composites
-                for member in await _current_emission_set(session, canonical_version=3)
+                for member in await _current_emission_set(
+                    session, canonical_version=_BENCH_VERSION
+                )
             }
 
         async with session_maker() as session, session.begin():
@@ -9262,14 +9955,16 @@ class TestTop5CatchUpConvergence:
                     )
                     for seed in settled
                 ],
-                bench_version=3,
+                bench_version=_BENCH_VERSION,
                 created_at=datetime.now(UTC),
             )
 
         async with session_maker() as session:
             after = {
                 member.agent_id: member.completed_wave_composites
-                for member in await _current_emission_set(session, canonical_version=3)
+                for member in await _current_emission_set(
+                    session, canonical_version=_BENCH_VERSION
+                )
             }
 
         assert before[newcomer] is None
@@ -9301,7 +9996,9 @@ class TestTop5CatchUpConvergence:
         async with session_maker() as session:
             member_ids = tuple(
                 member.agent_id
-                for member in await _current_emission_set(session, canonical_version=3)
+                for member in await _current_emission_set(
+                    session, canonical_version=_BENCH_VERSION
+                )
             )
 
         # Half the gap already covered: the plan must name the other half only.
@@ -9315,7 +10012,7 @@ class TestTop5CatchUpConvergence:
                     )
                     for seed in covered
                 ],
-                bench_version=3,
+                bench_version=_BENCH_VERSION,
                 created_at=datetime.now(UTC),
             )
 
@@ -9326,7 +10023,7 @@ class TestTop5CatchUpConvergence:
                     champion_agent_id=champion,
                     member_agent_id=member,
                     wave_member_ids=member_ids,
-                    canonical_version=3,
+                    canonical_version=_BENCH_VERSION,
                 )
 
         assert await _plan(newcomer) == tuple(missing)
@@ -9406,7 +10103,9 @@ class TestTop5CatchUpConvergence:
         async with session_maker() as session:
             member_ids = {
                 member.agent_id
-                for member in await _current_emission_set(session, canonical_version=3)
+                for member in await _current_emission_set(
+                    session, canonical_version=_BENCH_VERSION
+                )
             }
             extended = await session.scalars(
                 select(Agent.agent_id).where(Agent.name == "top5-5")
@@ -9441,7 +10140,7 @@ class TestTop5CatchUpConvergence:
                     session,
                     champion_agent_id=champion,
                     emission_member_ids=tuple(member_ids),
-                    canonical_version=3,
+                    canonical_version=_BENCH_VERSION,
                     now=datetime.now(UTC),
                 )
 
@@ -9461,7 +10160,7 @@ class TestTop5CatchUpConvergence:
                     )
                     for seed in settled
                 ],
-                bench_version=3,
+                bench_version=_BENCH_VERSION,
                 created_at=datetime.now(UTC),
             )
 
@@ -9491,7 +10190,7 @@ class TestTop5CatchUpConvergence:
         champion, newcomer, settled = await _seed_catchup_board(
             app,
             session_maker,
-            bench_version=2,
+            bench_version=_BENCH_VERSION,
             pool_composites=(0.90, 0.88, 0.86, 0.84, 0.82, 0.70),
             benchmark_capacity=one_slot,
         )

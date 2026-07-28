@@ -24,6 +24,12 @@ from ditto.db.queries.tickets import get_open_ticket
 pytestmark = pytest.mark.integration
 
 _HOTKEY = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
+# The era these leases are for. Nothing here is about a benchmark version --
+# these tests are about lock order and savepoints -- but a ticket can no longer
+# fall back to the model default of 2: the ``validator_tickets`` floor trigger
+# refuses to create a lease beneath MIN_SCOREABLE_BENCH_VERSION, so the version
+# has to be said out loud, and the one worth saying is the live one.
+_BENCH_VERSION = 7
 # Arbitrary but module-private; advisory-lock keys share one global namespace.
 _MODULE_LOCK_KEY = 0x_D177_0001
 
@@ -155,6 +161,7 @@ async def test_progress_waiting_behind_score_lock_rechecks_consumed_ticket(
                 status=TicketStatus.ISSUED,
                 issued_at=now,
                 deadline=deadline,
+                bench_version=_BENCH_VERSION,
             )
         )
 
@@ -171,6 +178,7 @@ async def test_progress_waiting_behind_score_lock_rechecks_consumed_ticket(
                 validator_hotkey=_HOTKEY,
                 now=now,
                 deadline=deadline,
+                bench_version=_BENCH_VERSION,
                 for_update=True,
             )
             if agent.status != AgentStatus.EVALUATING or ticket is None:
@@ -206,6 +214,7 @@ async def test_progress_waiting_behind_score_lock_rechecks_consumed_ticket(
             validator_hotkey=_HOTKEY,
             now=now,
             deadline=deadline,
+            bench_version=_BENCH_VERSION,
             for_update=True,
         )
         assert ticket is not None
@@ -222,7 +231,9 @@ async def test_progress_waiting_behind_score_lock_rechecks_consumed_ticket(
     assert await asyncio.wait_for(progress_task, timeout=2) is False
     async with session_maker() as session:
         heartbeat = await session.get(ValidatorHeartbeat, _HOTKEY)
-        spent_ticket = await session.get(ValidatorTicket, (agent_id, 2, _HOTKEY))
+        spent_ticket = await session.get(
+            ValidatorTicket, (agent_id, _BENCH_VERSION, _HOTKEY)
+        )
     assert heartbeat is None
     assert spent_ticket is not None and spent_ticket.status == TicketStatus.SCORED
 
@@ -261,6 +272,7 @@ async def test_savepoint_rollback_frees_work_locks_and_keeps_the_liveness_write(
                 status=TicketStatus.ISSUED,
                 issued_at=now,
                 deadline=deadline,
+                bench_version=_BENCH_VERSION,
             )
         )
 
@@ -278,6 +290,7 @@ async def test_savepoint_rollback_frees_work_locks_and_keeps_the_liveness_write(
                     validator_hotkey=_HOTKEY,
                     now=now,
                     deadline=deadline,
+                    bench_version=_BENCH_VERSION,
                     for_update=True,
                 )
                 assert ticket is not None

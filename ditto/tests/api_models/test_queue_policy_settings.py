@@ -11,6 +11,7 @@ implementation.
 from __future__ import annotations
 
 import pytest
+from pydantic import ValidationError
 
 from ditto.api_models.queue_policy_settings import (
     DEFAULT_FRESH_SUBMISSION_SLOTS,
@@ -126,17 +127,25 @@ class TestQueuePolicyBoundsMatchQueueConstants:
         with pytest.raises(ValueError):
             PrevGenCarryoverSettings(max_agents=MAX_PREV_GEN_CARRYOVER_AGENTS + 1)
 
-    def test_a_retired_era_is_not_backfilled_by_default(self) -> None:
-        """The one default here that is NOT the pre-existing behaviour.
+    def test_a_retired_era_has_no_knob_left_to_turn(self) -> None:
+        """``allow_retired_era_backfill`` is gone, and gone is stronger than off.
 
-        A knob that ships matching today's behaviour fixes nothing: the fleet
-        keeps spending slots on a benchmark version no quorum will ever accept
-        until somebody remembers to go and turn it off.
+        It shipped ``False``, but it was an MCP-exposed runtime setting whose
+        own docstring advertised that flipping it restored retired-era
+        admission "without a deploy". One Backroom write re-opened v6. A
+        default is not a floor.
+
+        ``extra="forbid"`` is what makes the removal load-bearing rather than
+        cosmetic: a stale writer that still sends the key is REJECTED, not
+        silently ignored, so nobody gets to believe they turned it back on.
         """
-        assert PrevGenCarryoverSettings().allow_retired_era_backfill is False
-        assert QueuePolicySettings().prev_gen_carryover.allow_retired_era_backfill is (
-            False
-        )
+        assert "allow_retired_era_backfill" not in PrevGenCarryoverSettings.model_fields
+        with pytest.raises(ValidationError):
+            PrevGenCarryoverSettings(allow_retired_era_backfill=True)  # type: ignore[call-arg]
+        with pytest.raises(ValidationError):
+            QueuePolicySettings(
+                prev_gen_carryover={"allow_retired_era_backfill": True}  # type: ignore[arg-type]
+            )
 
 
 class TestLaneDecision:

@@ -35,8 +35,14 @@ from ditto.db.queries.scores import SCORING_QUORUM
 
 _ROLLOUT_START = datetime(2026, 7, 22, 12, 0, 0, tzinfo=UTC)
 _NOW = _ROLLOUT_START + timedelta(days=3)
-_FROM_VERSION = 6
-_DESIRED_VERSION = 7
+# The generation being retired and the one superseding it. These used to be
+# 6 and 7 -- the transition that was live when the file was written -- and the
+# tests below write real ``scores`` rows at ``_FROM_VERSION``, which the floor
+# now refuses under MIN_SCOREABLE_BENCH_VERSION. Nothing here is about v6
+# specifically: the rule under test is "the generation the fleet has moved off,
+# whichever that is", so the same pair sits one era up.
+_FROM_VERSION = 7
+_DESIRED_VERSION = 8
 _ENABLED = PrevGenCarryoverSettings(enabled=True)
 
 
@@ -106,7 +112,7 @@ def _retire(session: AsyncSession, agent_id: UUID) -> None:
             bench_version=_FROM_VERSION,
             superseded_by_version=_DESIRED_VERSION,
             actor="peyton",
-            reason="benchmark v6 is closed and will not be scored again",
+            reason=f"benchmark v{_FROM_VERSION} is closed and will not be scored again",
             expected_snapshot="ab" * 32,
             score_count=2,
             ticket_snapshot=[],

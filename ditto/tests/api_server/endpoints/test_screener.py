@@ -84,6 +84,7 @@ from ditto.db.models import (
     ValidatorTicket,
 )
 from ditto.db.queries.tickets import issue_ticket
+from ditto.tests.legacy_era import retired_era_writes_allowed
 from ditto_screening_protocol import ScreenResultOutcome, verdict_signing_message
 
 _KEYPAIR = bittensor.Keypair.create_from_uri("//Alice")
@@ -337,6 +338,19 @@ def test_v2_canonical_signing_matches_screener_contract(stage: str) -> None:
 
 
 # --- DB + dependency wiring ------------------------------------------------
+
+
+# The transition the rollout-shaped tests below run against. It used to be the
+# arbitrary 2 -> 3 (and once 2 -> 4); nothing in these tests is about which two
+# eras they are, only that one succeeds the other. The floor makes the choice
+# for us: ``benchmark_rollout_desired_floor`` refuses a target under
+# MIN_SCOREABLE_BENCH_VERSION and v7 is the newest shipped contract, so the only
+# transition that can be both open and functional is the real 6 -> 7 -- which
+# also means the SOURCE era is retired, and the one source-era rollout row
+# seeded below needs ``retired_era_writes_allowed`` the way production needed
+# NOT VALID.
+_SOURCE_VERSION = 6
+_TARGET_VERSION = 7
 
 
 class _FakeGenerator:
@@ -1800,7 +1814,7 @@ class TestQuarantineAdmin:
                     status=TicketStatus.ISSUED,
                     issued_at=now,
                     deadline=deadline,
-                    bench_version=2,
+                    bench_version=_TARGET_VERSION,
                     attempt_count=1,
                 )
             )
@@ -1816,7 +1830,10 @@ class TestQuarantineAdmin:
                     memory_mean=0.8,
                     median_ms=123,
                     n=114,
-                    details={"bench_version": 2},
+                    # The admin listing counts the scores whose advisory era
+                    # matches the ticket's, so this one is the era the lease is
+                    # for and the one below is an older era that must not count.
+                    details={"bench_version": _TARGET_VERSION},
                     generated_at=now,
                 )
             )
@@ -1832,7 +1849,7 @@ class TestQuarantineAdmin:
                     memory_mean=0.3,
                     median_ms=456,
                     n=114,
-                    details={"bench_version": 1},
+                    details={"bench_version": _SOURCE_VERSION},
                     generated_at=now - timedelta(days=1),
                 )
             )
@@ -1873,7 +1890,9 @@ class TestQuarantineAdmin:
         assert replay.status_code == 409
 
         async with session_maker() as session:
-            ticket = await session.get(ValidatorTicket, (agent_id, 2, validator_hotkey))
+            ticket = await session.get(
+                ValidatorTicket, (agent_id, _TARGET_VERSION, validator_hotkey)
+            )
             scores = (
                 await session.scalars(select(Score).where(Score.agent_id == agent_id))
             ).all()
@@ -2116,7 +2135,7 @@ class TestQuarantineAdmin:
             session.add(
                 BenchmarkDataset(
                     agent_id=agent_id,
-                    bench_version=2,
+                    bench_version=_SOURCE_VERSION,
                     seed=42,
                     sha256="ab" * 32,
                     run_size="full",
@@ -2127,8 +2146,8 @@ class TestQuarantineAdmin:
             session.add(
                 BenchmarkRollout(
                     rollout_id=uuid4(),
-                    from_version=2,
-                    desired_version=3,
+                    from_version=_SOURCE_VERSION,
+                    desired_version=_TARGET_VERSION,
                     status="activated",
                     cohort_size=5,
                     created_at=now,
@@ -2176,22 +2195,22 @@ class TestQuarantineAdmin:
         ] == ["release"]
         assert generator.calls == 1
         assert generator.seeds == [42]
-        assert generator.bench_versions == [3]
+        assert generator.bench_versions == [_TARGET_VERSION]
         async with session_maker() as session:
             agent = await session.get(Agent, agent_id)
-            v2 = await session.get(BenchmarkDataset, (agent_id, 2))
-            v3 = await session.get(BenchmarkDataset, (agent_id, 3))
+            source = await session.get(BenchmarkDataset, (agent_id, _SOURCE_VERSION))
+            target = await session.get(BenchmarkDataset, (agent_id, _TARGET_VERSION))
             assert agent is not None
             assert agent.dataset_seed == 42
             assert agent.dataset_sha256 == "ab" * 32
             assert agent.dataset_run_size == "full"
-            assert v2 is not None and v2.sha256 == "ab" * 32
-            assert v3 is not None and v3.sha256 == "be" * 32
+            assert source is not None and source.sha256 == "ab" * 32
+            assert target is not None and target.sha256 == "be" * 32
 
         # The release pinned the active dataset, so the missing-DATASET branch
         # must not re-fire. But this artifact tripped source review BEFORE its
         # screened image was built (agentic-source-review-tripwire), so it is
-        # released to EVALUATING without the image v3 requires. It therefore
+        # released to EVALUATING without the image v7 requires. It therefore
         # correctly re-enters screening via the missing-screened-image branch to
         # build that image — otherwise validators would skip it forever.
         next_claim = await client.post(_CLAIM_URL)
@@ -2224,8 +2243,8 @@ class TestQuarantineAdmin:
             session.add(
                 BenchmarkRollout(
                     rollout_id=uuid4(),
-                    from_version=2,
-                    desired_version=4,
+                    from_version=_SOURCE_VERSION,
+                    desired_version=_TARGET_VERSION,
                     status="activated",
                     cohort_size=5,
                     created_at=now - timedelta(hours=1),
@@ -2655,7 +2674,7 @@ class TestQuarantineAdmin:
             assert [attempt.attempt_id for attempt in attempts] == [attempt_id]
             assert len(scores) == 1
 
-    async def test_contract_refresh_rescreens_rebuilds_and_reissues_v3(
+    async def test_contract_refresh_rescreens_rebuilds_and_reissues_the_dataset(
         self,
         app: FastAPI,
         client: httpx.AsyncClient,
@@ -2675,13 +2694,13 @@ class TestQuarantineAdmin:
         image_upload_id = uuid5(
             NAMESPACE_URL, f"{agent_id}:{attempt_id}:screened-image"
         )
-        validator_hotkey = "5ValidatorWithStaleV3Contract"
+        validator_hotkey = "5ValidatorWithStaleTargetContract"
         async with session_maker() as session, session.begin():
             session.add(
                 BenchmarkRollout(
                     rollout_id=uuid4(),
-                    from_version=2,
-                    desired_version=3,
+                    from_version=_SOURCE_VERSION,
+                    desired_version=_TARGET_VERSION,
                     status="activated",
                     cohort_size=5,
                     created_at=now,
@@ -2730,7 +2749,7 @@ class TestQuarantineAdmin:
             session.add(
                 BenchmarkDataset(
                     agent_id=agent_id,
-                    bench_version=3,
+                    bench_version=_TARGET_VERSION,
                     seed=42,
                     sha256="aa" * 32,
                     run_size="full",
@@ -2743,7 +2762,7 @@ class TestQuarantineAdmin:
                     status=TicketStatus.ISSUED,
                     issued_at=now,
                     deadline=now + timedelta(minutes=90),
-                    bench_version=3,
+                    bench_version=_TARGET_VERSION,
                     attempt_count=2,
                 )
             )
@@ -2767,7 +2786,7 @@ class TestQuarantineAdmin:
             "agent_name": "alpha-agent",
             "agent_status": AgentStatus.EVALUATING,
             "artifact_sha256": _SHA256,
-            "bench_version": 3,
+            "bench_version": _TARGET_VERSION,
             "dataset_sha256": "aa" * 32,
             "score_count": 0,
             "screening_attempt_active": False,
@@ -2779,9 +2798,9 @@ class TestQuarantineAdmin:
             "refresh-benchmark-contract",
             headers=headers,
             json={
-                "reason": "Generator and scorer produced different v3 datasets",
+                "reason": "Generator and scorer produced different v7 datasets",
                 "expected_sha256": _SHA256,
-                "expected_bench_version": 3,
+                "expected_bench_version": _TARGET_VERSION,
                 "expected_dataset_sha256": "aa" * 32,
                 "expected_score_count": 0,
             },
@@ -2791,9 +2810,9 @@ class TestQuarantineAdmin:
 
         async with session_maker() as session:
             agent = await session.get(Agent, agent_id)
-            dataset = await session.get(BenchmarkDataset, (agent_id, 3))
+            dataset = await session.get(BenchmarkDataset, (agent_id, _TARGET_VERSION))
             stale_ticket = await session.get(
-                ValidatorTicket, (agent_id, 3, validator_hotkey)
+                ValidatorTicket, (agent_id, _TARGET_VERSION, validator_hotkey)
             )
             assert agent is not None
             assert agent.status == AgentStatus.SCREENING_FAILED
@@ -2813,10 +2832,10 @@ class TestQuarantineAdmin:
             json=_result_payload(agent_id, passed=True, attempt_id=fresh_attempt_id),
         )
         assert verdict.status_code == 200, verdict.text
-        assert generator.bench_versions == [3]
+        assert generator.bench_versions == [_TARGET_VERSION]
 
         async with session_maker() as session, session.begin():
-            dataset = await session.get(BenchmarkDataset, (agent_id, 3))
+            dataset = await session.get(BenchmarkDataset, (agent_id, _TARGET_VERSION))
             assert dataset is not None
             assert dataset.sha256 == "cd" * 32
             fresh_ticket = await issue_ticket(
@@ -2824,20 +2843,41 @@ class TestQuarantineAdmin:
                 validator_hotkey=validator_hotkey,
                 now=now + timedelta(minutes=1),
                 ttl=timedelta(minutes=90),
-                bench_version=3,
+                bench_version=_TARGET_VERSION,
                 artifact_mode="screened_only",
             )
             assert fresh_ticket is not None
             assert fresh_ticket.agent_id == agent_id
-            assert fresh_ticket.bench_version == 3
+            assert fresh_ticket.bench_version == _TARGET_VERSION
             assert fresh_ticket.status == TicketStatus.ISSUED
 
-    async def test_zero_score_v2_migration_preserves_history_and_issues_v3(
+    async def test_zero_score_v2_migration_can_no_longer_be_reached(
         self,
         app: FastAPI,
         client: httpx.AsyncClient,
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
+        """The v2-to-v3 rescue lane is closed, and closed at its own front door.
+
+        This test used to run the lane end to end: an open v2 -> v3 rollout, a
+        zero-score v2 submission, and an assertion that its history survived
+        while a fresh v3 dataset and lease were issued. Every part of that is
+        now unreachable, and deliberately so.
+
+        ``inspect_benchmark_contract_migration`` and its POST both require
+        ``rollout.from_version == 2 and rollout.desired_version == 3``
+        literally. A rollout aiming at v3 cannot be created -- it violates
+        ``benchmark_rollout_desired_floor`` -- and no v2 -> v3 rollout is open in
+        production, because the fleet activated past it long ago and
+        ``open_rollout`` only returns a collecting one. Even granted the
+        premise, the v3 lease at the end would be refused by the
+        ``validator_tickets`` floor trigger.
+
+        So the assertion is inverted: against the only transition that CAN be
+        open, the lane reports itself blocked rather than migrating anything.
+        That is the guarantee worth pinning -- a retired era cannot be re-entered
+        through an admin endpoint any more than through the queue.
+        """
         app.state.config = replace(
             app.state.config,
             admin_api_token="test-admin-token-at-least-32-characters",
@@ -2848,13 +2888,12 @@ class TestQuarantineAdmin:
             screening_policy_version=SCREENING_POLICY_VERSION,
         )
         now = datetime.now(UTC)
-        validator_hotkey = "5ValidatorWithLegacyV2Contract"
         async with session_maker() as session, session.begin():
             session.add(
                 BenchmarkRollout(
                     rollout_id=uuid4(),
-                    from_version=2,
-                    desired_version=3,
+                    from_version=_SOURCE_VERSION,
+                    desired_version=_TARGET_VERSION,
                     status="collecting",
                     cohort_size=5,
                     created_at=now,
@@ -2863,23 +2902,12 @@ class TestQuarantineAdmin:
             session.add(
                 BenchmarkDataset(
                     agent_id=agent_id,
-                    bench_version=2,
+                    bench_version=_SOURCE_VERSION,
                     seed=42,
                     sha256="aa" * 32,
                     run_size="full",
                     seed_block=4321,
                     seed_block_hash="0x" + "9f" * 32,
-                )
-            )
-            session.add(
-                ValidatorTicket(
-                    agent_id=agent_id,
-                    validator_hotkey=validator_hotkey,
-                    status=TicketStatus.EXPIRED,
-                    issued_at=now - timedelta(hours=2),
-                    deadline=now - timedelta(hours=1),
-                    bench_version=2,
-                    attempt_count=2,
                 )
             )
 
@@ -2897,18 +2925,17 @@ class TestQuarantineAdmin:
             headers=headers,
         )
         assert inspected.status_code == 200, inspected.text
-        assert inspected.json()["migration_allowed"] is True
-        assert inspected.json()["source_bench_version"] == 2
-        assert inspected.json()["target_bench_version"] == 3
-        assert inspected.json()["source_score_count"] == 0
-        assert inspected.json()["target_score_count"] == 0
+        assert inspected.json()["migration_allowed"] is False
+        assert inspected.json()["blocking_reason"] == (
+            "an open v2-to-v3 rollout is required"
+        )
 
         migrated = await client.post(
             f"/api/v1/admin/screening-submissions/{agent_id}/"
             "migrate-benchmark-contract",
             headers=headers,
             json={
-                "reason": "Legacy zero-score submission needs the active v3 contract",
+                "reason": "Legacy zero-score submission needs the active contract",
                 "expected_sha256": _SHA256,
                 "expected_source_bench_version": 2,
                 "expected_target_bench_version": 3,
@@ -2917,50 +2944,15 @@ class TestQuarantineAdmin:
                 "expected_target_score_count": 0,
             },
         )
-        assert migrated.status_code == 200, migrated.text
-        assert migrated.json()["target_dataset_sha256"] == "cd" * 32
-        assert generator.bench_versions == [3]
-        assert generator.seeds == [42]
-
+        assert migrated.status_code == 409, migrated.text
+        # Refused before anything was generated: no dataset is rendered for an
+        # era the ledger would not accept a score for.
+        assert generator.calls == 0
         async with session_maker() as session:
-            agent = await session.get(Agent, agent_id)
-            source = await session.get(BenchmarkDataset, (agent_id, 2))
-            target = await session.get(BenchmarkDataset, (agent_id, 3))
-            legacy_ticket = await session.get(
-                ValidatorTicket, (agent_id, 2, validator_hotkey)
-            )
-            assert agent is not None
-            assert agent.status == AgentStatus.SCREENING_FAILED
+            source = await session.get(BenchmarkDataset, (agent_id, _SOURCE_VERSION))
+            target = await session.get(BenchmarkDataset, (agent_id, _TARGET_VERSION))
             assert source is not None and source.sha256 == "aa" * 32
-            assert target is not None and target.sha256 == "cd" * 32
-            assert target.seed_block == source.seed_block
-            assert target.seed_block_hash == source.seed_block_hash
-            assert legacy_ticket is not None
-            assert legacy_ticket.status == TicketStatus.EXPIRED
-
-        claim = await client.post(_CLAIM_URL)
-        fresh_attempt_id = UUID(claim.json()["items"][0]["attempt_id"])
-        await _seed_verified_image_upload(
-            session_maker, agent_id=agent_id, attempt_id=fresh_attempt_id
-        )
-        verdict = await client.post(
-            f"/api/v1/screener/agent/{agent_id}/result",
-            json=_result_payload(agent_id, passed=True, attempt_id=fresh_attempt_id),
-        )
-        assert verdict.status_code == 200, verdict.text
-
-        async with session_maker() as session, session.begin():
-            ticket = await issue_ticket(
-                session,
-                validator_hotkey="5FreshV3Validator",
-                now=now + timedelta(minutes=1),
-                ttl=timedelta(minutes=90),
-                bench_version=3,
-                artifact_mode="screened_only",
-            )
-            assert ticket is not None
-            assert ticket.agent_id == agent_id
-            assert ticket.bench_version == 3
+            assert target is None
 
 
 # --- Artifact --------------------------------------------------------------
@@ -3986,7 +3978,7 @@ class TestSubmitResult:
             assert agent.dataset_seed_block_hash == _BLOCK.hash
             assert agent.dataset_seed == derive_seed(_BLOCK.hash, agent_id)
 
-    async def test_pass_after_activation_generates_and_persists_v3_dataset(
+    async def test_pass_after_activation_generates_and_persists_the_dataset(
         self,
         app: FastAPI,
         client: httpx.AsyncClient,
@@ -3997,8 +3989,8 @@ class TestSubmitResult:
             session.add(
                 BenchmarkRollout(
                     rollout_id=uuid4(),
-                    from_version=2,
-                    desired_version=3,
+                    from_version=_SOURCE_VERSION,
+                    desired_version=_TARGET_VERSION,
                     status="activated",
                     cohort_size=5,
                     created_at=datetime.now(UTC),
@@ -4021,9 +4013,9 @@ class TestSubmitResult:
         )
 
         assert response.status_code == 200, response.text
-        assert generator.bench_versions == [3]
+        assert generator.bench_versions == [_TARGET_VERSION]
         async with session_maker() as session:
-            dataset = await session.get(BenchmarkDataset, (agent_id, 3))
+            dataset = await session.get(BenchmarkDataset, (agent_id, _TARGET_VERSION))
             assert dataset is not None
             assert dataset.sha256 == "cd" * 32
             assert dataset.run_size == "full"
@@ -4036,27 +4028,39 @@ class TestSubmitResult:
     ) -> None:
         rollout_started = datetime.now(UTC) - timedelta(minutes=1)
         agent_id = await _seed_agent(session_maker, status=AgentStatus.UPLOADED)
+        # The earlier transition is the one that PUT the fleet on the source
+        # era, so its target IS the source era -- retired, and refused by
+        # ``benchmark_rollout_desired_floor`` today. It is exactly the row
+        # production keeps as its audit trail, so it is seeded the way
+        # production came by it: written under the lifted floor, then
+        # grandfathered. The open transition beside it needs no such help.
+        async with (
+            session_maker() as floor_session,
+            retired_era_writes_allowed(floor_session),
+            session_maker() as session,
+            session.begin(),
+        ):
+            session.add(
+                BenchmarkRollout(
+                    rollout_id=uuid4(),
+                    from_version=_SOURCE_VERSION - 1,
+                    desired_version=_SOURCE_VERSION,
+                    status="activated",
+                    cohort_size=5,
+                    created_at=rollout_started - timedelta(hours=1),
+                    activated_at=rollout_started - timedelta(minutes=30),
+                )
+            )
         async with session_maker() as session, session.begin():
-            session.add_all(
-                [
-                    BenchmarkRollout(
-                        rollout_id=uuid4(),
-                        from_version=1,
-                        desired_version=2,
-                        status="activated",
-                        cohort_size=5,
-                        created_at=rollout_started - timedelta(hours=1),
-                        activated_at=rollout_started - timedelta(minutes=30),
-                    ),
-                    BenchmarkRollout(
-                        rollout_id=uuid4(),
-                        from_version=2,
-                        desired_version=3,
-                        status="collecting",
-                        cohort_size=5,
-                        created_at=rollout_started,
-                    ),
-                ]
+            session.add(
+                BenchmarkRollout(
+                    rollout_id=uuid4(),
+                    from_version=_SOURCE_VERSION,
+                    desired_version=_TARGET_VERSION,
+                    status="collecting",
+                    cohort_size=5,
+                    created_at=rollout_started,
+                )
             )
         _install_db(app, session_maker)
         _install_chain(app)
@@ -4074,27 +4078,27 @@ class TestSubmitResult:
         )
 
         assert response.status_code == 200, response.text
-        assert generator.bench_versions == [3]
+        assert generator.bench_versions == [_TARGET_VERSION]
         async with session_maker() as session:
-            target = await session.get(BenchmarkDataset, (agent_id, 3))
-            source = await session.get(BenchmarkDataset, (agent_id, 2))
+            target = await session.get(BenchmarkDataset, (agent_id, _TARGET_VERSION))
+            source = await session.get(BenchmarkDataset, (agent_id, _SOURCE_VERSION))
             assert target is not None
             assert source is None
 
-        # The persisted activated row is still v2 while this open rollout
-        # targets v3. The completed v3 submission must not be mistaken for a
-        # missing-v2 backfill and immediately claimed again.
+        # The persisted activated row is still the source era while this open
+        # rollout targets the next one. The completed target-era submission must
+        # not be mistaken for a missing source-era backfill and claimed again.
         next_claim = await client.post(_CLAIM_URL)
         assert next_claim.status_code == 200, next_claim.text
         assert next_claim.json()["items"] == []
 
-    async def test_rescreen_after_activation_backfills_missing_v3_dataset(
+    async def test_rescreen_after_activation_backfills_the_missing_dataset(
         self,
         app: FastAPI,
         client: httpx.AsyncClient,
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
-        """A legacy v2 pin must not strand an active-v3 waiting agent at 0/3."""
+        """A legacy source-era pin must not strand an active-era agent at 0/3."""
         agent_id = await _seed_agent(
             session_maker,
             status=AgentStatus.EVALUATING,
@@ -4112,7 +4116,7 @@ class TestSubmitResult:
             session.add(
                 BenchmarkDataset(
                     agent_id=agent_id,
-                    bench_version=2,
+                    bench_version=_SOURCE_VERSION,
                     seed=42,
                     sha256="ab" * 32,
                     run_size="full",
@@ -4123,8 +4127,8 @@ class TestSubmitResult:
             session.add(
                 BenchmarkRollout(
                     rollout_id=uuid4(),
-                    from_version=2,
-                    desired_version=3,
+                    from_version=_SOURCE_VERSION,
+                    desired_version=_TARGET_VERSION,
                     status="activated",
                     cohort_size=5,
                     created_at=now,
@@ -4147,21 +4151,21 @@ class TestSubmitResult:
         )
 
         assert response.status_code == 200, response.text
-        assert generator.bench_versions == [3]
+        assert generator.bench_versions == [_TARGET_VERSION]
         assert generator.seeds == [42]
         async with session_maker() as session:
             agent = await session.get(Agent, agent_id)
             assert agent is not None
             assert agent.dataset_seed == 42
             assert agent.dataset_sha256 == "ab" * 32
-            v2 = await session.get(BenchmarkDataset, (agent_id, 2))
-            v3 = await session.get(BenchmarkDataset, (agent_id, 3))
-            assert v2 is not None and v2.sha256 == "ab" * 32
-            assert v3 is not None
-            assert v3.seed == 42
-            assert v3.sha256 == "cd" * 32
-            assert v3.seed_block == 123
-            assert v3.seed_block_hash == "0x" + "12" * 32
+            source = await session.get(BenchmarkDataset, (agent_id, _SOURCE_VERSION))
+            target = await session.get(BenchmarkDataset, (agent_id, _TARGET_VERSION))
+            assert source is not None and source.sha256 == "ab" * 32
+            assert target is not None
+            assert target.seed == 42
+            assert target.sha256 == "cd" * 32
+            assert target.seed_block == 123
+            assert target.seed_block_hash == "0x" + "12" * 32
 
     async def test_seed_falls_back_when_chain_unavailable(
         self,

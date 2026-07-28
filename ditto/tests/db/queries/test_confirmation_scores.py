@@ -24,6 +24,14 @@ from ditto.db.queries.confirmation_scores import (
 )
 
 _NOW = datetime(2026, 7, 21, 12, 0, 0, tzinfo=UTC)
+# The era these rows belong to. This ledger is version-scoped but none of the
+# idempotence, median or seed-universe rules below care which version they run
+# at; the literal used to be 2 because it was the oldest one there was.
+# ``confirmation_scores_bench_version_floor`` refuses anything under
+# MIN_SCOREABLE_BENCH_VERSION, so it is the live era, and the tests that need a
+# second version to prove version scoping use the one after it.
+_BENCH_VERSION = 7
+_NEXT_BENCH_VERSION = 8
 
 
 async def _seed_agent(session: AsyncSession, name: str = "a") -> UUID:
@@ -65,7 +73,7 @@ class TestAppendConfirmationScores:
             n = await append_confirmation_scores(
                 session,
                 rows=[_row(aid, "5V1", 100, 0.80), _row(aid, "5V1", 200, 0.82)],
-                bench_version=2,
+                bench_version=_BENCH_VERSION,
                 created_at=_NOW,
             )
         assert n == 2
@@ -79,7 +87,7 @@ class TestAppendConfirmationScores:
                     _row(aid, "5V1", 200, 0.99),  # same key -> ignored
                     _row(aid, "5V1", 300, 0.85),  # new seed -> inserted
                 ],
-                bench_version=2,
+                bench_version=_BENCH_VERSION,
                 created_at=_NOW,
             )
         assert n2 == 1
@@ -87,7 +95,9 @@ class TestAppendConfirmationScores:
             total = await session.scalar(
                 select(func.count()).select_from(ConfirmationScore)
             )
-            first = await session.get(ConfirmationScore, (aid, 2, "5V1", 100))
+            first = await session.get(
+                ConfirmationScore, (aid, _BENCH_VERSION, "5V1", 100)
+            )
         assert total == 3
         # The first-written composite wins; a later resend never overwrites it.
         assert first is not None and first.composite == 0.80
@@ -100,13 +110,13 @@ class TestAppendConfirmationScores:
             await append_confirmation_scores(
                 session,
                 rows=[_row(aid, "5V1", 100, 0.80), _row(aid, "5V2", 100, 0.82)],
-                bench_version=2,
+                bench_version=_BENCH_VERSION,
                 created_at=_NOW,
             )
             await append_confirmation_scores(
                 session,
                 rows=[_row(aid, "5V1", 100, 0.90)],
-                bench_version=3,
+                bench_version=_NEXT_BENCH_VERSION,
                 created_at=_NOW,
             )
         async with session.begin():
@@ -237,11 +247,11 @@ class TestConfirmationAggregates:
                     _row(aid, "5V3", 100, 0.82),
                     _row(aid, "5V1", 200, 0.70),
                 ],
-                bench_version=2,
+                bench_version=_BENCH_VERSION,
                 created_at=_NOW,
             )
         by_seed = await confirmation_composites_by_seed(
-            session, agent_ids=[aid], bench_version=2
+            session, agent_ids=[aid], bench_version=_BENCH_VERSION
         )
         assert by_seed[aid][100] == 0.82  # median of 0.80/0.82/0.84
         assert by_seed[aid][200] == 0.70
@@ -257,10 +267,12 @@ class TestConfirmationAggregates:
                     _row(aid, "5V1", 200, 0.82),
                     _row(aid, "5V1", 300, 0.83),
                 ],
-                bench_version=2,
+                bench_version=_BENCH_VERSION,
                 created_at=_NOW,
             )
-        depths = await confirmation_depths(session, agent_ids=[aid], bench_version=2)
+        depths = await confirmation_depths(
+            session, agent_ids=[aid], bench_version=_BENCH_VERSION
+        )
         assert depths[aid] == 3  # three distinct seeds
 
     async def test_history_returns_raw_unaggregated_records(
@@ -271,17 +283,17 @@ class TestConfirmationAggregates:
             await append_confirmation_scores(
                 session,
                 rows=[_row(aid, "5V1", 100, 0.80), _row(aid, "5V2", 100, 0.84)],
-                bench_version=2,
+                bench_version=_BENCH_VERSION,
                 created_at=_NOW,
             )
         history = await confirmation_history_by_agent(
-            session, agent_ids=[aid], bench_version=2
+            session, agent_ids=[aid], bench_version=_BENCH_VERSION
         )
         rows = history[aid]
         # Raw per-(validator, seed) rows, NOT medianed: two rows for seed 100.
         assert len(rows) == 2
         assert {r.composite for r in rows} == {0.80, 0.84}
-        assert all(r.bench_version == 2 for r in rows)
+        assert all(r.bench_version == _BENCH_VERSION for r in rows)
 
     async def test_universe_is_every_recorded_seed_across_reigns(
         self, session: AsyncSession
@@ -304,42 +316,49 @@ class TestConfirmationAggregates:
                     _row(first, "5V1", 100, 0.82),
                     _row(second, "5V1", 200, 0.83),  # only the other agent has it
                 ],
-                bench_version=2,
+                bench_version=_BENCH_VERSION,
                 created_at=_NOW,
             )
             await append_confirmation_scores(
                 session,
                 rows=[_row(first, "5V1", 999, 0.90)],
-                bench_version=3,
+                bench_version=_NEXT_BENCH_VERSION,
                 created_at=_NOW,
             )
 
         assert await lane_seed_universe(
-            session, agent_ids=[first, second], bench_version=2
+            session, agent_ids=[first, second], bench_version=_BENCH_VERSION
         ) == (100, 200, 300)
         # A version the caller did not ask about contributes nothing.
         assert await lane_seed_universe(
-            session, agent_ids=[first, second], bench_version=3
+            session, agent_ids=[first, second], bench_version=_NEXT_BENCH_VERSION
         ) == (999,)
         # And an agent outside the cohort contributes nothing.
         assert await lane_seed_universe(
-            session, agent_ids=[second], bench_version=2
+            session, agent_ids=[second], bench_version=_BENCH_VERSION
         ) == (200,)
 
     async def test_universe_is_empty_without_agents(
         self, session: AsyncSession
     ) -> None:
-        assert await lane_seed_universe(session, agent_ids=[], bench_version=2) == ()
+        assert (
+            await lane_seed_universe(
+                session, agent_ids=[], bench_version=_BENCH_VERSION
+            )
+            == ()
+        )
 
     async def test_absent_agents_map_to_empty(self, session: AsyncSession) -> None:
         assert (
             await confirmation_composites_by_seed(
-                session, agent_ids=[], bench_version=2
+                session, agent_ids=[], bench_version=_BENCH_VERSION
             )
             == {}
         )
         assert (
-            await confirmation_depths(session, agent_ids=[uuid4()], bench_version=2)
+            await confirmation_depths(
+                session, agent_ids=[uuid4()], bench_version=_BENCH_VERSION
+            )
             == {}
         )
 

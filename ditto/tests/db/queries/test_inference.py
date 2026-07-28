@@ -12,6 +12,7 @@ from ditto.api_models.inference_concurrency_settings import (
 from ditto.api_models.ticket_status import TicketStatus
 from ditto.api_server.config import InferenceProxyConfig
 from ditto.api_server.inference_concurrency_settings import apply_settings
+from ditto.api_server.inference_routing import benchmark_model
 from ditto.db.models import (
     Agent,
     AgentStatus,
@@ -30,6 +31,70 @@ from ditto.db.queries.inference import (
     revoke_ticket_inference,
 )
 
+# The era every ticket below is leased for. Nothing in this file is about a
+# benchmark version -- these are budget, concurrency and revocation rules -- and
+# the value used to be 5 purely as a placeholder. The ``validator_tickets``
+# floor trigger refuses to create a lease beneath
+# MIN_SCOREABLE_BENCH_VERSION, so the placeholder is the live era, and the live
+# era brings its model and its route requirement with it (see
+# ``_seed_calibrated_route``).
+_BENCH_VERSION = 7
+_CHAT_MODEL = benchmark_model(_BENCH_VERSION)
+
+
+async def _seed_calibrated_route(session: AsyncSession, now: datetime) -> None:
+    """The dynamic route a v7 grant is bound to at mint time.
+
+    From v7 on, ``ensure_inference_grant`` refuses to mint without a calibrated,
+    eligible route for the benchmark's model -- there is no static provider any
+    more. That is a precondition of every grant in this file now, not a thing
+    any of these tests assert, so it is seeded once here rather than restated.
+
+    Idempotent, because several tests mint a second grant for a second validator
+    and the route is fleet-wide, not per-grant.
+    """
+    if await session.get(InferenceRoutingPolicy, _CHAT_MODEL) is not None:
+        return
+    session.add(
+        InferenceRoutingPolicy(
+            model=_CHAT_MODEL,
+            enabled=True,
+            speed_weight=0.65,
+            cost_weight=0.25,
+            exploration_weight=0.10,
+            exploration_ticket_budget=3,
+            min_tool_accuracy=0.55,
+            min_composite=0.15,
+            min_calibration_samples=20,
+            max_error_rate=0.25,
+            max_timeout_rate=0.15,
+            cooldown_seconds=30,
+            ewma_alpha=0.20,
+            updated_at=now,
+        )
+    )
+    session.add(
+        InferenceProviderRoute(
+            model=_CHAT_MODEL,
+            provider="calibrated-provider",
+            profile_revision="openrouter-route-fixture-v1",
+            status="healthy",
+            calibration_status="eligible",
+            prompt_price_per_token=0.00000003,
+            completion_price_per_token=0.00000013,
+            ewma_tokens_per_second=150,
+            ewma_latency_ms=900,
+            ewma_error_rate=0,
+            ewma_timeout_rate=0,
+            calibration_tool_accuracy=0.65,
+            calibration_composite=0.20,
+            calibration_sample_count=60,
+            calibration_manifest_sha256="ab" * 32,
+            sample_count=20,
+            discovered_at=now,
+        )
+    )
+
 
 def _config() -> InferenceProxyConfig:
     return InferenceProxyConfig(
@@ -38,7 +103,7 @@ def _config() -> InferenceProxyConfig:
         public_base_url="https://platform.example",
         openrouter_api_key="test-key",
         upstream_url="https://openrouter.ai/api/v1/chat/completions",
-        allowed_models=("qwen/qwen3-32b",),
+        allowed_models=(_CHAT_MODEL,),
         provider="nebius",
         routing_mode="adaptive",
         request_budget=2,
@@ -101,10 +166,11 @@ async def _live_grant(
         status=TicketStatus.ISSUED,
         issued_at=now,
         deadline=now + timedelta(minutes=20),
-        bench_version=5,
+        bench_version=_BENCH_VERSION,
         attempt_count=1,
     )
     session.add_all([agent, ticket])
+    await _seed_calibrated_route(session, now)
     await session.flush()
     grant = await ensure_inference_grant(session, ticket=ticket, config=config)
     assert grant is not None
@@ -136,7 +202,7 @@ async def test_v7_grant_requires_and_binds_one_calibrated_dynamic_route(
     session: AsyncSession,
 ) -> None:
     now = datetime.now(UTC)
-    config = replace(_config(), allowed_models=("qwen/qwen3-32b", "openai/gpt-oss-20b"))
+    config = _config()
     async with session.begin():
         agent = Agent(
             agent_id=uuid4(),
@@ -153,7 +219,7 @@ async def test_v7_grant_requires_and_binds_one_calibrated_dynamic_route(
             status=TicketStatus.ISSUED,
             issued_at=now,
             deadline=now + timedelta(minutes=20),
-            bench_version=7,
+            bench_version=_BENCH_VERSION,
             attempt_count=1,
         )
         session.add_all([agent, ticket])
@@ -266,7 +332,7 @@ async def test_grant_rejects_wrong_bearer_model_budget_and_replay(
                 grant_id=grant.grant_id,
                 nonce=uuid4(),
                 bearer="stolen-sibling-bearer",
-                model="qwen/qwen3-32b",
+                model=_CHAT_MODEL,
                 token_reservation=10,
                 now=now,
                 config=_config(),
@@ -292,7 +358,7 @@ async def test_grant_rejects_wrong_bearer_model_budget_and_replay(
                 grant_id=grant.grant_id,
                 nonce=uuid4(),
                 bearer=bearer,
-                model="qwen/qwen3-32b",
+                model=_CHAT_MODEL,
                 token_reservation=101,
                 now=now,
                 config=_config(),
@@ -309,7 +375,7 @@ async def test_grant_rejects_wrong_bearer_model_budget_and_replay(
             grant_id=grant.grant_id,
             nonce=nonce,
             bearer=bearer,
-            model="qwen/qwen3-32b",
+            model=_CHAT_MODEL,
             token_reservation=10,
             now=now,
             config=_config(),
@@ -333,7 +399,7 @@ async def test_grant_rejects_wrong_bearer_model_budget_and_replay(
                 grant_id=grant.grant_id,
                 nonce=nonce,
                 bearer=bearer,
-                model="qwen/qwen3-32b",
+                model=_CHAT_MODEL,
                 token_reservation=10,
                 now=now,
                 config=_config(),
@@ -359,7 +425,7 @@ async def test_canceled_or_expired_ticket_revokes_capability(
                 grant_id=grant.grant_id,
                 nonce=uuid4(),
                 bearer=bearer,
-                model="qwen/qwen3-32b",
+                model=_CHAT_MODEL,
                 token_reservation=10,
                 now=now,
                 config=_config(),
@@ -380,7 +446,7 @@ async def test_revocation_cancels_inflight_and_missing_usage_charges_reservation
             grant_id=grant.grant_id,
             nonce=nonce,
             bearer=bearer,
-            model="qwen/qwen3-32b",
+            model=_CHAT_MODEL,
             token_reservation=10,
             now=now,
             config=_config(),
@@ -408,7 +474,7 @@ async def test_revocation_cancels_inflight_and_missing_usage_charges_reservation
             grant_id=grant.grant_id,
             nonce=nonce,
             bearer=bearer,
-            model="qwen/qwen3-32b",
+            model=_CHAT_MODEL,
             token_reservation=10,
             now=now,
             config=_config(),
@@ -447,7 +513,7 @@ async def test_ticket_request_rate_is_bounded_after_requests_finish(
             grant_id=grant.grant_id,
             nonce=first_nonce,
             bearer=bearer,
-            model="qwen/qwen3-32b",
+            model=_CHAT_MODEL,
             token_reservation=10,
             now=now,
             config=config,
@@ -473,7 +539,7 @@ async def test_ticket_request_rate_is_bounded_after_requests_finish(
                 grant_id=grant.grant_id,
                 nonce=uuid4(),
                 bearer=bearer,
-                model="qwen/qwen3-32b",
+                model=_CHAT_MODEL,
                 token_reservation=10,
                 now=now,
                 config=config,
@@ -507,7 +573,7 @@ async def _live_v7_embedding_grant(session: AsyncSession, config: InferenceProxy
         status=TicketStatus.ISSUED,
         issued_at=now,
         deadline=now + timedelta(minutes=20),
-        bench_version=7,
+        bench_version=_BENCH_VERSION,
         attempt_count=1,
     )
     session.add_all([agent, ticket])
@@ -515,7 +581,7 @@ async def _live_v7_embedding_grant(session: AsyncSession, config: InferenceProxy
     grant = InferenceGrant(
         grant_id=uuid4(),
         agent_id=agent.agent_id,
-        bench_version=7,
+        bench_version=_BENCH_VERSION,
         validator_hotkey=ticket.validator_hotkey,
         slot_id=ticket.slot_id,
         ticket_deadline=ticket.deadline,
@@ -523,7 +589,7 @@ async def _live_v7_embedding_grant(session: AsyncSession, config: InferenceProxy
         bearer_digest=None,
         broker_public_key=None,
         generation=0,
-        allowed_models=["qwen/qwen3-32b"],
+        allowed_models=[_CHAT_MODEL],
         route_provider="test-provider",
         route_profile="openrouter-route-test-v1",
         request_budget=config.request_budget,
@@ -704,7 +770,7 @@ async def test_chat_capacity_refusal_is_retryable_not_fatal(
                 grant_id=grant.grant_id,
                 nonce=uuid4(),
                 bearer=bearer,
-                model="qwen/qwen3-32b",
+                model=_CHAT_MODEL,
                 token_reservation=10,
                 now=now,
                 config=config,
@@ -717,7 +783,7 @@ async def test_chat_capacity_refusal_is_retryable_not_fatal(
                 grant_id=grant.grant_id,
                 nonce=uuid4(),
                 bearer=bearer,
-                model="qwen/qwen3-32b",
+                model=_CHAT_MODEL,
                 token_reservation=10,
                 now=now,
                 config=config,
@@ -777,7 +843,7 @@ async def test_spent_budget_is_named_and_stays_named(session: AsyncSession) -> N
                     grant_id=grant.grant_id,
                     nonce=uuid4(),
                     bearer=bearer,
-                    model="qwen/qwen3-32b",
+                    model=_CHAT_MODEL,
                     token_reservation=10,
                     now=now,
                     config=config,
@@ -791,7 +857,7 @@ async def test_spent_budget_is_named_and_stays_named(session: AsyncSession) -> N
                     grant_id=grant.grant_id,
                     nonce=uuid4(),
                     bearer=bearer,
-                    model="qwen/qwen3-32b",
+                    model=_CHAT_MODEL,
                     token_reservation=10,
                     now=now,
                     config=config,
@@ -823,7 +889,7 @@ async def test_a_bad_bearer_learns_nothing_about_the_grant(
                     grant_id=grant.grant_id,
                     nonce=uuid4(),
                     bearer=bearer,
-                    model="qwen/qwen3-32b",
+                    model=_CHAT_MODEL,
                     token_reservation=10,
                     now=now,
                     config=config,
@@ -837,7 +903,7 @@ async def test_a_bad_bearer_learns_nothing_about_the_grant(
                 grant_id=grant.grant_id,
                 nonce=uuid4(),
                 bearer=bearer,
-                model="qwen/qwen3-32b",
+                model=_CHAT_MODEL,
                 token_reservation=10,
                 now=now,
                 config=config,
@@ -851,7 +917,7 @@ async def test_a_bad_bearer_learns_nothing_about_the_grant(
                 grant_id=grant.grant_id,
                 nonce=uuid4(),
                 bearer="not-the-bearer",
-                model="qwen/qwen3-32b",
+                model=_CHAT_MODEL,
                 token_reservation=10,
                 now=now,
                 config=config,
@@ -888,10 +954,11 @@ async def test_the_operator_budget_is_stamped_onto_the_new_grant(
         status=TicketStatus.ISSUED,
         issued_at=now,
         deadline=now + timedelta(minutes=20),
-        bench_version=5,
+        bench_version=_BENCH_VERSION,
         attempt_count=1,
     )
     session.add_all([agent, ticket])
+    await _seed_calibrated_route(session, now)
     await session.flush()
     board = apply_settings(
         _config(),
@@ -952,7 +1019,7 @@ async def test_a_spent_token_budget_is_named_terminal_and_persistent(
                 grant_id=grant.grant_id,
                 nonce=(nonce := uuid4()),
                 bearer=bearer,
-                model="qwen/qwen3-32b",
+                model=_CHAT_MODEL,
                 token_reservation=250,
                 now=now,
                 config=config,
@@ -979,7 +1046,7 @@ async def test_a_spent_token_budget_is_named_terminal_and_persistent(
                 grant_id=grant.grant_id,
                 nonce=uuid4(),
                 bearer=bearer,
-                model="qwen/qwen3-32b",
+                model=_CHAT_MODEL,
                 token_reservation=250,
                 now=now,
                 config=config,
@@ -999,7 +1066,7 @@ async def test_a_spent_token_budget_is_named_terminal_and_persistent(
                     grant_id=grant.grant_id,
                     nonce=uuid4(),
                     bearer=bearer,
-                    model="qwen/qwen3-32b",
+                    model=_CHAT_MODEL,
                     token_reservation=250,
                     now=now,
                     config=config,
@@ -1029,7 +1096,7 @@ async def test_in_flight_reservations_alone_are_backpressure_not_exhaustion(
                     grant_id=grant.grant_id,
                     nonce=uuid4(),
                     bearer=bearer,
-                    model="qwen/qwen3-32b",
+                    model=_CHAT_MODEL,
                     token_reservation=300,
                     now=now,
                     config=config,
@@ -1045,7 +1112,7 @@ async def test_in_flight_reservations_alone_are_backpressure_not_exhaustion(
                 grant_id=grant.grant_id,
                 nonce=uuid4(),
                 bearer=bearer,
-                model="qwen/qwen3-32b",
+                model=_CHAT_MODEL,
                 token_reservation=300,
                 now=now,
                 config=config,
@@ -1088,7 +1155,7 @@ async def test_a_jupiter_profile_run_completes_at_the_shipped_budget(
                 grant_id=grant.grant_id,
                 nonce=(nonce := uuid4()),
                 bearer=bearer,
-                model="qwen/qwen3-32b",
+                model=_CHAT_MODEL,
                 token_reservation=per_call_prompt + per_call_completion,
                 now=now,
                 config=config,
@@ -1153,7 +1220,7 @@ async def test_a_reclaimed_request_is_charged_the_estimate_not_the_byte_count(
                 grant_id=grant.grant_id,
                 nonce=nonce,
                 bearer=bearer,
-                model="qwen/qwen3-32b",
+                model=_CHAT_MODEL,
                 token_reservation=estimate,
                 max_chargeable_tokens=byte_bound,
                 now=now,
@@ -1204,7 +1271,7 @@ async def test_real_usage_above_the_estimate_is_still_deliverable(
                 grant_id=grant.grant_id,
                 nonce=nonce,
                 bearer=bearer,
-                model="qwen/qwen3-32b",
+                model=_CHAT_MODEL,
                 token_reservation=estimate,
                 max_chargeable_tokens=ceiling,
                 now=now,
@@ -1240,7 +1307,7 @@ async def test_real_usage_above_the_estimate_is_still_deliverable(
                 grant_id=grant.grant_id,
                 nonce=nonce,
                 bearer=bearer,
-                model="qwen/qwen3-32b",
+                model=_CHAT_MODEL,
                 token_reservation=2_048,
                 max_chargeable_tokens=8_192,
                 now=now,

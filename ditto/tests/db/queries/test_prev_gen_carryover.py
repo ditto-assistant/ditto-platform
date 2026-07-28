@@ -16,6 +16,8 @@ capable of producing an outage when moved alone:
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from uuid import UUID, uuid4
@@ -49,10 +51,21 @@ from ditto.db.queries.benchmark_carryover import (
 )
 from ditto.db.queries.benchmark_rollout import DatasetPin, arrival_bench_version
 from ditto.db.queries.tickets import MAX_ATTEMPTS_PER_VERSION, issue_ticket
+from ditto.tests.legacy_era import retired_era_writes_allowed
 
 _ROLLOUT_START = datetime(2026, 7, 20, 12, 0, 0, tzinfo=UTC)
 _NOW = _ROLLOUT_START + timedelta(days=2)
 _TTL = timedelta(minutes=90)
+# The generation the stranded work belongs to, and the one it is carried over
+# into. Unlike most benchmark versions in the suite these two are NOT arbitrary
+# and cannot be renumbered upward: carryover only exists during a rollout, the
+# newest shipped contract is v7 (``benchmark_contract`` fails closed above it,
+# so no ticket can issue for v8), and a rollout must move forward. That pins
+# the pair at 6 -> 7 -- which means the source generation is a RETIRED one, and
+# the stranded ``scores`` and burnt ``validator_tickets`` this file is about are
+# rows the floor refuses to write. Production holds them because the floor is
+# NOT VALID and grandfathered them; a fresh test database has to be put into the
+# same state on purpose, which is what ``_seeding_the_retired_era`` does.
 _FROM_VERSION = 6
 _DESIRED_VERSION = 7
 
@@ -60,6 +73,26 @@ _DESIRED_VERSION = 7
 # against the object an un-revisioned deployment actually resolves.
 _SHIPPED_DEFAULT = PrevGenCarryoverSettings()
 _ENABLED = PrevGenCarryoverSettings(enabled=True)
+
+
+@asynccontextmanager
+async def _seeding_the_retired_era(session: AsyncSession) -> AsyncIterator[None]:
+    """Open the seeding transaction with the retired-era floor lifted.
+
+    Everything written inside is history: a v6 submission that never reached
+    quorum, the two validator scores it did collect, the ticket whose attempts
+    it burnt. Those are precisely the rows ``scores_bench_version_floor`` and
+    the ``validator_tickets`` trigger exist to stop anything from creating
+    *now*, and they are also the only thing carryover has to work on.
+
+    The floor is restored -- NOT VALID, exactly as the migration declares it --
+    before the assertions run, so the seeded rows are grandfathered the same way
+    production's are and every write the code under test attempts afterwards
+    still meets the live floor. Nothing here weakens the guarantee; it
+    reproduces the database production is actually in.
+    """
+    async with retired_era_writes_allowed(session), session.begin():
+        yield
 
 
 async def _seed_rollout(
@@ -105,9 +138,9 @@ async def _seed_stranded(
         screening_policy_version=screening_policy_version,
         created_at=created_at or (_ROLLOUT_START - timedelta(days=age_days)),
     )
-    # v7 requires a complete screened image; without one the agent is filtered
-    # by artifact_mode long before admission is consulted, which would make an
-    # admission assertion vacuous.
+    # The desired era requires a complete screened image; without one the agent
+    # is filtered by artifact_mode long before admission is consulted, which
+    # would make an admission assertion vacuous.
     agent.screened_image_sha256 = "12" * 32
     agent.screened_image_size_bytes = 123
     agent.screened_image_id = "sha256:" + "34" * 32
@@ -189,7 +222,7 @@ class TestShippedDefaultIsATotalNoOp:
     async def test_disabled_admits_nothing_and_generates_nothing(
         self, session: AsyncSession
     ) -> None:
-        async with session.begin():
+        async with _seeding_the_retired_era(session):
             rollout = await _seed_rollout(session)
             agent_id = await _seed_stranded(session, name="stranded")
 
@@ -230,7 +263,7 @@ class TestThreeLegsMoveTogether:
     async def test_adoption_pins_dataset_admits_and_leases(
         self, session: AsyncSession
     ) -> None:
-        async with session.begin():
+        async with _seeding_the_retired_era(session):
             rollout = await _seed_rollout(session)
             agent_id = await _seed_stranded(session, name="stranded")
 
@@ -278,7 +311,7 @@ class TestThreeLegsMoveTogether:
         id proves the restriction is doing the selecting: an implementation that
         accepted the argument and ignored it would return the lower id.
         """
-        async with session.begin():
+        async with _seeding_the_retired_era(session):
             rollout = await _seed_rollout(session)
             first = await _seed_stranded(
                 session, name="twin-a", hotkey="5HotkeyA", age_days=5
@@ -314,7 +347,7 @@ class TestThreeLegsMoveTogether:
         instead, with no arrival filter -- so the disjunct is what keeps an
         adopted agent leasable rather than stranding it a second time.
         """
-        async with session.begin():
+        async with _seeding_the_retired_era(session):
             rollout = await _seed_rollout(session)
             agent_id = await _seed_stranded(session, name="stranded")
         async with session.begin():
@@ -352,7 +385,7 @@ class TestThreeLegsMoveTogether:
             assert agent is not None
             return await arrival_bench_version(session, agent=agent)
 
-        async with session.begin():
+        async with _seeding_the_retired_era(session):
             rollout = await _seed_rollout(session)
             agent_id = await _seed_stranded(session, name="stranded")
 
@@ -374,7 +407,7 @@ class TestAdmissionCannotOutrunGeneration:
         rescreen would silently admit it. Admission keys off the carryover ROW,
         which only ``adopt_carryover_agent`` writes.
         """
-        async with session.begin():
+        async with _seeding_the_retired_era(session):
             rollout = await _seed_rollout(session)
             agent_id = await _seed_stranded(session, name="rescreened")
             session.add(
@@ -403,7 +436,7 @@ class TestAdmissionCannotOutrunGeneration:
         self, session: AsyncSession
     ) -> None:
         """Both halves land in one transaction, or neither does."""
-        async with session.begin():
+        async with _seeding_the_retired_era(session):
             rollout = await _seed_rollout(session)
             agent_id = await _seed_stranded(session, name="stranded")
         async with session.begin():
@@ -423,7 +456,7 @@ class TestAdmissionCannotOutrunGeneration:
         assert set(rows) <= datasets
 
     async def test_second_adoption_is_idempotent(self, session: AsyncSession) -> None:
-        async with session.begin():
+        async with _seeding_the_retired_era(session):
             rollout = await _seed_rollout(session)
             agent_id = await _seed_stranded(session, name="stranded")
         async with session.begin():
@@ -443,7 +476,7 @@ class TestStrandedSelection:
     async def test_min_score_count_two_excludes_never_ticketed(
         self, session: AsyncSession
     ) -> None:
-        async with session.begin():
+        async with _seeding_the_retired_era(session):
             rollout = await _seed_rollout(session)
             two_of_three = await _seed_stranded(
                 session, name="progressed", score_count=2
@@ -471,7 +504,7 @@ class TestStrandedSelection:
     async def test_finalized_and_new_era_submissions_are_not_stranded(
         self, session: AsyncSession
     ) -> None:
-        async with session.begin():
+        async with _seeding_the_retired_era(session):
             rollout = await _seed_rollout(session)
             await _seed_stranded(session, name="finalized", score_count=3)
             await _seed_stranded(
@@ -490,7 +523,7 @@ class TestStrandedSelection:
     async def test_cohort_member_is_not_carried_over_again(
         self, session: AsyncSession
     ) -> None:
-        async with session.begin():
+        async with _seeding_the_retired_era(session):
             rollout = await _seed_rollout(session)
             member = await _seed_stranded(session, name="cohort")
             session.add(
@@ -520,7 +553,7 @@ class TestStrandedSelection:
         could ever be handed. An operator rescreen brings it in on the next
         convergence pass with no carryover-specific action.
         """
-        async with session.begin():
+        async with _seeding_the_retired_era(session):
             rollout = await _seed_rollout(session)
             stale = await _seed_stranded(
                 session,
@@ -546,7 +579,7 @@ class TestStrandedSelection:
         assert [c.agent_id for c in selected] == [stale]
 
     async def test_queue_withdrawal_is_respected(self, session: AsyncSession) -> None:
-        async with session.begin():
+        async with _seeding_the_retired_era(session):
             rollout = await _seed_rollout(session)
             withdrawn = await _seed_stranded(session, name="withdrawn")
             session.add(
@@ -598,7 +631,7 @@ class TestExhaustionPolicy:
     async def test_exhausted_excluded_by_default_included_when_asked(
         self, session: AsyncSession
     ) -> None:
-        async with session.begin():
+        async with _seeding_the_retired_era(session):
             rollout = await _seed_rollout(session)
             exhausted = await _seed_stranded(session, name="exhausted")
             await self._exhaust(session, exhausted)
@@ -622,7 +655,7 @@ class TestDedupe:
         self, session: AsyncSession
     ) -> None:
         """Two hotkeys, one coldkey, same age: the owner gets a single slot."""
-        async with session.begin():
+        async with _seeding_the_retired_era(session):
             rollout = await _seed_rollout(session)
             first = await _seed_stranded(
                 session, name="ck-a", hotkey="5HotkeyA", coldkey="5Coldkey"
@@ -651,7 +684,7 @@ class TestDedupe:
         self, session: AsyncSession
     ) -> None:
         """The miner moved on by their own choice, so the old work stands down."""
-        async with session.begin():
+        async with _seeding_the_retired_era(session):
             rollout = await _seed_rollout(session)
             await _seed_stranded(
                 session,
@@ -682,7 +715,7 @@ class TestDedupe:
         self, session: AsyncSession
     ) -> None:
         """A dead newer submission is no evidence the miner moved on."""
-        async with session.begin():
+        async with _seeding_the_retired_era(session):
             rollout = await _seed_rollout(session)
             old = await _seed_stranded(
                 session,
@@ -711,7 +744,7 @@ class TestDedupe:
         assert [c.agent_id for c in selected] == [old]
 
     async def test_scope_none_disables_suppression(self, session: AsyncSession) -> None:
-        async with session.begin():
+        async with _seeding_the_retired_era(session):
             rollout = await _seed_rollout(session)
             old = await _seed_stranded(
                 session,
@@ -740,7 +773,7 @@ class TestDedupe:
     async def test_an_owner_already_adopted_gets_no_second_slot(
         self, session: AsyncSession
     ) -> None:
-        async with session.begin():
+        async with _seeding_the_retired_era(session):
             rollout = await _seed_rollout(session)
             first = await _seed_stranded(
                 session, name="ck-a", hotkey="5HotkeyA", coldkey="5Coldkey"
@@ -775,7 +808,7 @@ class TestCapAndOrdering:
     async def test_cap_keeps_the_highest_progress_then_fifo(
         self, session: AsyncSession
     ) -> None:
-        async with session.begin():
+        async with _seeding_the_retired_era(session):
             rollout = await _seed_rollout(session)
             newer_two = await _seed_stranded(
                 session, name="two-newer", score_count=2, age_days=3
@@ -810,7 +843,7 @@ class TestCapAndOrdering:
     async def test_already_adopted_rows_count_against_the_cap(
         self, session: AsyncSession
     ) -> None:
-        async with session.begin():
+        async with _seeding_the_retired_era(session):
             rollout = await _seed_rollout(session)
             first = await _seed_stranded(session, name="first", age_days=9)
             await _seed_stranded(session, name="second", age_days=8)
@@ -842,7 +875,7 @@ class TestFreshLaneIsNotDiluted:
         datasetted, and named in the adopted set. ``only_agent_ids`` is the only
         thing that reaches it, and only the cohort-lane carryover path passes it.
         """
-        async with session.begin():
+        async with _seeding_the_retired_era(session):
             rollout = await _seed_rollout(session)
             adopted = await _seed_stranded(session, name="stranded")
         async with session.begin():
@@ -879,7 +912,7 @@ class TestFreshLaneIsNotDiluted:
         self, session: AsyncSession
     ) -> None:
         """Naming an id is a narrowing, never a bypass."""
-        async with session.begin():
+        async with _seeding_the_retired_era(session):
             await _seed_rollout(session)
             # Named, but never adopted: no desired-version dataset, so
             # ``issue_ticket``'s own hard requirement still refuses it.
@@ -899,7 +932,7 @@ class TestFreshLaneIsNotDiluted:
 
     async def test_default_call_shape_is_unchanged(self, session: AsyncSession) -> None:
         """Every existing caller passes no ``only_agent_ids`` and is unaffected."""
-        async with session.begin():
+        async with _seeding_the_retired_era(session):
             rollout = await _seed_rollout(session)
             adopted = await _seed_stranded(session, name="stranded")
             fresh_agent = await _seed_stranded(

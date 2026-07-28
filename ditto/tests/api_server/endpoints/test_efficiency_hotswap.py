@@ -45,6 +45,7 @@ from ditto.tests.api_server.endpoints.test_public_efficiency import (
     _seed_finalized,
     _seed_v7_board,
 )
+from ditto.tests.legacy_era import retired_era_writes_allowed
 
 _ADMIN_TOKEN = "test-admin-token-at-least-32-characters"
 _ADMIN_HEADERS = {"Authorization": f"Bearer {_ADMIN_TOKEN}"}
@@ -246,20 +247,31 @@ class TestBenchVersionGate:
     async def test_pre_v7_board_untouched_even_with_revision_enabled(
         self, session_maker: async_sessionmaker[AsyncSession]
     ) -> None:
-        # A finalized v6 board: the bonus never applies below bench_version 7,
-        # regardless of the hot-swappable policy.
+        """A finalized v6 board takes no bonus, whatever the operator sets.
+
+        The board this describes is history now -- v6 is retired, the active
+        version only moves forward, and neither the activated v2 -> v6 rollout
+        row nor a v6 score can be written any more. The guard is not history,
+        though: the rows it protects are still in the ledger, so it is seeded
+        the way production came by its own, with the floor lifted for the write
+        and restored (NOT VALID) before the read under test.
+        """
         from ditto.tests.api_server.endpoints.test_public_efficiency import (
             _activate_bench_version,
         )
 
-        await _activate_bench_version(session_maker, 6)
-        agent = await _seed_finalized(
-            session_maker,
-            miner=_MINERS[0],
-            composite=0.80,
-            total_tokens=100_000,
-            bench_version=6,
-        )
+        async with (
+            session_maker() as floor_session,
+            retired_era_writes_allowed(floor_session),
+        ):
+            await _activate_bench_version(session_maker, 6)
+            agent = await _seed_finalized(
+                session_maker,
+                miner=_MINERS[0],
+                composite=0.80,
+                total_tokens=100_000,
+                bench_version=6,
+            )
         app = _make_hotswap_app(session_maker)
         async with _client(app) as client:
             await _apply(client, expected=0, enabled=True)

@@ -30,6 +30,7 @@ from ditto.db.queries.benchmark_rollout import (
     RolloutSnapshotMember,
     create_rollout_snapshot,
 )
+from ditto.tests.legacy_era import retired_era_writes_allowed
 
 pytestmark = pytest.mark.integration
 
@@ -54,12 +55,22 @@ class _Generator:
 
 
 async def test_concurrent_legacy_qualification_has_one_winner() -> None:
+    """Two refreshes race over the same inherited cohort; exactly one wins.
+
+    The inherited ledger here is v2 and cannot be renumbered forward. A rollout
+    must move the version FORWARD to a target the contract registry ships, and
+    the newest shipped contract is v7 -- so whatever era this qualifies FROM is
+    below the retired-era floor by construction. These are grandfathered rows
+    of exactly the kind production still holds, so they are written the way
+    production got them: with the floor lifted for the seed and restored before
+    the code under test runs.
+    """
     engine = create_db_engine()
     maker = async_sessionmaker(engine, expire_on_commit=False)
     now = datetime.now(UTC).replace(microsecond=0)
     initial_ids = [uuid4() for _ in range(5)]
     rising_id = uuid4()
-    async with maker() as session, session.begin():
+    async with maker() as session, retired_era_writes_allowed(session), session.begin():
         await session.execute(text("TRUNCATE TABLE benchmark_rollouts, agents CASCADE"))
         members: list[RolloutSnapshotMember] = []
         pins: dict = {}
@@ -146,7 +157,7 @@ async def test_concurrent_legacy_qualification_has_one_winner() -> None:
                         memory_mean=0.1,
                         median_ms=1,
                         n=114,
-                        details={"bench_version": 3},
+                        details={"bench_version": CANARY_BENCH_VERSION},
                         generated_at=now,
                     ),
                 ]
@@ -206,11 +217,18 @@ async def test_concurrent_legacy_qualification_has_one_winner() -> None:
 
 
 async def test_validator_bootstrap_is_disabled() -> None:
+    """A fully qualified inherited cohort still opens no rollout on its own.
+
+    The v2 scores are load-bearing: they are what would make these five agents
+    qualify if bootstrap were still enabled, so renumbering them past the floor
+    would empty the inherited ledger and make the assertion below pass for the
+    wrong reason. They are seeded as the retired-era rows they are.
+    """
     engine = create_db_engine()
     maker = async_sessionmaker(engine, expire_on_commit=False)
     now = datetime.now(UTC).replace(microsecond=0)
     agent_ids = [uuid4() for _ in range(5)]
-    async with maker() as session, session.begin():
+    async with maker() as session, retired_era_writes_allowed(session), session.begin():
         await session.execute(text("TRUNCATE TABLE benchmark_rollouts, agents CASCADE"))
         for position, agent_id in enumerate(agent_ids, start=1):
             session.add(

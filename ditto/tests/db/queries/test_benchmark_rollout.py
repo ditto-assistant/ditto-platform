@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from typing import TypeVar
 from unittest.mock import AsyncMock
 from uuid import UUID, uuid4
 
@@ -77,8 +80,11 @@ from ditto.db.queries.queue_policy_settings import (
 )
 from ditto.db.queries.scores import count_ranked_quorum_agents, list_eligible_ledger
 from ditto.db.queries.screening import claim_screening_attempts
+from ditto.tests.legacy_era import retired_era_writes_allowed
 
 pytestmark = pytest.mark.asyncio
+
+_Seeded = TypeVar("_Seeded")
 
 
 async def test_admin_status_read_does_not_start_rollout(
@@ -314,13 +320,85 @@ async def _seed_rollout(session, now: datetime) -> tuple[list[UUID], BenchmarkRo
     return agent_ids, rollout
 
 
+@asynccontextmanager
+async def _seeded_session(
+    session_maker: async_sessionmaker[AsyncSession],
+    seed: Callable[[AsyncSession], Awaitable[_Seeded]],
+) -> AsyncIterator[tuple[AsyncSession, _Seeded]]:
+    """Seed the inherited, retired era, then hand the body a live floor.
+
+    Every rollout exercised in this file starts FROM the inherited v2 era, and
+    it has to: a rollout must move the version forward to a contract the
+    platform ships, the newest shipped contract is v7, so the source era of any
+    rollout that can still be built is beneath the retired-era floor. The
+    inherited ledger those rollouts rank, rescore and preempt against is
+    therefore made of exactly the grandfathered sub-v7 rows production still
+    holds -- there is no renumbering that keeps the transition and clears the
+    floor.
+
+    So ``seed`` runs with the floor lifted, in its own transaction, and the
+    constraints are back (``NOT VALID``, so the seeded rows are grandfathered)
+    before the body starts. The body -- the code actually under test -- runs
+    against a live floor, so nothing it writes can slip beneath it unnoticed.
+    """
+    async with session_maker() as session:
+        async with retired_era_writes_allowed(session), session.begin():
+            seeded = await seed(session)
+        async with session.begin():
+            yield session, seeded
+
+
+@asynccontextmanager
+async def _seeded_rollout_session(
+    session_maker: async_sessionmaker[AsyncSession], now: datetime
+) -> AsyncIterator[tuple[AsyncSession, list[UUID], BenchmarkRollout]]:
+    """:func:`_seeded_session` for the common five-agent inherited cohort."""
+    async with _seeded_session(session_maker, lambda s: _seed_rollout(s, now)) as (
+        session,
+        (agent_ids, rollout),
+    ):
+        yield session, agent_ids, rollout
+
+
+@asynccontextmanager
+async def _inherited_era_session(
+    session_maker: async_sessionmaker[AsyncSession], now: datetime
+) -> AsyncIterator[tuple[AsyncSession, list[UUID], BenchmarkRollout]]:
+    """Like :func:`_seeded_rollout_session`, but the floor stays lifted.
+
+    For the tests whose subject IS the inherited era rather than its cohort:
+    they keep building it inside the body -- a submission that only ever scored
+    on the source version, or a *live* source-era lease the rollout has to
+    preempt, refuse or leave alone. A source-era lease in particular can only
+    have been issued before the floor landed, since the ticket trigger refuses
+    it now; it is precisely the in-flight sub-v7 state that trigger was written
+    to let DRAIN rather than strand. Reproducing either means keeping the floor
+    down for the body as well as the seed.
+    """
+    async with (
+        session_maker() as session,
+        retired_era_writes_allowed(session),
+        session.begin(),
+    ):
+        agent_ids, rollout = await _seed_rollout(session, now)
+        yield session, agent_ids, rollout
+
+
 async def test_historical_rescore_cohort_fills_from_exactly_two_prior_eras(
     session_maker: async_sessionmaker[AsyncSession],
 ) -> None:
     now = datetime.now(UTC).replace(microsecond=0)
     expected_v4: list[UUID] = []
     expected_v3: list[UUID] = []
-    async with session_maker() as session, session.begin():
+    # v2-v4 are exactly what this cohort is built out of: the two prior eras
+    # a rescore inherits from. They are below the retired-era floor and cannot
+    # be renumbered above it without ceasing to be prior eras at all, so they
+    # are seeded the way production's are -- grandfathered.
+    async with (
+        session_maker() as session,
+        retired_era_writes_allowed(session),
+        session.begin(),
+    ):
         for version, count in ((4, 6), (3, 10), (2, 5)):
             for rank in range(count):
                 agent_id = uuid4()
@@ -372,8 +450,11 @@ async def test_rollout_idles_validator_until_fleet_finishes_priority_five(
     session_maker: async_sessionmaker[AsyncSession],
 ) -> None:
     now = datetime.now(UTC).replace(microsecond=0)
-    async with session_maker() as session, session.begin():
-        priority_ids, rollout = await _seed_rollout(session, now)
+    async with _seeded_rollout_session(session_maker, now) as (
+        session,
+        priority_ids,
+        rollout,
+    ):
         sixth_id = uuid4()
         session.add(
             Agent(
@@ -511,8 +592,11 @@ async def test_source_backfill_gate_waits_for_full_inherited_top_ten(
     session_maker: async_sessionmaker[AsyncSession],
 ) -> None:
     now = datetime.now(UTC).replace(microsecond=0)
-    async with session_maker() as session, session.begin():
-        agent_ids, rollout = await _seed_rollout(session, now)
+    async with _seeded_rollout_session(session_maker, now) as (
+        session,
+        agent_ids,
+        rollout,
+    ):
         for position in range(6, DEFAULT_RESCORE_COHORT_SIZE + 1):
             agent_id = uuid4()
             agent_ids.append(agent_id)
@@ -618,8 +702,11 @@ async def test_frozen_top_five_barrier_remains_raw_three_of_three(
     session_maker: async_sessionmaker[AsyncSession],
 ) -> None:
     now = datetime.now(UTC).replace(microsecond=0)
-    async with session_maker() as session, session.begin():
-        priority_ids, rollout = await _seed_rollout(session, now)
+    async with _seeded_rollout_session(session_maker, now) as (
+        session,
+        priority_ids,
+        rollout,
+    ):
         sixth_id = uuid4()
         session.add(
             Agent(
@@ -687,8 +774,11 @@ async def test_parallel_rollout_slots_stay_distinct_inside_frozen_priority_five(
     session_maker: async_sessionmaker[AsyncSession],
 ) -> None:
     now = datetime.now(UTC).replace(microsecond=0)
-    async with session_maker() as session, session.begin():
-        priority_ids, _rollout = await _seed_rollout(session, now)
+    async with _seeded_rollout_session(session_maker, now) as (
+        session,
+        priority_ids,
+        _rollout,
+    ):
         slot0 = await issue_rollout_ticket(
             session,
             validator_hotkey="validator-a",
@@ -712,8 +802,11 @@ async def test_five_agents_remain_v2_at_two_of_three_then_activate_atomically(
     session_maker: async_sessionmaker[AsyncSession],
 ) -> None:
     now = datetime.now(UTC).replace(microsecond=0)
-    async with session_maker() as session, session.begin():
-        agent_ids, rollout = await _seed_rollout(session, now)
+    async with _inherited_era_session(session_maker, now) as (
+        session,
+        agent_ids,
+        rollout,
+    ):
         v2_only_id = uuid4()
         session.add(
             Agent(
@@ -869,8 +962,11 @@ async def test_ineligible_qualified_member_does_not_block_remaining_work(
     session_maker: async_sessionmaker[AsyncSession],
 ) -> None:
     now = datetime.now(UTC).replace(microsecond=0)
-    async with session_maker() as session, session.begin():
-        agent_ids, _ = await _seed_rollout(session, now)
+    async with _seeded_rollout_session(session_maker, now) as (
+        session,
+        agent_ids,
+        _,
+    ):
         agent = await session.get(Agent, agent_ids[2])
         assert agent is not None
         agent.status = AgentStatus.BANNED
@@ -903,8 +999,11 @@ async def test_rollout_screened_only_skips_and_releases_source_only_work(
     session_maker: async_sessionmaker[AsyncSession],
 ) -> None:
     now = datetime.now(UTC).replace(microsecond=0)
-    async with session_maker() as session, session.begin():
-        agent_ids, rollout = await _seed_rollout(session, now)
+    async with _inherited_era_session(session_maker, now) as (
+        session,
+        agent_ids,
+        rollout,
+    ):
         for agent_id in agent_ids:
             agent = await session.get(Agent, agent_id)
             assert agent is not None
@@ -990,8 +1089,11 @@ async def test_rollout_preempts_idle_source_lease_only_when_target_work_exists(
     session_maker: async_sessionmaker[AsyncSession],
 ) -> None:
     now = datetime.now(UTC).replace(microsecond=0)
-    async with session_maker() as session, session.begin():
-        agent_ids, rollout = await _seed_rollout(session, now)
+    async with _inherited_era_session(session_maker, now) as (
+        session,
+        agent_ids,
+        rollout,
+    ):
         ordinary_id = uuid4()
         session.add(
             Agent(
@@ -1144,8 +1246,11 @@ async def test_rollout_never_preempts_a_lease_behind_a_frozen_capacity_blob(
     whose heartbeat ingest has stalled must keep its in-flight lease here too --
     the blob is a cache of the last successful ingest, not a liveness probe."""
     now = datetime.now(UTC).replace(microsecond=0)
-    async with session_maker() as session, session.begin():
-        _, rollout = await _seed_rollout(session, now)
+    async with _inherited_era_session(session_maker, now) as (
+        session,
+        _,
+        rollout,
+    ):
         ordinary_id = uuid4()
         session.add(
             Agent(
@@ -1205,8 +1310,11 @@ async def test_rollout_does_not_serve_or_preempt_noncanonical_lease(
     purpose: TicketPurpose,
 ) -> None:
     now = datetime.now(UTC).replace(microsecond=0)
-    async with session_maker() as session, session.begin():
-        _, rollout = await _seed_rollout(session, now)
+    async with _inherited_era_session(session_maker, now) as (
+        session,
+        _,
+        rollout,
+    ):
         ordinary_id = uuid4()
         session.add(
             Agent(
@@ -1250,7 +1358,11 @@ async def test_v3_score_drop_qualifies_and_rescreens_new_top_five_agent(
     now = datetime.now(UTC).replace(microsecond=0)
     rising_id = uuid4()
     async with session_maker() as session:
-        async with session.begin():
+        # The rising sixth is seeded on the inherited v2 ledger, the era the
+        # rollout is migrating away from -- below the retired-era floor by
+        # construction, since the only shipped target above it is v7. The
+        # floor is restored before the qualification under test runs.
+        async with retired_era_writes_allowed(session), session.begin():
             initial_ids, rollout = await _seed_rollout(session, now)
             session.add(
                 Agent(
@@ -1335,7 +1447,11 @@ async def test_legacy_scored_top_five_recovers_seed_and_converges_idempotently(
     now = datetime.now(UTC).replace(microsecond=0)
     rising_id = uuid4()
     async with session_maker() as session:
-        async with session.begin():
+        # The rising sixth is seeded on the inherited v2 ledger, the era the
+        # rollout is migrating away from -- below the retired-era floor by
+        # construction, since the only shipped target above it is v7. The
+        # floor is restored before the qualification under test runs.
+        async with retired_era_writes_allowed(session), session.begin():
             initial_ids, rollout = await _seed_rollout(session, now)
             session.add(
                 Agent(
@@ -1483,7 +1599,11 @@ async def test_admin_qualifies_scored_top_five_with_compare_and_swap_guards(
     now = datetime.now(UTC).replace(microsecond=0)
     rising_id = uuid4()
     async with session_maker() as session:
-        async with session.begin():
+        # The rising sixth is seeded on the inherited v2 ledger, the era the
+        # rollout is migrating away from -- below the retired-era floor by
+        # construction, since the only shipped target above it is v7. The
+        # floor is restored before the qualification under test runs.
+        async with retired_era_writes_allowed(session), session.begin():
             initial_ids, rollout = await _seed_rollout(session, now)
             session.add(
                 Agent(
@@ -1547,7 +1667,12 @@ async def test_admin_qualifies_scored_top_five_with_compare_and_swap_guards(
         assert detail.target_score_count == 0
 
         await session.rollback()
-        async with session.begin():
+        # A live source-era lease, which the ticket trigger now refuses to
+        # create -- it is by definition a lease that predates the floor. The
+        # floor goes straight back on, and the deadline rewrite below still
+        # runs under it: the trigger deliberately permits a retired lease to
+        # DRAIN, refusing only its re-issue.
+        async with retired_era_writes_allowed(session), session.begin():
             issued = ValidatorTicket(
                 agent_id=rising_id,
                 bench_version=2,
@@ -1641,7 +1766,11 @@ async def test_multiple_legacy_score_seeds_use_canonical_minimum(
     now = datetime.now(UTC).replace(microsecond=0)
     rising_id = uuid4()
     async with session_maker() as session:
-        async with session.begin():
+        # The rising sixth is seeded on the inherited v2 ledger, the era the
+        # rollout is migrating away from -- below the retired-era floor by
+        # construction, since the only shipped target above it is v7. The
+        # floor is restored before the qualification under test runs.
+        async with retired_era_writes_allowed(session), session.begin():
             initial_ids, rollout = await _seed_rollout(session, now)
             session.add(
                 Agent(
@@ -1757,7 +1886,14 @@ async def test_capable_validator_cannot_automatically_seed_rollout_work(
     session_maker: async_sessionmaker[AsyncSession],
 ) -> None:
     now = datetime.now(UTC).replace(microsecond=0)
-    async with session_maker() as session, session.begin():
+    # The inherited v2 ledger a capable validator must NOT be able to turn into
+    # rollout work on its own. Retired, so it is seeded with the floor lifted;
+    # nothing in the body writes, which is the point of the test.
+    async with (
+        session_maker() as session,
+        retired_era_writes_allowed(session),
+        session.begin(),
+    ):
         for position in range(1, 6):
             agent_id = uuid4()
             session.add(
@@ -2084,8 +2220,8 @@ async def test_second_rollout_while_one_is_open_raises_conflict_not_integrity(
             members=members,
             datasets=pins,
             now=now,
-            from_version=2,
-            desired_version=3,
+            from_version=7,
+            desired_version=8,
         )
         with pytest.raises(RolloutConflictError) as exc_info:
             await create_rollout_snapshot(
@@ -2093,8 +2229,8 @@ async def test_second_rollout_while_one_is_open_raises_conflict_not_integrity(
                 members=members,
                 datasets=pins,
                 now=now,
-                from_version=2,
-                desired_version=4,
+                from_version=7,
+                desired_version=9,
             )
         assert "only one benchmark rollout may be open" in str(exc_info.value)
 
@@ -2146,13 +2282,13 @@ async def test_supersede_frees_the_open_slot_for_the_next_rollout(
             members=members,
             datasets=pins,
             now=now,
-            from_version=2,
-            desired_version=3,
+            from_version=7,
+            desired_version=8,
         )
         assert await open_rollout(session) is not None
 
         superseded = await supersede_open_rollout(
-            session, actor="nick", reason="v3 gate had false positives", now=now
+            session, actor="nick", reason="v8 gate had false positives", now=now
         )
         assert superseded is not None
         assert superseded.rollout_id == stale.rollout_id
@@ -2169,20 +2305,20 @@ async def test_supersede_frees_the_open_slot_for_the_next_rollout(
         ).all()
         assert len(audit) == 1
         assert audit[0].payload["actor"] == "nick"
-        assert audit[0].payload["reason"] == "v3 gate had false positives"
+        assert audit[0].payload["reason"] == "v8 gate had false positives"
         assert audit[0].payload["previous_status"] == "collecting"
-        assert audit[0].payload["desired_version"] == 3
+        assert audit[0].payload["desired_version"] == 8
 
-        # 2 -> 4 now inserts cleanly rather than tripping the unique index.
+        # 7 -> 9 now inserts cleanly rather than tripping the unique index.
         fresh = await create_rollout_snapshot(
             session,
             members=members,
             datasets=pins,
             now=now + timedelta(seconds=1),
-            from_version=2,
-            desired_version=4,
+            from_version=7,
+            desired_version=9,
         )
-        assert fresh.desired_version == 4
+        assert fresh.desired_version == 9
         assert fresh.status == "collecting"
         await session.flush()
 
@@ -2191,8 +2327,11 @@ async def test_superseded_rollout_issues_no_tickets_and_never_activates(
     session_maker: async_sessionmaker[AsyncSession],
 ) -> None:
     now = datetime.now(UTC).replace(microsecond=0)
-    async with session_maker() as session, session.begin():
-        _agent_ids, rollout = await _seed_rollout(session, now)
+    async with _seeded_rollout_session(session_maker, now) as (
+        session,
+        _agent_ids,
+        rollout,
+    ):
         assert await supersede_open_rollout(
             session, actor="nick", reason="abandoned", now=now
         )
@@ -2214,8 +2353,9 @@ async def test_supersede_refuses_rollout_after_priority_cohort_owns_authority(
     session_maker: async_sessionmaker[AsyncSession],
 ) -> None:
     now = datetime.now(UTC).replace(microsecond=0)
-    async with session_maker() as session, session.begin():
-        _agent_ids, rollout = await _seed_desired_quorum_cohort(session, now)
+    async with _seeded_session(
+        session_maker, lambda s: _seed_desired_quorum_cohort(s, now)
+    ) as (session, (_agent_ids, rollout)):
         assert await active_bench_version(session) == CANARY_BENCH_VERSION
 
         with pytest.raises(RolloutConflictError, match="already owns active authority"):
@@ -2233,8 +2373,9 @@ async def test_operator_can_select_fully_qualified_superseded_authority(
     session_maker: async_sessionmaker[AsyncSession],
 ) -> None:
     now = datetime.now(UTC).replace(microsecond=0)
-    async with session_maker() as session, session.begin():
-        _agent_ids, rollout = await _seed_desired_quorum_cohort(session, now)
+    async with _seeded_session(
+        session_maker, lambda s: _seed_desired_quorum_cohort(s, now)
+    ) as (session, (_agent_ids, rollout)):
         rollout.status = "superseded"
         await session.flush()
         assert await active_bench_version(session) == 2
@@ -2266,8 +2407,9 @@ async def test_operator_cannot_select_v7_after_proxy_key_rollback(
     session_maker: async_sessionmaker[AsyncSession],
 ) -> None:
     now = datetime.now(UTC).replace(microsecond=0)
-    async with session_maker() as session, session.begin():
-        _agent_ids, rollout = await _seed_desired_quorum_cohort(session, now)
+    async with _seeded_session(
+        session_maker, lambda s: _seed_desired_quorum_cohort(s, now)
+    ) as (session, (_agent_ids, rollout)):
         rollout.status = "superseded"
         await session.flush()
 
@@ -2297,8 +2439,8 @@ async def test_activated_rollout_cannot_be_superseded(
         session.add(
             BenchmarkRollout(
                 rollout_id=uuid4(),
-                from_version=2,
-                desired_version=3,
+                from_version=7,
+                desired_version=8,
                 status="activated",
                 cohort_size=5,
                 created_at=now,
@@ -2323,18 +2465,22 @@ async def test_admin_supersede_endpoint_audits_and_refuses_activated(
                 members=members,
                 datasets=pins,
                 now=now,
-                from_version=2,
-                desired_version=3,
+                # The admin route resolves the version against the shipped
+                # contract registry, so this transition cannot move above v7
+                # the way the pure-query supersede tests do -- v8 answers
+                # "no shipped contract" and 409s before the supersede runs.
+                from_version=6,
+                desired_version=7,
             )
-        # The path accepts the legacy "v3" spelling as well as a bare "3".
+        # The path accepts the legacy "v7" spelling as well as a bare "7".
         state = await supersede_rollout(
             None,
             session,
-            "v3",
+            "v7",
             AdminRolloutSupersedeRequest(
                 reason="false positives",
                 actor="nick",
-                confirmation="SUPERSEDE BENCHMARK V3",
+                confirmation="SUPERSEDE BENCHMARK V7",
             ),
         )
         assert state["status"] == "superseded"
@@ -2345,11 +2491,11 @@ async def test_admin_supersede_endpoint_audits_and_refuses_activated(
             await supersede_rollout(
                 None,
                 session,
-                "v3",
+                "v7",
                 AdminRolloutSupersedeRequest(
                     reason="again",
                     actor="nick",
-                    confirmation="SUPERSEDE BENCHMARK V3",
+                    confirmation="SUPERSEDE BENCHMARK V7",
                 ),
             )
         assert exc_info.value.status_code == 409
@@ -2443,13 +2589,12 @@ async def test_activation_requires_five_ranked_desired_quorum_agents(
     # Parametrised rather than looped: each case needs a pristine database, which
     # the loop used to get by building a throwaway in-memory SQLite per iteration.
     now = datetime.now(UTC).replace(microsecond=0)
-    async with session_maker() as session, session.begin():
-        _agent_ids, rollout = await _seed_desired_quorum_cohort(
-            session,
-            now,
-            smoke_indices=smoke_indices,
-            held_indices=held_indices,
-        )
+    async with _seeded_session(
+        session_maker,
+        lambda s: _seed_desired_quorum_cohort(
+            s, now, smoke_indices=smoke_indices, held_indices=held_indices
+        ),
+    ) as (session, (_agent_ids, rollout)):
         # Raw row counts look like a complete cohort quorum.
         raw_counts = (
             await session.execute(
@@ -2483,8 +2628,9 @@ async def test_same_coldkey_generations_fill_one_rollout_position(
     session_maker: async_sessionmaker[AsyncSession],
 ) -> None:
     now = datetime.now(UTC).replace(microsecond=0)
-    async with session_maker() as session, session.begin():
-        agent_ids, _rollout = await _seed_desired_quorum_cohort(session, now)
+    async with _seeded_session(
+        session_maker, lambda s: _seed_desired_quorum_cohort(s, now)
+    ) as (session, (agent_ids, _rollout)):
         for index, agent_id in enumerate(agent_ids):
             agent = await session.get(Agent, agent_id)
             assert agent is not None
@@ -2525,10 +2671,9 @@ async def test_activation_refused_when_only_ranked_quorum_count_is_short(
     # precondition this cohort would activate into a four-agent pool and the
     # KOTH tail would go short.
     now = datetime.now(UTC).replace(microsecond=0)
-    async with session_maker() as session, session.begin():
-        agent_ids, rollout = await _seed_desired_quorum_cohort(
-            session, now, smoke_indices=(0,)
-        )
+    async with _seeded_session(
+        session_maker, lambda s: _seed_desired_quorum_cohort(s, now, smoke_indices=(0,))
+    ) as (session, (agent_ids, rollout)):
         converged = [
             RolloutSnapshotMember(
                 agent_id=agent_id, miner_hotkey=f"miner-{index + 1}", composite=0.9
@@ -2563,8 +2708,9 @@ async def test_activation_at_five_ranked_quorums_keeps_a_full_emission_set(
     # boundary. Before, the ledger is pinned to v2 with five entries; after, it
     # is wholly on v4 and still has five.
     now = datetime.now(UTC).replace(microsecond=0)
-    async with session_maker() as session, session.begin():
-        agent_ids, rollout = await _seed_desired_quorum_cohort(session, now)
+    async with _seeded_session(
+        session_maker, lambda s: _seed_desired_quorum_cohort(s, now)
+    ) as (session, (agent_ids, rollout)):
         assert (
             await count_ranked_quorum_agents(
                 session, bench_version=CANARY_BENCH_VERSION
@@ -2616,8 +2762,9 @@ async def test_v7_top_five_authority_requires_live_exact_inference_route(
     stale_route: bool,
 ) -> None:
     now = datetime.now(UTC).replace(microsecond=0)
-    async with session_maker() as session, session.begin():
-        _agent_ids, rollout = await _seed_desired_quorum_cohort(session, now)
+    async with _seeded_session(
+        session_maker, lambda s: _seed_desired_quorum_cohort(s, now)
+    ) as (session, (_agent_ids, rollout)):
         if stale_route:
             route = await session.get(
                 InferenceProviderRoute,
@@ -2646,7 +2793,7 @@ async def test_rollout_state_active_version_matches_start_guard_authority(
 ) -> None:
     """rollout_state's active_version must equal active_bench_version.
 
-    Regression for the spurious "active benchmark changed: expected v5, found v4"
+    Regression for the spurious "active benchmark changed: expected v9, found v8"
     409 on rollout start. The start guard compares the operator-supplied
     expected_active_version against active_bench_version(), while the operator UI
     reads it from rollout_state()["active_version"]. When those two derive the
@@ -2654,21 +2801,21 @@ async def test_rollout_state_active_version_matches_start_guard_authority(
     nothing changed.
 
     The divergent state: an activated older transition plus a newer, terminally
-    superseded transition that never activated (a real sequence -- a v5->v6 rollout
-    opened while a converging v4->v5 briefly read as active, then v4->v5 was
-    reverted, leaving v5->v6 dangling as the most-recent row). The most-recent row
-    (superseded, from=5) and the latest activated row (desired=4) disagree; both
+    superseded transition that never activated (a real sequence -- a v9->v10 rollout
+    opened while a converging v8->v9 briefly read as active, then v8->v9 was
+    reverted, leaving v9->v10 dangling as the most-recent row). The most-recent row
+    (superseded, from=9) and the latest activated row (desired=8) disagree; both
     reports must nonetheless agree with each other.
     """
     async with session_maker() as session:
         base = datetime(2026, 7, 1, tzinfo=UTC)
         # Older transition, activated: this is what the weight-setting guard treats
-        # as authoritative (latest activated desired_version == 4).
+        # as authoritative (latest activated desired_version == 8).
         session.add(
             BenchmarkRollout(
                 rollout_id=uuid4(),
-                from_version=3,
-                desired_version=4,
+                from_version=7,
+                desired_version=8,
                 status="activated",
                 cohort_size=5,
                 created_at=base,
@@ -2676,12 +2823,12 @@ async def test_rollout_state_active_version_matches_start_guard_authority(
             )
         )
         # Newer transition, terminally superseded (never activated). Its from_version
-        # is 5, so the pre-fix most-recent-row derivation reported active_version == 5.
+        # is 9, so the pre-fix most-recent-row derivation reported active_version == 9.
         session.add(
             BenchmarkRollout(
                 rollout_id=uuid4(),
-                from_version=5,
-                desired_version=6,
+                from_version=9,
+                desired_version=10,
                 status="superseded",
                 cohort_size=5,
                 created_at=base + timedelta(hours=2),
@@ -2691,7 +2838,7 @@ async def test_rollout_state_active_version_matches_start_guard_authority(
 
         guard = await active_bench_version(session)
         state = await rollout_state(session)
-        assert guard == 4
+        assert guard == 8
         # The invariant the fix guarantees: the value the UI echoes back as
         # expected_active_version is exactly what the start guard checks.
         assert state["active_version"] == guard
@@ -2763,7 +2910,15 @@ async def _start_for_cohort_size(
 ) -> dict:
     """Start a rollout with 12 eligible inherited agents under a given policy."""
     now = datetime.now(UTC).replace(microsecond=0)
-    async with session_maker() as session, session.begin():
+    async with (
+        session_maker() as session,
+        # The inherited era a rollout starts FROM is v2, which is beneath the
+        # retired-era floor -- as it must be, since the only shipped target
+        # above the floor is v7 and a rollout has to move forward into it. The
+        # floor is restored on the way out, so the start below runs against it.
+        retired_era_writes_allowed(session),
+        session.begin(),
+    ):
         await _seed_eligible_v2_era(session, now, count=12)
         if configured is not None:
             await insert_queue_policy_settings_revision(
