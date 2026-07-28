@@ -194,9 +194,7 @@ def upgrade() -> None:
     # supported. Drop both -- the column stays NOT NULL, so omitting it is now
     # an honest, immediate "null value in column" instead.
     op.execute("ALTER TABLE scores ALTER COLUMN bench_version DROP DEFAULT")
-    op.execute(
-        "ALTER TABLE validator_tickets ALTER COLUMN bench_version DROP DEFAULT"
-    )
+    op.execute("ALTER TABLE validator_tickets ALTER COLUMN bench_version DROP DEFAULT")
 
 
 def downgrade() -> None:
@@ -204,9 +202,7 @@ def downgrade() -> None:
     # this migration, so a downgrade leaves the schema byte-for-byte reversible
     # rather than only functionally so.
     op.execute("ALTER TABLE scores ALTER COLUMN bench_version SET DEFAULT 2")
-    op.execute(
-        "ALTER TABLE validator_tickets ALTER COLUMN bench_version SET DEFAULT 2"
-    )
+    op.execute("ALTER TABLE validator_tickets ALTER COLUMN bench_version SET DEFAULT 2")
     op.execute(
         "DROP TRIGGER IF EXISTS validator_tickets_bench_version_floor "
         "ON validator_tickets"

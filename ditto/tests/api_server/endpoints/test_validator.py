@@ -1136,6 +1136,7 @@ async def _seed_ticket(
         # so seeding it needs the floor lifted -- exactly as production's
         # surviving v6 leases predate the constraint. The floor is restored
         # before the test runs, so the drain it then asserts is a real drain.
+        ctx: contextlib.AbstractAsyncContextManager[None]
         if bench_version < MIN_SCOREABLE_BENCH_VERSION:
             ctx = retired_era_writes_allowed(s)
         else:

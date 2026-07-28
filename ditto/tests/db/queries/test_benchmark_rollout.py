@@ -51,6 +51,7 @@ from ditto.db.models import (
 )
 from ditto.db.queries.benchmark_rollout import (
     CANARY_BENCH_VERSION,
+    DEFAULT_BENCH_VERSION,
     DEFAULT_RESCORE_COHORT_SIZE,
     MIN_DESIRED_AUTHORITY_AGENTS,
     DatasetPin,
@@ -288,8 +289,16 @@ async def _seed_rollout(session, now: datetime) -> tuple[list[UUID], BenchmarkRo
                 )
             )
     await session.flush()
+    # ``from_version`` lost its default (it was 2, and a silent 2 -> target
+    # transition is exactly the shape the floor makes meaningless). This
+    # fixture's cohort IS the inherited v2 era -- see ``_seeded_session`` -- so
+    # it now says so instead of relying on the default that said it for it.
     rollout = await create_rollout_snapshot(
-        session, members=members, datasets=pins, now=now
+        session,
+        members=members,
+        datasets=pins,
+        now=now,
+        from_version=DEFAULT_BENCH_VERSION,
     )
     capabilities, stack = _capabilities(now)
     for hotkey in ("validator-a", "validator-b", "validator-c"):

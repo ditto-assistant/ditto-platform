@@ -26,6 +26,7 @@ from ditto.db.models import (
 )
 from ditto.db.queries.benchmark_rollout import (
     CANARY_BENCH_VERSION,
+    DEFAULT_BENCH_VERSION,
     DatasetPin,
     RolloutSnapshotMember,
     create_rollout_snapshot,
@@ -163,8 +164,14 @@ async def test_concurrent_legacy_qualification_has_one_winner() -> None:
                 ]
             )
         await session.flush()
+        # Explicit now that ``from_version`` has no default; this cohort is
+        # the inherited pre-floor era, which is what the old default of 2 meant.
         rollout = await create_rollout_snapshot(
-            session, members=members, datasets=pins, now=now
+            session,
+            members=members,
+            datasets=pins,
+            now=now,
+            from_version=DEFAULT_BENCH_VERSION,
         )
 
     async with maker() as session:

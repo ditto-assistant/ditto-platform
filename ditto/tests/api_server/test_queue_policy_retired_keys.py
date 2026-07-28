@@ -18,24 +18,30 @@ still rejects it.
 
 from __future__ import annotations
 
-from types import SimpleNamespace
+from typing import cast
 
 from ditto.api_models.queue_policy_settings import QueuePolicySettings
 from ditto.api_server.queue_policy_settings import (
     DEFAULT_SETTINGS,
     settings_from_row,
 )
+from ditto.db.models import QueuePolicySettingsRevision
 
 
-def _stored(**carryover_overrides: object) -> SimpleNamespace:
-    """A stored payload that still carries the retired key."""
+def _stored(**carryover_overrides: object) -> QueuePolicySettingsRevision:
+    """A stored payload that still carries the retired key.
+
+    Built as the real row type rather than a stand-in: ``settings_from_row``
+    reads a revision straight out of the table, and a duck-typed stub would let
+    the signature drift without anything noticing.
+    """
     payload = QueuePolicySettings().model_dump(mode="json")
     payload["prev_gen_carryover"] = {
         **payload["prev_gen_carryover"],
         "allow_retired_era_backfill": False,
         **carryover_overrides,
     }
-    return SimpleNamespace(revision=7, settings=payload)
+    return QueuePolicySettingsRevision(revision=7, settings=payload)
 
 
 def test_a_revision_carrying_the_retired_key_still_decodes() -> None:
@@ -65,5 +71,7 @@ def test_the_operators_other_settings_survive_the_removal() -> None:
 
 def test_a_genuinely_corrupt_revision_still_fails_open() -> None:
     """Stripping retired keys must not swallow real corruption."""
-    corrupt = SimpleNamespace(revision=8, settings={"prev_gen_carryover": "nonsense"})
+    corrupt = QueuePolicySettingsRevision(
+        revision=8, settings=cast(dict[str, object], {"prev_gen_carryover": "nonsense"})
+    )
     assert settings_from_row(corrupt) == DEFAULT_SETTINGS
