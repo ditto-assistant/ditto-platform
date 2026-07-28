@@ -49,6 +49,21 @@ DEFAULT_BENCH_VERSION = 2
 # follow DEFAULT_BENCH_VERSION, or a future rollout-from bump would silently
 # reinterpret every legacy submission as a newer benchmark.
 LEGACY_BENCH_VERSION = 2
+# The oldest benchmark era that may still produce a score. v2-v6 are RETIRED:
+# their datasets, harness contract and model relay are gone, no quorum will ever
+# be assembled on them again, and nothing in the ledger consumes their scores.
+#
+# This is a FLOOR, not a mirror of the active version. It is raised by hand when
+# an era is retired for good, never automatically on activation -- a rollout is
+# open precisely so ``from_version`` keeps scoring while the fleet migrates, and
+# pinning this to ``active_bench_version()`` would kill that lane mid-transition.
+#
+# Enforced in the database (``scores_bench_version_floor``,
+# ``confirmation_scores_bench_version_floor``, ``benchmark_rollout_desired_floor``
+# and the ``validator_tickets_bench_version_floor`` insert trigger), so an
+# application bug cannot write beneath it. Keep this constant and the migration
+# in step: the database is the authority, this is the value the API rejects with.
+MIN_SCOREABLE_BENCH_VERSION = 7
 # Compatibility name for callers/tests that need the newest *shipped* contract.
 # This is discovery metadata only: it no longer opens or selects a rollout.
 CANARY_BENCH_VERSION = latest_benchmark_contract().version

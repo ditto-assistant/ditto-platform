@@ -427,3 +427,42 @@ submissions page, findable by search and by direct URL, labelled
 `Retired · earlier benchmark`, with copy explaining that the subnet moved to a
 newer benchmark, that nothing was rejected, and that the scores it did receive
 are still on file.
+
+## The retired-era floor is terminal, never infrastructure
+
+Benchmark versions below **7** cannot be leased or scored at all. The bound is
+in the schema, not in a setting: `scores`, `confirmation_scores` and
+`benchmark_rollouts` carry `bench_version >= 7` CHECK constraints, and
+`validator_tickets` carries a trigger that refuses both an insert and any
+update that flips a sub-v7 ticket back to `issued`. See
+`MIN_SCOREABLE_BENCH_VERSION` and the
+`2026_07_28_enforce_bench_version_floor` migration.
+
+The constraints are `NOT VALID`, so every historical v2-v6 row stays present
+and readable. This closes the era to new writes; it does not delete anything.
+
+**A score submitted for a retired era returns `410 Gone` with error code
+`4002`, and that is a terminal verdict.** It must never be handed back as
+`fail_job(reason="infrastructure")`. Infrastructure is the no-fault class
+documented above — it mints a compensating grant, raises the attempt cap and
+re-leases — and a retired era is a condition that never clears, so treating it
+as infrastructure re-leases forever. This is the ditto-subnet#279 shape
+exactly, and it is why the status is 410 rather than 409: a conflict invites a
+retry, `Gone` does not. The correct hand-back is `scoring_error`, which is
+already what the canonical lane does for a `PlatformError` out of
+`submit_score`.
+
+The floor is also why a misclassification cannot loop even if one happens: the
+reissue an `infrastructure` verdict asks for has to put a sub-v7 ticket back
+into `issued`, and the trigger refuses it. The lease dies either way.
+
+### In-flight leases
+
+A lease that was already live when the floor landed is left alone rather than
+force-closed. It reaches a terminal state one of two ways — the validator
+reports the 410 through `fail_job`, or the overdue sweep expires it at its own
+deadline, at most ~90 minutes out — and nothing can re-lease it afterwards.
+Permitting the `issued -> expired` drain while refusing the re-lease is why
+the ticket guard is a trigger and not a CHECK constraint: a CHECK sees only the
+resulting row, never the transition, so it would have stranded every in-flight
+lease in `issued` with no way to close it.

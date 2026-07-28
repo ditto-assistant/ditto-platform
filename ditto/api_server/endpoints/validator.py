@@ -184,6 +184,7 @@ from ditto.db.queries.benchmark_admission import activated_rollout_for_version
 from ditto.db.queries.benchmark_carryover import carryover_agent_ids
 from ditto.db.queries.benchmark_rollout import (
     LEGACY_BENCH_VERSION,
+    MIN_SCOREABLE_BENCH_VERSION,
     active_bench_version,
     heartbeat_supports_version,
     issue_rollout_ticket,
@@ -730,22 +731,43 @@ async def _issue_source_backfill_ticket(
 ) -> ValidatorTicket | None:
     """Use otherwise-idle capacity after the desired era has nothing to give.
 
-    Retired-era work is previous-generation work, exactly like the adopted
-    carryover below, so both answer to the same operator policy
-    (``queue_policy.prev_gen_carryover``): it issues only into a genuinely empty
-    desired-era queue. A lease already in flight is never revoked -- the gate
-    guards new admission, not resumption, because expiring a running benchmark
-    would burn a retry attempt for a submission that did nothing wrong.
+    Previous-generation work answers to the same operator policy as the adopted
+    carryover below (``queue_policy.prev_gen_carryover``): it issues only into a
+    genuinely empty desired-era queue.
 
     ``active_version`` is the era the fleet is actually scoring. While a rollout
     is open it equals ``rollout.from_version``, and this lane does what it was
     written for (#362): keep a source-version validator busy draining the source
     backlog instead of idling through the transition, producing scores that
-    still count. Once the rollout activates the two diverge, and every ticket
-    this lane issues is for an era nobody will ever score again -- see
-    ``PrevGenCarryoverSettings.allow_retired_era_backfill``, which is why that
-    setting ships OFF.
+    still count. That is the ONLY case this lane serves now -- see the floor
+    below.
     """
+    # The floor, checked before anything else and before the resume path.
+    #
+    # Two separate conditions, because they fail for different reasons and one
+    # does not imply the other:
+    #
+    # * ``from_version < active_version`` -- the rollout activated and this
+    #   era is behind the fleet. Every ticket would be for a version no quorum
+    #   will ever be assembled on.
+    # * ``from_version < MIN_SCOREABLE_BENCH_VERSION`` -- the era is RETIRED
+    #   outright. Its scores cannot be written at all; the database rejects
+    #   them and the ticket trigger rejects the lease.
+    #
+    # This sits ABOVE the existing-lease resume below, and that placement is the
+    # entire point. The resume path re-issued an unexpired ``from_version``
+    # lease before reaching the old retired-era gate, and ``request_job``
+    # resurrects the activated v7 rollout to feed this lane -- whose
+    # ``from_version`` is 6. So "no rollout is open" did not mean "no v6
+    # tickets": a v6 lease kept renewing itself indefinitely with no flag
+    # involved. Resumption is not exempt from a floor. A lease for an era that
+    # can no longer be scored is not work in progress, it is a slot the live era
+    # does not get, and the score at the end of it would be rejected anyway.
+    if (
+        rollout.from_version < active_version
+        or rollout.from_version < MIN_SCOREABLE_BENCH_VERSION
+    ):
+        return None
     if heartbeat is None or not heartbeat_supports_version(
         heartbeat, now=now, version=rollout.from_version
     ):
@@ -791,21 +813,18 @@ async def _issue_source_backfill_ticket(
         )
     if resume_only:
         return None
-    # Everything below is NEW admission. A retired era gets none of it.
+    # NEW admission below. The retired-era question is already settled at the
+    # top of this function, for resume and admission alike, and there is no
+    # longer a setting that can re-open it.
     #
-    # `_prev_gen_lane_open` cannot stand in for this. It asks whether any
-    # desired-era work is leasable *right now*, and "nothing leasable this
-    # instant" is not "the desired era is finished": owner serialization, the
-    # per-(agent, version, validator) rule and quorum-sized capable fleets all
-    # make a deep v7 queue momentarily unleasable, at which point that gate
-    # correctly reports drained and this lane fills the fleet with tickets for a
-    # version that will never be scored again. Priority was the wrong axis --
+    # `_prev_gen_lane_open` never could have stood in for that floor. It asks
+    # whether any desired-era work is leasable *right now*, and "nothing
+    # leasable this instant" is not "the desired era is finished": owner
+    # serialization, the per-(agent, version, validator) rule and quorum-sized
+    # capable fleets all make a deep v7 queue momentarily unleasable, at which
+    # point that gate correctly reports drained. Priority was the wrong axis --
     # a retired era does not need to be last, it needs to be never.
-    if (
-        rollout.from_version != active_version
-        and not carryover_settings.allow_retired_era_backfill
-    ):
-        return None
+    #
     # Checked before the fleet lock so a poll that is going to decline anyway
     # does not serialize behind one that is not.
     if not await _prev_gen_lane_open(
@@ -1047,6 +1066,33 @@ class ValidatorAuthError(Exception):
     registered on the netuid, a hotkey without a ``validator_permit``, and
     a score whose signature does not verify. The envelope handler maps all
     of these to HTTP 401 + code 4000.
+    """
+
+
+class RetiredBenchVersionError(Exception):
+    """Raised when a score is submitted for a benchmark era that is retired.
+
+    Maps to HTTP **410 Gone** + code 4002, and the status is the whole point.
+    This is TERMINAL and it is the validator's cue to stop: the era is gone,
+    the database will not accept the row, and no amount of retrying changes
+    that. 409 was available and deliberately not used -- it reads as a
+    conflict, and a conflict invites a retry.
+
+    It must never be reported back as ``fail_job(reason="infrastructure")``.
+    Infrastructure is NO-FAULT: it mints a compensating grant, raises the
+    attempt cap and re-leases, forever. That is the exact loop that burned
+    4.5 validator-hours per attempt on the ``mnemo*`` family, and a retired
+    era would feed it indefinitely because the condition never clears. The
+    correct hand-back is ``scoring_error`` (consumes the attempt, no grant),
+    which is what the canonical lane already does for a ``PlatformError`` out
+    of ``submit_score``.
+
+    Belt and braces, though: even a misclassified ``infrastructure`` report
+    cannot loop, because the reissue it asks for has to insert a sub-v7
+    ``validator_tickets`` row and the
+    ``validator_tickets_bench_version_floor`` trigger refuses it. The lease
+    dies either way. That is the difference between closing this in policy and
+    closing it in the schema.
     """
 
 
@@ -4229,7 +4275,30 @@ async def submit_score(
         chain, netuid, payload.validator_hotkey, network=network
     )
 
-    # 3. Atomic: record the score + advance status together. The row lock
+    # 3. Retired-era floor, checked before the transaction opens.
+    #
+    # Deliberately outside ``session.begin()``: the answer depends on nothing
+    # in the database, so taking the agent row lock first would serialize live
+    # v7 scorers behind a submission that is going to be refused regardless.
+    #
+    # The in-flight lease this refuses is left ISSUED rather than closed here.
+    # That is the safe direction. Closing it would need this check to live
+    # inside the transaction that the rejection then rolls back, and a lease
+    # left alone still reaches a terminal state two ways: the validator reports
+    # the 410 through ``fail_job`` (``scoring_error`` -- consumes the attempt,
+    # mints no grant), or, if it says nothing at all, the overdue sweep expires
+    # it at its own deadline, at most ~90 minutes out. Neither can be re-leased
+    # afterwards: ``_issue_source_backfill_ticket`` refuses to resume beneath
+    # the floor, and the ``validator_tickets_bench_version_floor`` trigger
+    # refuses to insert a fresh sub-v7 ticket even if something asked.
+    report_version = report.bench_version or LEGACY_BENCH_VERSION
+    if report_version < MIN_SCOREABLE_BENCH_VERSION:
+        raise RetiredBenchVersionError(
+            f"benchmark v{report_version} is retired; the score ledger accepts "
+            f"v{MIN_SCOREABLE_BENCH_VERSION} and later only"
+        )
+
+    # 4. Atomic: record the score + advance status together. The row lock
     #    serializes concurrent scorers so the status guard + transition below
     #    can't be lost-updated.
     async with session.begin():
@@ -4243,7 +4312,6 @@ async def submit_score(
                 status_code=409,
                 detail="score submission is missing its ticket lease deadline",
             )
-        report_version = report.bench_version or LEGACY_BENCH_VERSION
         prior_ticket = await session.get(
             ValidatorTicket,
             (agent_id, report_version, payload.validator_hotkey),
