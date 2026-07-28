@@ -2078,11 +2078,21 @@ class ValidatorTicket(Base):
     reason alone. This is where that code now lands.
 
     Advisory and validator-supplied: it is not part of the signed fail payload
-    (neither is :attr:`failure_reason`), it drives no policy, and it is bounded
-    to 200 characters by ``FailJobRequest``. Written and cleared together with
-    :attr:`failure_reason`, so the pair is always read as one report. NULL means
-    the reporter sent none -- which is what every validator predating the field
-    does, and is not an error.
+    (neither is :attr:`failure_reason`), it drives no policy, and its length is
+    bounded by ``FailJobRequest`` alone -- see
+    ``ditto.api_models.validator.FAILURE_DETAIL_MAX_LENGTH``. The column itself
+    is ``TEXT`` and always has been, so widening that cap (200 -> 4096) needed no
+    migration and no rewrite of existing rows: every value ever stored here is
+    still valid, and the only thing that changed is how much a validator is
+    allowed to send. Written and cleared together with :attr:`failure_reason`, so
+    the pair is always read as one report. NULL means the reporter sent none --
+    which is what every validator predating the field does, and is not an error.
+
+    A value ending in ``...[truncated, N chars]`` is an amputated message, not a
+    whole one: the sender hit the cap and said so. Before that marker existed a
+    truncation was silent, and the half-sentence it left behind read as a
+    complete finding -- which is how the 2026-07-27 inference-decline diagnosis
+    lost the clause that named what the platform had actually done.
     """
 
     created_at: Mapped[datetime] = mapped_column(

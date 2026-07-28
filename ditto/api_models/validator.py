@@ -338,14 +338,50 @@ Being low-cardinality is also what makes it useless for diagnosis, which is what
 ``FailJobRequest.failure_detail`` exists to carry.
 """
 
-_FAILURE_DETAIL_MAX_LENGTH = 200
+FAILURE_DETAIL_MAX_LENGTH = 4096
 """Cap on ``FailJobRequest.failure_detail``.
 
-Long enough for a scorer failure code plus a short qualifier, short enough that
-the field cannot become a log-shipping channel into a hot table. The validator
-truncates to the same number before sending: a detail that overflows must never
-turn a hand-back into a 422 and leave the lease to expire silently -- that would
-trade the diagnosis this field adds for the ambiguity it exists to remove.
+Was 200, which is the length of a failure code plus a short qualifier and
+nothing more. That bound cost the very diagnosis the field was added for: on
+2026-07-27 it cut
+
+    ``... the platform rejected 81 of the harness's inference r``
+
+mid-word, discarding ``equest(s) outright, before reserving any capacity`` --
+the clause that named *what* the platform had done. The surviving half read as
+a complete sentence, which is worse than an obvious stub. The count and the
+verb survived only because of where they happened to fall in the sentence.
+
+4096 is a deliberate ceiling rather than "unbounded". This field is written by
+validators, on a hot table, once per failed ticket, and its content is derived
+from strings a miner's harness can influence -- so an unbounded column is a
+storage and log-volume liability with an adversarial input path into it. 4 KiB
+is ~16x the longest real message observed and comfortably fits a scorer message
+with a run id, a full account of an exhaustion, and its counts; it is still
+small enough that the whole ledger cannot be turned into a log sink.
+
+Overflow past this is still truncated by the sender, but no longer silently:
+:func:`ditto.validator.errors.failure_detail` in ditto-subnet appends an
+explicit ``...[truncated, N chars]`` marker, so a reader can tell an amputated
+message from a whole one. Truncating on the sending side (rather than rejecting
+here) remains the rule: a detail that overflows must never turn a hand-back into
+a 422 and leave the lease to expire silently -- that would trade the diagnosis
+this field adds for the ambiguity it exists to remove.
+
+Public rather than underscore-private because ditto-subnet mirrors this number
+by name and the golden contract in ``ditto/tests/contract`` pins it; the two
+copies are only correct together.
+"""
+
+LEGACY_FAILURE_DETAIL_MAX_LENGTH = 200
+"""The pre-widening cap, retained as documentation of the accepted floor.
+
+Validators run mixed versions. Every one predating this change truncates to 200
+before sending, and 200 <= :data:`FAILURE_DETAIL_MAX_LENGTH`, so those reports
+keep validating unchanged -- widening a ``max_length`` can only ever admit more.
+The reverse skew (a new validator against an old platform) is handled on the
+sending side in ditto-subnet, which retries a 422'd hand-back once at this
+bound.
 """
 
 
@@ -377,12 +413,12 @@ class FailJobRequest(BaseModel):
     ]
     failure_detail: Annotated[
         str | None,
-        StringConstraints(strip_whitespace=True, max_length=_FAILURE_DETAIL_MAX_LENGTH),
+        StringConstraints(strip_whitespace=True, max_length=FAILURE_DETAIL_MAX_LENGTH),
         Field(
             default=None,
             description=(
-                "Reporter's own failure code or short note behind ``reason``. "
-                "Advisory: drives no policy, unsigned, and optional."
+                "Reporter's own failure code or diagnostic message behind "
+                "``reason``. Advisory: drives no policy, unsigned, and optional."
             ),
         ),
     ] = None

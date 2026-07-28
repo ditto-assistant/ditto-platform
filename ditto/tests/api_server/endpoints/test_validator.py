@@ -53,6 +53,10 @@ from ditto.api_models.system_health import (
     system_metrics_signing_token,
 )
 from ditto.api_models.ticket_status import TicketPurpose, TicketStatus
+from ditto.api_models.validator import (
+    FAILURE_DETAIL_MAX_LENGTH,
+    LEGACY_FAILURE_DETAIL_MAX_LENGTH,
+)
 from ditto.api_models.validator_capabilities import (
     InferenceCalibrationRoute,
     ScorerBenchmarkCapability,
@@ -4876,6 +4880,7 @@ class TestFailJob:
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
         # The field is a diagnosis, not a log-shipping channel into a hot table.
+        # The cap moved 200 -> 4096; what must not move is that there *is* one.
         agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
         await _seed_ticket(session_maker, agent_id)
         _install_db(app, session_maker)
@@ -4885,10 +4890,119 @@ class TestFailJob:
             "/api/v1/validator/job/fail",
             headers=_AUTH_HEADER,
             json=_job_fail_payload(
-                agent_id, reason="infrastructure", failure_detail="x" * 201
+                agent_id,
+                reason="infrastructure",
+                failure_detail="x" * (FAILURE_DETAIL_MAX_LENGTH + 1),
             ),
         )
         assert failed.status_code == 422, failed.text
+
+    async def test_diagnostic_message_past_the_old_bound_survives_intact(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        # The regression this widening exists for. This is the real 2026-07-27
+        # value, the one that finally named a root cause three investigations had
+        # missed. At the old 200-char bound it arrived cut at "inference r",
+        # losing the clause that said what the platform actually did -- and the
+        # surviving half read as a finished sentence, so nothing signalled that
+        # anything was missing. Asserted end to end (HTTP body -> ticket row),
+        # character for character, because a cap that truncates *quietly* is the
+        # failure mode, not a cap as such.
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await _seed_ticket(session_maker, agent_id)
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        detail = (
+            "DittobenchError: run 2b7c6b6c-ae45-493d-b8f5-b1a4a6ff8b3a failed: "
+            "harness exhausted its inference allowance: agent-attributable "
+            "inference decline: the platform rejected 81 of the harness's "
+            "inference request(s) outright, before reserving any capacity"
+        )
+        assert len(detail) > LEGACY_FAILURE_DETAIL_MAX_LENGTH
+        assert len(detail) <= FAILURE_DETAIL_MAX_LENGTH
+
+        failed = await client.post(
+            "/api/v1/validator/job/fail",
+            headers=_AUTH_HEADER,
+            json=_job_fail_payload(
+                agent_id, reason="infrastructure", failure_detail=detail
+            ),
+        )
+        assert failed.status_code == 200, failed.text
+        async with session_maker() as s:
+            ticket = await s.get(ValidatorTicket, (agent_id, 2, _VALIDATOR_HOTKEY))
+            assert ticket is not None
+            # The whole message, not a prefix of it. `endswith` is asserted
+            # separately so a future silent re-truncation fails loudly on the
+            # clause that was lost, rather than on an opaque length mismatch.
+            assert ticket.failure_detail == detail
+            assert ticket.failure_detail.endswith("before reserving any capacity")
+
+    async def test_a_detail_at_the_widened_cap_round_trips(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        # The boundary itself. `failure_detail` is a TEXT column, so nothing
+        # narrower than the wire model can truncate it -- this is the assertion
+        # that says so, and it is what would catch a future VARCHAR(n) being
+        # introduced underneath the widened wire type.
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await _seed_ticket(session_maker, agent_id)
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        detail = "y" * FAILURE_DETAIL_MAX_LENGTH
+        failed = await client.post(
+            "/api/v1/validator/job/fail",
+            headers=_AUTH_HEADER,
+            json=_job_fail_payload(
+                agent_id, reason="scoring_error", failure_detail=detail
+            ),
+        )
+        assert failed.status_code == 200, failed.text
+        async with session_maker() as s:
+            ticket = await s.get(ValidatorTicket, (agent_id, 2, _VALIDATOR_HOTKEY))
+            assert ticket is not None
+            assert ticket.failure_detail is not None
+            assert len(ticket.failure_detail) == FAILURE_DETAIL_MAX_LENGTH
+            assert ticket.failure_detail == detail
+
+    async def test_legacy_validator_detail_at_the_old_bound_still_validates(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        # Fleet version skew, pinned in the direction that actually ships first.
+        # Validators run mixed versions (0.34.1 through 0.37.3 concurrently at
+        # time of writing) and every one of them truncates to 200 before sending.
+        # Widening a max_length only ever admits more, so those reports must keep
+        # validating byte-identically -- this is the test that says the widening
+        # is additive rather than a re-specification of the field.
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await _seed_ticket(session_maker, agent_id)
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        detail = "z" * LEGACY_FAILURE_DETAIL_MAX_LENGTH
+        failed = await client.post(
+            "/api/v1/validator/job/fail",
+            headers=_AUTH_HEADER,
+            json=_job_fail_payload(
+                agent_id, reason="infrastructure", failure_detail=detail
+            ),
+        )
+        assert failed.status_code == 200, failed.text
+        async with session_maker() as s:
+            ticket = await s.get(ValidatorTicket, (agent_id, 2, _VALIDATOR_HOTKEY))
+            assert ticket is not None
+            assert ticket.failure_detail == detail
 
     async def test_repeated_infrastructure_stops_minting_grants_per_agent(
         self,
