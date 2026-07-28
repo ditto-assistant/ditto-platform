@@ -13,7 +13,7 @@ import hashlib
 import json
 import logging
 import statistics
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Iterator, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -3555,6 +3555,23 @@ class TestHeartbeat:
         assert response.json()["error_code"] == ERROR_CODE_VALIDATOR_AUTH
 
 
+@contextlib.contextmanager
+def _capture_artifact_audit_logs(
+    caplog: pytest.LogCaptureFixture,
+) -> Iterator[None]:
+    """Capture the concrete audit logger even if another test replaced root handlers."""
+    audit_logger = logging.getLogger("ditto.db.queries.artifact_fetch_audit")
+    was_disabled = audit_logger.disabled
+    audit_logger.disabled = False
+    audit_logger.addHandler(caplog.handler)
+    try:
+        with caplog.at_level(logging.ERROR, logger=audit_logger.name):
+            yield
+    finally:
+        audit_logger.removeHandler(caplog.handler)
+        audit_logger.disabled = was_disabled
+
+
 class TestArtifactFetchAudit:
     """Every served artifact must leave a durable, attributable row."""
 
@@ -3628,6 +3645,7 @@ class TestArtifactFetchAudit:
         client: httpx.AsyncClient,
         session_maker: async_sessionmaker[AsyncSession],
         monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
         """A logging fault must never become a scoring outage.
 
@@ -3651,16 +3669,11 @@ class TestArtifactFetchAudit:
             "ditto.db.queries.artifact_fetch_audit.ArtifactFetchAudit",
             _explode,
         )
-        logged: list[str] = []
-        monkeypatch.setattr(
-            "ditto.db.queries.artifact_fetch_audit.logger.exception",
-            lambda message, *args, **_kwargs: logged.append(message % args),
-        )
-
-        response = await client.get(
-            f"/api/v1/validator/agent/{agent_id}/artifact",
-            headers=_artifact_headers(agent_id),
-        )
+        with _capture_artifact_audit_logs(caplog):
+            response = await client.get(
+                f"/api/v1/validator/agent/{agent_id}/artifact",
+                headers=_artifact_headers(agent_id),
+            )
 
         # The artifact is still served, in full.
         assert response.status_code == 200
@@ -3668,7 +3681,7 @@ class TestArtifactFetchAudit:
         assert body["download_url"].startswith("https://")
         assert body["sha256"] == _SHA256
         # ...and the gap is loud, not silent: this is the string alerting keys on.
-        assert any(AUDIT_WRITE_FAILED in message for message in logged)
+        assert AUDIT_WRITE_FAILED in caplog.text
         async with session_maker() as s:
             assert (
                 await s.scalar(select(func.count()).select_from(ArtifactFetchAudit))
@@ -3678,26 +3691,30 @@ class TestArtifactFetchAudit:
         self,
         session_maker: async_sessionmaker[AsyncSession],
         monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
         """The helper itself never raises, and never fails silently."""
-        logged: list[str] = []
+        # Reproduce the xdist order where earlier logging configuration left
+        # this already-imported named logger disabled in the worker.
         monkeypatch.setattr(
-            "ditto.db.queries.artifact_fetch_audit.logger.exception",
-            lambda message, *args, **_kwargs: logged.append(message % args),
+            logging.getLogger("ditto.db.queries.artifact_fetch_audit"),
+            "disabled",
+            True,
         )
-        async with session_maker() as s:
-            wrote = await record_artifact_fetch(
-                s,
-                agent_id=uuid4(),
-                endpoint="validator.agent_artifact",
-                requester_kind="validator",
-                # Violates the requester_id presence CHECK for a non-public
-                # kind, so the INSERT fails inside the database.
-                requester_id=None,
-            )
+        with _capture_artifact_audit_logs(caplog):
+            async with session_maker() as s:
+                wrote = await record_artifact_fetch(
+                    s,
+                    agent_id=uuid4(),
+                    endpoint="validator.agent_artifact",
+                    requester_kind="validator",
+                    # Violates the requester_id presence CHECK for a non-public
+                    # kind, so the INSERT fails inside the database.
+                    requester_id=None,
+                )
 
         assert wrote is False
-        assert any(AUDIT_WRITE_FAILED in message for message in logged)
+        assert AUDIT_WRITE_FAILED in caplog.text
 
 
 class TestArtifact:
