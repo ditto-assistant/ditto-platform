@@ -2372,10 +2372,18 @@
     .page[data-page="leaderboard"] #emissions-strip { margin-top: 28px; }
     /* The page's own title already says "Leaderboard"; the block heading is
        redundant here (it stays on the overview, where it is the board's only
-       label). Archive state remains signaled by the version pills and the
-       switch's context line. */
+       label). The version switch is hidden too: entering this page force-
+       resets to the current rollout (see the router), so an archive can never
+       render here — archive browsing lives on the overview, with full run
+       detail per row via the modal. */
     .page[data-page="leaderboard"] .section-head { display: none; }
     .page[data-page="leaderboard"] .leaderboard-version-switch { display: none; }
+    /* This page's promise is every column at every viewport: undo the
+       window-width column hiding (Model at ≤960, the metric set at ≤720) for
+       this board only. The table keeps its 850px floor and scrolls inside
+       .board, so all-columns stays honest on a phone. */
+    .page[data-page="leaderboard"] #board .hide-md,
+    .page[data-page="leaderboard"] #board .hide-sm { display: table-cell; }
     @media (min-width: 1181px) and (max-width: 1919px) {
       /* The half-width pane can't fit context text + one pill per bench
          version side by side; stack them like the mobile layout does. */
