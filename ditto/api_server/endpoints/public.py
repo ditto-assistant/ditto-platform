@@ -148,6 +148,7 @@ from ditto.api_server.artifact_audit import client_ip, request_detail
 from ditto.api_server.bench import CURRENT_BENCH_VERSION, is_bench_version_retired
 from ditto.api_server.benchmark_rollout import rolling_qualification_blockers
 from ditto.api_server.continual_retest_settings import aggregate_is_active
+from ditto.api_server.crn import champion_anchored_seeds
 from ditto.api_server.datapipeline import DataPipelineError
 from ditto.api_server.efficiency import (
     EfficiencyBoardView,
@@ -175,6 +176,7 @@ from ditto.api_server.koth import (
     KOTH_MARGIN,
     KOTH_RANK_SHARES,
     KOTH_TAIL_SIZE,
+    TOP5_MAX_CONFIRMATION_SEEDS,
     KothEntry,
     effective_composite,
     project_koth,
@@ -1670,8 +1672,15 @@ def _completed_wave_data(
     confirmation_by_seed: dict[UUID, dict[int, float]] | None = None,
     confirmation_depth: dict[UUID, int] | None = None,
     wave_membership: WaveMembership = DEFAULT_WAVE_MEMBERSHIP,
+    anchor_version: int | None = None,
 ) -> tuple[list[LedgerRow], dict[UUID, dict[int, float]], dict[UUID, int]]:
-    """Return canonical candidates plus only fully completed cohort-wave data."""
+    """Return canonical candidates plus only fully completed cohort-wave data.
+
+    ``anchor_version`` is the active benchmark version the reigning champion's
+    CRN anchor is derived on. Without it the fold intersects the raw append-only
+    trail, which spans every champion the board has had, and any member carrying
+    rows from an earlier reign collapses the wave to zero.
+    """
     by_seed = confirmation_by_seed or {}
     depths = confirmation_depth or {}
     candidates: list[LedgerRow] = []
@@ -1705,6 +1714,15 @@ def _completed_wave_data(
             agent_id: values.keys() for agent_id, values in by_seed.items()
         },
         mode=wave_membership,
+        anchored_seeds=(
+            champion_anchored_seeds(
+                raw_projection.champion.agent_id,
+                version=anchor_version,
+                max_seeds=TOP5_MAX_CONFIRMATION_SEEDS,
+            )
+            if raw_projection is not None and anchor_version is not None
+            else None
+        ),
     )
     by_seed = {
         agent_id: {
@@ -1738,6 +1756,7 @@ def _public_koth_emissions(
     confirmation_depth: dict[UUID, int] | None = None,
     include_continual_scores: bool = True,
     wave_membership: WaveMembership = DEFAULT_WAVE_MEMBERSHIP,
+    anchor_version: int | None = None,
 ) -> PublicKothEmissions | None:
     """Project the finalized score pool through the validator's pure fold."""
     quorum_values = quorum_by_agent or {}
@@ -1747,6 +1766,7 @@ def _public_koth_emissions(
         confirmation_by_seed=confirmation_by_seed,
         confirmation_depth=confirmation_depth,
         wave_membership=wave_membership,
+        anchor_version=anchor_version,
     )
 
     fold_entries = []
@@ -2097,6 +2117,7 @@ async def leaderboard(
         confirmation_by_seed=confirmation_by_seed,
         confirmation_depth=confirmation_depth,
         wave_membership=continual_settings.wave_membership,
+        anchor_version=active_version,
     )
     official_composites = {
         row.agent_id: effective_composite(
@@ -2337,6 +2358,7 @@ async def leaderboard(
                 ),
                 include_continual_scores=continual_mean_active,
                 wave_membership=continual_settings.wave_membership,
+                anchor_version=active_version,
             )
         ),
         efficiency=_efficiency_status(efficiency_view),

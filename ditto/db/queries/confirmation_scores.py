@@ -144,6 +144,7 @@ def fold_eligible_seeds_by_agent(
     member_ids: Iterable[UUID],
     seeds_by_agent: Mapping[UUID, Iterable[int]],
     mode: WaveMembership = DEFAULT_WAVE_MEMBERSHIP,
+    anchored_seeds: Sequence[int] | None = None,
 ) -> dict[UUID, frozenset[int]]:
     """Per agent, which confirmation seeds may enter the fold's aggregate.
 
@@ -204,16 +205,43 @@ def fold_eligible_seeds_by_agent(
     ``koth._paired_statistic`` computes its OWN pairwise seed intersection
     between challenger and champion, so the crown comparison stays paired
     whatever this returns.
+
+    ``anchored_seeds`` scopes every mode to ONE champion's anchor, and is what
+    makes the three policies above mean what they claim on a board that churns.
+    The anchor is a pure function of the champion's agent id
+    (:func:`ditto.api_server.crn.champion_anchored_seeds`), so a dethrone
+    replaces the seed set wholesale -- two champions' anchors are disjoint, and
+    only ``TOP5_MAX_CONFIRMATION_SEEDS`` of them exist per reign. The
+    append-only trail, however, spans every anchor the agent has ever been
+    rescored under. Intersecting those raw trails therefore compares seeds from
+    different reigns, and it fails in the direction that costs the most: an
+    agent carrying deep history from a PREVIOUS champion is admitted by the
+    ``participants`` predicate on the strength of rows that cannot match the
+    current anchor, and then empties the intersection for everyone. That is the
+    same defect ``participants`` was introduced to fix, arriving from the
+    opposite side -- there a member at depth zero erased the wave, here a member
+    at depth thirty-nine does.
+
+    Filtering to the anchor FIRST fixes both halves at once: the predicate then
+    asks "is this agent participating in the CURRENT wave", which is the
+    question it was always meant to ask, and the intersection is taken over
+    seeds that are actually comparable. ``None`` keeps the unscoped behaviour
+    for callers that have no champion to anchor on (and for the rollback path).
     """
     members = tuple(dict.fromkeys(member_ids))
-    own = {agent_id: frozenset(seeds) for agent_id, seeds in seeds_by_agent.items()}
+    anchor = None if anchored_seeds is None else frozenset(anchored_seeds)
+    own = {
+        agent_id: (frozenset(seeds) if anchor is None else frozenset(seeds) & anchor)
+        for agent_id, seeds in seeds_by_agent.items()
+    }
     if mode == "per_agent":
         return own
     if mode == "participants":
         members = tuple(member_id for member_id in members if own.get(member_id))
-    shared = completed_confirmation_wave_seeds(
-        member_ids=members, seeds_by_agent=seeds_by_agent
-    )
+    # Over ``own``, not the caller's raw mapping: the intersection has to see the
+    # same anchor-scoped sets the predicate just ran on, or a stale-anchor seed
+    # could still slip into ``shared`` and be handed back as fold-eligible.
+    shared = completed_confirmation_wave_seeds(member_ids=members, seeds_by_agent=own)
     # Intersected with what the agent actually holds, so the result is that
     # agent's fold-eligible seeds rather than a filter to be applied later. For
     # every member this is the shared set unchanged (the intersection could not

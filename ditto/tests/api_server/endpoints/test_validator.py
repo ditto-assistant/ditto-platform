@@ -6807,12 +6807,18 @@ class TestTop5ConfirmationLane:
         completed-wave samples here made every healthy validator claim the raw
         leader and receive a 409 from the authoritative job endpoint.
         """
+        from ditto.api_server.crn import champion_anchored_seeds
+
         agent_ids = await _seed_top5_emission_set(
             session_maker,
             bench_version=6,
             composites=[0.90, 0.92, 0.86, 0.84, 0.82, 0.80],
         )
-        seed = 123456
+        # The fold is scoped to the reigning champion's CRN anchor, so the wave
+        # has to be recorded on seeds that champion's reign would really issue.
+        # The incumbent keeps the crown here: 0.92 leads the raw median but at
+        # ``composite_stderr=0.03`` it is well inside the dethrone band.
+        seed = champion_anchored_seeds(agent_ids[0], version=6, max_seeds=16)[0]
         async with session_maker() as session, session.begin():
             for index, agent_id in enumerate(agent_ids[:5]):
                 session.add(

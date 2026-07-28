@@ -2407,6 +2407,15 @@ async def _current_koth_entries(
             agent_id: values.keys() for agent_id, values in history.items()
         },
         mode=wave_membership,
+        anchored_seeds=(
+            champion_anchored_seeds(
+                raw_members[0].agent_id,
+                version=canonical_version,
+                max_seeds=TOP5_MAX_CONFIRMATION_SEEDS,
+            )
+            if raw_members
+            else None
+        ),
     )
     entries: list[KothEntry] = []
     for rank, row in enumerate(rows, start=1):
