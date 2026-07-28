@@ -1291,7 +1291,13 @@ class TestDashboard:
         app = create_api_server(make_api_server_config(dashboard_enabled=True))
         body = (await _get(app, "/")).text
         assert '<aside class="sidebar"' in body
-        for page in ("overview", "leaderboard", "operations", "submissions", "benchmark"):
+        for page in (
+            "overview",
+            "leaderboard",
+            "operations",
+            "submissions",
+            "benchmark",
+        ):
             assert f'href="#/{page}"' in body
             assert f'data-page="{page}"' in body
         assert 'id="leaderboard-title">Leaderboard</h2>' in body
