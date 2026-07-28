@@ -49,7 +49,7 @@ class DatasetGenerator(Protocol):
         """Configured scoring profile, or ``None`` when disabled."""
         ...
 
-    async def generate(self, seed: int, bench_version: int = 2) -> str:
+    async def generate(self, seed: int, bench_version: int) -> str:
         """Generate the dataset for ``seed`` and return its SHA-256 (hex).
 
         Raises:
@@ -59,7 +59,7 @@ class DatasetGenerator(Protocol):
         ...
 
     async def fetch_dataset(
-        self, seed: int, run_size: str, bench_version: int = 2
+        self, seed: int, run_size: str, bench_version: int
     ) -> tuple[dict[str, Any], str]:
         """Return the FULL labeled dataset artifact for ``(seed, run_size)``.
 
@@ -89,7 +89,7 @@ class NullGenerator:
 
     run_size: str | None = None
 
-    async def generate(self, seed: int, bench_version: int = 2) -> str:
+    async def generate(self, seed: int, bench_version: int) -> str:
         del seed, bench_version
         raise DataPipelineError(
             "data-pipeline generate service is not configured (DATA_PIPELINE_URL "
@@ -97,7 +97,7 @@ class NullGenerator:
         )
 
     async def fetch_dataset(
-        self, seed: int, run_size: str, bench_version: int = 2
+        self, seed: int, run_size: str, bench_version: int
     ) -> tuple[dict[str, Any], str]:
         del seed, run_size, bench_version
         raise DataPipelineError(
@@ -122,7 +122,7 @@ class HttpDatasetGenerator:
     def run_size(self) -> str | None:
         return self._config.run_size
 
-    async def generate(self, seed: int, bench_version: int = 2) -> str:
+    async def generate(self, seed: int, bench_version: int) -> str:
         assert self._config.run_size is not None  # only built when enabled
         # generate() only needs the hash; the body (if any) is discarded, so it
         # never requires a parseable JSON payload.
@@ -130,7 +130,7 @@ class HttpDatasetGenerator:
         return sha
 
     async def fetch_dataset(
-        self, seed: int, run_size: str, bench_version: int = 2
+        self, seed: int, run_size: str, bench_version: int
     ) -> tuple[dict[str, Any], str]:
         resp, sha = await self._post_generate(seed, run_size, bench_version)
         try:

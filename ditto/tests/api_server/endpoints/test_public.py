@@ -6924,9 +6924,17 @@ class _FakeRevealGenerator:
         self._sha = sha
         self._fail = fail
         self.calls = 0
+        self.bench_versions: list[int] = []
 
-    async def fetch_dataset(self, seed: int, run_size: str) -> tuple[dict, str]:
+    async def fetch_dataset(
+        self, seed: int, run_size: str, bench_version: int
+    ) -> tuple[dict, str]:
+        # ``bench_version`` is required, not defaulted. The reveal endpoint used
+        # to omit it and take the old default of 2, which served the v2 dataset
+        # for every finalized agent regardless of the era it ran. Recording it
+        # here is what lets a test assert the endpoint asked for the right one.
         self.calls += 1
+        self.bench_versions.append(bench_version)
         if self._fail:
             raise DataPipelineError("generate service down")
         return {**self._artifact, "seed": seed, "run_size": run_size}, self._sha
@@ -6963,6 +6971,14 @@ class TestPublicDatasetReveal:
         assert body["run_size"] == "full"
         assert body["dataset_sha256"] == "cd" * 32
         assert body["bench_version"] == 2
+        # The dataset asked for is the one this agent actually ran. This is the
+        # regression: the endpoint omitted `bench_version` entirely and took the
+        # old default of 2, so every finalized agent was revealed the v2
+        # dataset. It never errored -- a v2 dataset is well-formed -- so only
+        # asserting the era the generator was ASKED for catches it coming back.
+        # (This agent genuinely scored on 2, so the right answer here IS 2 --
+        # what was broken is that it was 2 for everyone.)
+        assert gen.bench_versions == [2]
         # The FULL labeled artifact (answer keys included) is served.
         assert body["artifact"]["tool_cases"][0]["expected_tools"] == ["x"]
         assert gen.calls == 1
