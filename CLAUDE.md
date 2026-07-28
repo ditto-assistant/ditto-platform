@@ -50,6 +50,18 @@ async-substrate-interface). Wire shapes are `ditto/api_models` (Pydantic).
 - **Migrations own the schema.** `ditto/db/models.py` describes it in Python but
   Alembic under `alembic/versions/` is the source of truth — keep them in sync and
   add a migration for any schema change.
+- **One Alembic head, always — rebase before you add a migration.** Alembic
+  linears the chain by `down_revision`, *not* by merge date, so two branches
+  that each extend the same parent stay divergent however git merges them, and
+  `alembic upgrade head` then refuses to run at all (`Multiple head revisions
+  are present`) — taking the deploy and every DB test with it. Rebase onto
+  current `origin/main` and point `down_revision` at its head before opening a
+  PR, renumbering the `YYYY_MM_DD_` filename if main has moved past your date.
+  This is enforced, not just advised: `Migration order` resolves the **merge
+  result** rather than your branch alone, and every push to `main` re-checks
+  each open PR — so a PR that was green when you pushed it goes red the moment
+  someone else's migration lands, instead of staying mergeable. Reproduce
+  either locally with `python scripts/check_migration_order.py origin/main`.
 - **Adding a column to a hot table? Use `safe_add_column`.** `op.add_column`
   holds an `AccessExclusiveLock` until the migration commits, so a plain
   add-then-backfill stalls every writer for the length of the backfill — that is
@@ -113,6 +125,15 @@ enforces all four; Python checks run on 3.11 and 3.12.
 - Put unit tests next to the package they cover under `ditto/tests/<package>`.
 - `make test-db-reset` forces a template rebuild; `make test-db-clean` reaps
   every harness-owned database.
+- **Hundreds of DB failures after touching migrations? Reset the template
+  before believing them.** The harness migrates `ditto_test_template` once and
+  then clones it, so a template built while the chain was broken keeps failing
+  every DB test long after the chain is fixed — and it fails in a way that
+  reads as *your* change's fault. During the 2026-07-28 two-head fix the first
+  run on a clean worktree came back with 513 failures from exactly this; the
+  same worktree was green after `make test-db-reset`. The tell is breadth: a
+  real regression fails tests near what you touched, a stale template fails
+  everything that opens a database.
 
 ## Gotchas
 
