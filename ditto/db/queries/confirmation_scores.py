@@ -101,24 +101,43 @@ def confirmation_catchup_seeds(
     anchored_seeds: Sequence[int],
     seeds_by_agent: Mapping[UUID, Iterable[int]],
 ) -> tuple[int, ...]:
-    """The member's whole backlog: seeds its peers all hold and it does not.
+    """The member's whole backlog: seeds ANY peer holds and it does not.
 
     This is the *coverage gap* of one member measured against the rest of its
-    wave, in champion-anchored order. It is deliberately not "every seed the
-    member is missing": a seed nobody has reached yet is ordinary wave growth,
-    paced one at a time by :func:`completed_confirmation_wave_seeds`, and a
-    member must never run ahead of the wave. A seed every *other* member already
-    holds is different in kind -- it is settled evidence that this member alone
-    lacks, so there is no wave left to tear and no ordering to preserve. Every
-    one of them can be leased at once.
+    wave, in ``anchored_seeds`` order. A seed nobody has reached yet is ordinary
+    wave growth, paced by :func:`completed_confirmation_wave_seeds`, and a member
+    must never run ahead of the wave. A seed some peer already holds is different
+    in kind -- it is recorded evidence this member lacks, so there is no wave
+    left to tear and no ordering to preserve. Every one of them can be leased at
+    once.
 
-    That distinction is the whole point. A member promoted into the emission set
-    arrives at seed depth zero and, under one-seed-per-round pacing, needs one
-    round per anchored seed to converge -- during which the strict intersection
-    that gates the KOTH fold stays empty and every sibling's accumulated depth
-    stops counting (see :func:`fold_eligible_seeds_by_agent`). Returning the
-    backlog in full lets the fleet drain it in one round instead of N, so the
-    degraded window is brief rather than chronic.
+    That distinction is the whole point. A member arriving at seed depth zero
+    needs, under one-seed-per-round pacing, one round per anchored seed to
+    converge -- during which the intersection that gates the KOTH fold stays
+    empty and every sibling's accumulated depth stops counting (see
+    :func:`fold_eligible_seeds_by_agent`). Returning the backlog in full lets the
+    fleet drain it in one round instead of N, so the degraded window is brief
+    rather than chronic.
+
+    ANY peer, not every peer. This was the intersection over peers, which
+    quietly made the backlog only as wide as the peers' *common* coverage: a
+    seed that one peer held and the others did not was invisible to catch-up,
+    so nobody was ever sent to it and it stayed a permanent orphan. It could
+    not enter the fold either, because the fold intersects over members and
+    that seed was missing from most of them. Runs that had already been paid for
+    therefore sat in the table contributing to nothing -- 188 of 288 recorded
+    runs on the 2026-07-28 board.
+
+    Reading the union instead turns every one of those into a lease target: one
+    member holding a seed is sufficient reason to send everybody else to it, and
+    once they arrive the seed enters the intersection and starts counting. That
+    is also what makes a dethrone survivable. The anchor is keyed on the
+    champion's agent id, so a new crown introduces a disjoint seed set; under the
+    intersection reading the outgoing reign's coverage was abandoned, while under
+    the union reading it is simply backlog the cohort converges onto. The shared
+    set then grows monotonically across reigns instead of resetting, which is
+    what the champion-anchored design assumed all along and only holds if nothing
+    is discarded.
 
     Returns ``()`` when there are no peers: a lone member has nothing to catch
     up to, and growth pacing owns the decision.
@@ -128,15 +147,54 @@ def confirmation_catchup_seeds(
     )
     if not peers:
         return ()
-    reached = completed_confirmation_wave_seeds(
-        member_ids=peers, seeds_by_agent=seeds_by_agent
-    )
+    reached: set[int] = set()
+    for peer_id in peers:
+        reached.update(seeds_by_agent.get(peer_id, ()))
     if not reached:
         return ()
     held = frozenset(seeds_by_agent.get(member_id, ()))
     return tuple(
         seed for seed in anchored_seeds if seed in reached and seed not in held
     )
+
+
+async def lane_seed_universe(
+    session: AsyncSession,
+    *,
+    agent_ids: Iterable[UUID],
+    bench_version: int,
+) -> tuple[int, ...]:
+    """Every seed the lane has already recorded for these agents, seed-ordered.
+
+    The champion-anchored anchor describes one reign: at most
+    ``TOP5_MAX_CONFIRMATION_SEEDS`` seeds, disjoint from the previous crown's.
+    Bounding the lane to it means a dethrone abandons whatever coverage the
+    outgoing reign accumulated, which is how an agent ends up holding 53
+    recorded seeds against a 16-seed cap with none of them foldable.
+
+    The universe is the cumulative set instead: the anchor says which seeds are
+    NEW, and this says which are already in play. Callers bound catch-up and the
+    fold to ``anchor | universe`` so growth keeps introducing unpredictable
+    seeds -- that is the anti-overfit property the champion key provides, and it
+    is preserved exactly -- while nothing already paid for falls out of scope.
+
+    Sorted rather than anchor-ordered because a cumulative set has no single
+    issuing order to inherit; callers put the live anchor first and append this,
+    so growth pacing still walks the current reign in its own order. Deterministic
+    either way, which is what the per-seed lease fairness check needs.
+    """
+    ids = list(dict.fromkeys(agent_ids))
+    if not ids:
+        return ()
+    rows = await session.execute(
+        select(ConfirmationScore.seed)
+        .where(
+            ConfirmationScore.agent_id.in_(ids),
+            ConfirmationScore.bench_version == bench_version,
+        )
+        .distinct()
+    )
+    return tuple(sorted(int(seed) for (seed,) in rows))
 
 
 def fold_eligible_seeds_by_agent(
