@@ -296,6 +296,31 @@ def fold_eligible_seeds_by_agent(
         return own
     if mode == "participants":
         members = tuple(member_id for member_id in members if own.get(member_id))
+        # ...and of those, only the ones that overlap SOMEBODY. Holding rows is
+        # not the same as being in the shared wave. A member whose coverage is
+        # disjoint from every other member's contributes nothing the
+        # intersection could keep and can only empty it -- which is precisely
+        # what a previous reign's survivor did on the 2026-07-28 board, vetoing
+        # every sibling's accumulated depth on the strength of seeds nobody else
+        # had ever been scored on.
+        #
+        # This is the same judgement the depth-zero exclusion already makes, one
+        # step further along: an agent that has not joined the wave does not get
+        # to hold it closed. It is deliberately "overlaps somebody" and not
+        # "holds a current-anchor seed" -- the latter empties the fold outright
+        # for the whole window after a dethrone, when the new anchor is in
+        # nobody's history yet and the cohort's real shared evidence is entirely
+        # cross-reign.
+        overlapping: list[UUID] = []
+        for member_id in members:
+            others: set[int] = set()
+            for other_id in members:
+                if other_id != member_id:
+                    others.update(own.get(other_id, frozenset()))
+            if own[member_id] & others:
+                overlapping.append(member_id)
+        if overlapping:
+            members = tuple(overlapping)
     # Over ``own``, not the caller's raw mapping: the intersection has to see the
     # same anchor-scoped sets the predicate just ran on, or a stale-anchor seed
     # could still slip into ``shared`` and be handed back as fold-eligible.

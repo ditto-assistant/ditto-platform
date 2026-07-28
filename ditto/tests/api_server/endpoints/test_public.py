@@ -1585,21 +1585,29 @@ class TestPublicLeaderboard:
         # ...but the append-only audit trail is still reported in full.
         assert entries[stale_only_id]["confirmation_seed_depth"] == 8
 
-    async def test_a_dethrone_resets_the_fold_but_keeps_the_audit_trail(
+    async def test_a_dethrone_keeps_the_evidence_the_cohort_already_shares(
         self,
         app: FastAPI,
         client: httpx.AsyncClient,
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
-        """The companion boundary: a dethrone genuinely does reset the wave.
+        """A dethrone must NOT throw away what the cohort was measured on.
 
-        The anchor moves with the crown, so the incoming champion's seed set is
-        disjoint from the outgoing one and none of the accumulated evidence is
-        comparable any more. Collapsing to the quorum median is the honest
-        answer here -- unlike a tail membership change, where ``participants``
-        keeps the wave alive because the anchor never moved.
+        The anchor moves with the crown, so the incoming champion contributes a
+        disjoint set of NEW seeds. That is the anchor doing its job -- it is the
+        growth frontier. It is not a statement that the outgoing reign's seeds
+        stopped being valid: a seed IS a dataset, and two agents holding it were
+        measured on the same one whatever anchored it. The dethrone test has
+        always paired over shared seeds with no anchor filter at all.
 
-        The audit trail must survive it regardless (#485).
+        Scoping the fold to the live anchor alone treated a crown change as an
+        evidence reset. On the 2026-07-28 board that dropped the fold from ten
+        shared seeds to four while the shallowest member of the raw top five
+        held sixteen, and it would have thrown away exactly the seeds
+        ditto-platform#547 sends the whole cohort to go and cover.
+
+        So the accumulated wave survives the crown, and the audit trail survives
+        it too (#485).
         """
         from ditto.db.models import ContinualRetestSettingsRevision
         from ditto.db.queries.confirmation_scores import (
@@ -1690,11 +1698,17 @@ class TestPublicLeaderboard:
         after = (await client.get("/api/v1/public/leaderboard")).json()
         entries = {entry["agent_id"]: entry for entry in after["entries"]}
         assert entries[usurper_id]["rank"] == 1
-        # Re-anchored: nothing accumulated under the old crown is comparable.
-        assert entries[champion_id]["completed_wave_count"] == 0
-        assert entries[champion_id]["aggregate_method"] == "canonical_median"
-        assert entries[champion_id]["official_composite"] == pytest.approx(0.90)
-        # ...but the accepted rows were never deleted.
+        # The crown moved; the shared evidence did not. Both agents that ran the
+        # wave keep all three seeds and stay on the continual mean.
+        assert entries[champion_id]["completed_wave_count"] == 3
+        assert entries[champion_id]["aggregate_method"] == "continual_mean"
+        assert entries[champion_id]["official_composite"] == pytest.approx(0.75)
+        assert entries[tail_id]["completed_wave_count"] == 3
+        # The usurper has run none of them, so it stays on the quorum median --
+        # and, holding nothing anyone else holds, it cannot empty the wave.
+        assert entries[usurper_id]["completed_wave_count"] == 0
+        assert entries[usurper_id]["aggregate_method"] == "canonical_median"
+        # The accepted rows were never deleted.
         assert entries[champion_id]["confirmation_seed_depth"] == 3
         assert entries[tail_id]["confirmation_seed_depth"] == 3
 
