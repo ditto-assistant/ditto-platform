@@ -1797,7 +1797,13 @@ class TestHeartbeat:
             ("slot-0", str(first)),
             ("slot-1", str(second)),
         ]
-        assert [lease["bench_version"] for lease in body["leases"]] == [2, 3]
+        # One live-era lease and one grandfathered v3 lease still draining --
+        # which is the shape that makes the point: the roster reports the era
+        # of each lease the ledger holds, not one era for the whole fleet.
+        assert [lease["bench_version"] for lease in body["leases"]] == [
+            _BENCH_VERSION,
+            3,
+        ]
         for lease in body["leases"]:
             assert datetime.fromisoformat(lease["deadline"]) == _TICKET_DEADLINE
 
@@ -1906,7 +1912,9 @@ class TestHeartbeat:
         # Exactly what `force_expire_lease` writes on an operator eviction.
         now = datetime.now(UTC)
         async with session_maker() as session, session.begin():
-            ticket = await session.get(ValidatorTicket, (evicted, 2, _VALIDATOR_HOTKEY))
+            ticket = await session.get(
+                ValidatorTicket, (evicted, _BENCH_VERSION, _VALIDATOR_HOTKEY)
+            )
             assert ticket is not None
             ticket.status = TicketStatus.EXPIRED
             ticket.deadline = now
@@ -3736,7 +3744,14 @@ class TestArtifact:
         execute the code. A validator that could not fetch the tarball could
         not produce a k=3 score, and the subnet would stop paying anyone.
         """
-        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        # No screened image on purpose: this test is about fetching the SOURCE
+        # TARBALL under `disclosure = never`, and it asserts that exact key
+        # below. `_seed_agent` now supplies a verified screened image unless
+        # asked not to, which would quietly move the assertion onto the image
+        # path and stop testing the tarball the docstring is about.
+        agent_id = await _seed_agent(
+            session_maker, status=AgentStatus.EVALUATING, screened_image=False
+        )
         await _seed_ticket(session_maker, agent_id, bench_version=3)
         async with session_maker() as session, session.begin():
             head = await session.scalar(
@@ -5865,7 +5880,9 @@ class TestFailJob:
         )
         assert failed.status_code == 200, failed.text
         async with session_maker() as s:
-            ticket = await s.get(ValidatorTicket, (agent_id, 2, _VALIDATOR_HOTKEY))
+            ticket = await s.get(
+                ValidatorTicket, (agent_id, _BENCH_VERSION, _VALIDATOR_HOTKEY)
+            )
             assert ticket is not None
             # The whole message, not a prefix of it. `endswith` is asserted
             # separately so a future silent re-truncation fails loudly on the
@@ -5898,7 +5915,9 @@ class TestFailJob:
         )
         assert failed.status_code == 200, failed.text
         async with session_maker() as s:
-            ticket = await s.get(ValidatorTicket, (agent_id, 2, _VALIDATOR_HOTKEY))
+            ticket = await s.get(
+                ValidatorTicket, (agent_id, _BENCH_VERSION, _VALIDATOR_HOTKEY)
+            )
             assert ticket is not None
             assert ticket.failure_detail is not None
             assert len(ticket.failure_detail) == FAILURE_DETAIL_MAX_LENGTH
@@ -5931,7 +5950,9 @@ class TestFailJob:
         )
         assert failed.status_code == 200, failed.text
         async with session_maker() as s:
-            ticket = await s.get(ValidatorTicket, (agent_id, 2, _VALIDATOR_HOTKEY))
+            ticket = await s.get(
+                ValidatorTicket, (agent_id, _BENCH_VERSION, _VALIDATOR_HOTKEY)
+            )
             assert ticket is not None
             assert ticket.failure_detail == detail
 
