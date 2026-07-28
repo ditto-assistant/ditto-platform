@@ -2417,7 +2417,8 @@
        re-parented by the router — these rules only match in the overview). */
     .overview-main #leaderboard-notice,
     .overview-main #rollout-strip,
-    .overview-main #emissions-strip { display: none !important; }
+    .overview-main #emissions-strip,
+    .overview-main .lb-context-heading { display: none !important; }
 
     .snapshot { margin: 14px 0; }
     /* Stat tiles, not ledger rows: in the wide rail a label...value row leaves
@@ -2611,7 +2612,8 @@
     <!-- Post-table context: emissions, rollout, and standing notices sit
          below the board so the table starts at the top of the Leaderboard
          page. Hidden entirely on the overview (see .overview-main rules). -->
-    <div class="emissions-strip" id="emissions-strip" role="status" aria-live="polite">
+    <h2 class="visually-hidden lb-context-heading">Emissions, rollout, and standing notices</h2>
+    <div class="emissions-strip" id="emissions-strip" role="status" aria-live="polite" aria-label="KOTH emissions">
       <div class="emissions-summary">
         <div class="emissions-title" id="emissions-title"></div>
         <details class="emissions-why" id="emissions-why" hidden>
@@ -2626,12 +2628,12 @@
         <span id="chain-observation-copy"></span>
       </div>
     </div>
-    <div class="rollout-strip" id="rollout-strip" role="status" aria-live="polite">
+    <div class="rollout-strip" id="rollout-strip" role="status" aria-live="polite" aria-label="Benchmark rollout">
       <div class="rollout-head" id="rollout-head"></div>
       <div class="rollout-progress" id="rollout-progress"></div>
       <div class="rollout-note" id="rollout-note"></div>
     </div>
-    <div class="leaderboard-notice" id="leaderboard-notice" role="status" aria-live="polite"></div>
+    <div class="leaderboard-notice" id="leaderboard-notice" role="status" aria-live="polite" aria-label="Standing notices"></div>
     </div>
     </div>
     </div>
