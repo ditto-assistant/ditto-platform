@@ -2226,17 +2226,7 @@ async def request_job(
                     ),
                 )
         else:
-            ticket = await activate_next_score_retest(
-                session,
-                validator_hotkey=payload.validator_hotkey,
-                now=now,
-                supports_version=lambda version: (
-                    heartbeat is not None
-                    and heartbeat_supports_version(heartbeat, now=now, version=version)
-                ),
-                validator_running_benchmark=slot_running_benchmark,
-                slot_id=slot_id,
-            )
+            ticket = None
         if ticket is None:
             # During an open rollout, a source-version validator may resume a
             # source-version lease. Once activation completes, only the active
@@ -2350,6 +2340,22 @@ async def request_job(
                             queue_policy.owner_concurrent_submission_limit
                         ),
                     )
+                )
+            if ticket is None and rollout is None:
+                # Operator score re-tests are idle-capacity backfill. Ordinary
+                # quorum scoring owns the slot whenever it has a candidate.
+                ticket = await activate_next_score_retest(
+                    session,
+                    validator_hotkey=payload.validator_hotkey,
+                    now=now,
+                    supports_version=lambda version: (
+                        heartbeat is not None
+                        and heartbeat_supports_version(
+                            heartbeat, now=now, version=version
+                        )
+                    ),
+                    validator_running_benchmark=slot_running_benchmark,
+                    slot_id=slot_id,
                 )
             if ticket is None and source_backfill_rollout is not None:
                 # Once the inherited top ten is fully established on the new
