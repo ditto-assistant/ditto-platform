@@ -2413,8 +2413,10 @@
     /* The page's one gold moment: the same champion grammar the timeline
        crown plate and rank-one rows already own (gold frame, ♛, gold-toned
        numeral via the contrast-validated rank-one token), at full strength. */
-    .champion-box { margin: 0 0 18px; border: 1px solid color-mix(in oklch, var(--gold) 45%, var(--border)); border-radius: 4px; background: color-mix(in oklch, var(--gold) 5%, var(--bg-elev)); overflow: hidden; }
-    .champion-kicker { padding: 10px 16px; border-bottom: 1px solid color-mix(in oklch, var(--gold) 35%, var(--border)); background: color-mix(in oklch, var(--gold) 12%, var(--bg-elev)); color: var(--rank-one-text); font: 700 11px/1 var(--mono); letter-spacing: .07em; text-transform: uppercase; }
+    /* overflow stays visible so tooltip bubbles can escape the frame; the
+       kicker rounds its own top corners instead of relying on parent clip. */
+    .champion-box { margin: 0 0 18px; border: 1px solid color-mix(in oklch, var(--gold) 45%, var(--border)); border-radius: 4px; background: color-mix(in oklch, var(--gold) 5%, var(--bg-elev)); }
+    .champion-kicker { padding: 10px 16px; border-radius: 3px 3px 0 0; border-bottom: 1px solid color-mix(in oklch, var(--gold) 35%, var(--border)); background: color-mix(in oklch, var(--gold) 12%, var(--bg-elev)); color: var(--rank-one-text); font: 700 11px/1 var(--mono); letter-spacing: .07em; text-transform: uppercase; }
     .champion-kicker .crown { margin-right: 7px; font-size: 12px; }
     .champion-body { padding: 16px 16px 14px; }
     .champion-state { color: var(--text-dim); font-size: 12.5px; line-height: 1.5; }
@@ -2439,8 +2441,13 @@
     /* Stat tiles, not ledger rows: in the wide rail a label...value row leaves
        a chasm between the pair. Same shared-1px-rule tile grid as the brand's
        bench board — label on top, serif numeral under it. */
-    .stat-ledger { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 1px; margin: 0; border: 1px solid var(--border); border-radius: 4px; background: var(--border); overflow: hidden; }
+    /* overflow stays visible so tile tooltips can escape the grid; the four
+       corner tiles round themselves (featured tile owns the whole left edge). */
+    .stat-ledger { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 1px; margin: 0; border: 1px solid var(--border); border-radius: 4px; background: var(--border); }
     .ledger-line { display: block; min-width: 0; padding: 11px 14px; background: var(--bg-elev); }
+    .stat-ledger .ledger-line.featured { border-radius: 3px 0 0 3px; }
+    .stat-ledger .ledger-line:nth-child(5) { border-top-right-radius: 3px; }
+    .stat-ledger .ledger-line:last-child { border-bottom-right-radius: 3px; }
     /* The population headline gets the hero treatment: one tall tile
        anchoring the grid's left edge, the eight singles filling a clean
        5-column rectangle around it. Detail stays in the tooltip. */
