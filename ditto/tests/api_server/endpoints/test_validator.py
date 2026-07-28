@@ -770,8 +770,22 @@ async def _seed_activated_era(
     Activated an hour in the past so agents seeded with ``created_at=now`` are
     submissions of this era and pass ``benchmark_admission_predicate``.
     """
-    rollout_id = uuid4()
     when = activated_at or (datetime.now(UTC) - timedelta(hours=1))
+    # Idempotent: (from_version, desired_version) is UNIQUE, and more than one
+    # fixture legitimately wants the fleet on this era -- the autouse
+    # ``_current_era`` fixtures and ``_seed_top5_emission_set`` both say so.
+    # Returning the existing transition lets them compose instead of colliding
+    # on a duplicate-key error that says nothing about benchmarks.
+    async with maker() as probe:
+        existing = await probe.scalar(
+            select(BenchmarkRollout.rollout_id).where(
+                BenchmarkRollout.from_version == version - 1,
+                BenchmarkRollout.desired_version == version,
+            )
+        )
+    if existing is not None:
+        return existing
+    rollout_id = uuid4()
     async with maker() as session:
         # An activation into a RETIRED era is history, and history is exactly
         # what production holds: `benchmark_rollout_desired_floor` is NOT VALID,
@@ -3910,7 +3924,7 @@ class TestRequestJob:
         """
         now = datetime.now(UTC)
         rollout = MagicMock(
-            rollout_id=uuid4(), from_version=6, desired_version=7, cohort_size=10
+            rollout_id=uuid4(), from_version=_BENCH_VERSION, desired_version=_BENCH_VERSION + 1, cohort_size=10
         )
         session = AsyncMock()
         session.get_bind = MagicMock(
@@ -3944,7 +3958,7 @@ class TestRequestJob:
             heartbeat=MagicMock(),
             validator_hotkey="validator-a",
             now=now,
-            active_version=6,
+            active_version=_BENCH_VERSION,
             artifact_mode="screened_only",
             validator_running_benchmark=False,
             slot_id="slot-1",
@@ -4146,7 +4160,7 @@ class TestRequestJob:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         now = datetime.now(UTC)
-        rollout = MagicMock(from_version=6, desired_version=7, cohort_size=10)
+        rollout = MagicMock(from_version=_BENCH_VERSION, desired_version=_BENCH_VERSION + 1, cohort_size=10)
         heartbeat = MagicMock()
         session = AsyncMock()
         session.get_bind = MagicMock(
@@ -4171,7 +4185,7 @@ class TestRequestJob:
             heartbeat=heartbeat,
             validator_hotkey="validator-a",
             now=now,
-            active_version=6,
+            active_version=_BENCH_VERSION,
             artifact_mode="screened_only",
             validator_running_benchmark=False,
             slot_id="slot-1",
@@ -4185,19 +4199,19 @@ class TestRequestJob:
             heartbeat=heartbeat,
             validator_hotkey="validator-a",
             now=now,
-            active_version=6,
+            active_version=_BENCH_VERSION,
             artifact_mode="screened_only",
             validator_running_benchmark=False,
             slot_id="slot-1",
         )
         assert ticket is issued
-        supports_version.assert_any_call(heartbeat, now=now, version=6)
+        supports_version.assert_any_call(heartbeat, now=now, version=_BENCH_VERSION)
         issue.assert_awaited_once_with(
             session,
             validator_hotkey="validator-a",
             now=now,
             ttl=timedelta(minutes=90),
-            bench_version=6,
+            bench_version=_BENCH_VERSION,
             artifact_mode="screened_only",
             validator_running_benchmark=False,
             slot_id="slot-1",
@@ -4206,19 +4220,25 @@ class TestRequestJob:
             owner_concurrent_submission_limit=2,
         )
 
-    async def test_activated_v7_retires_v6_until_an_operator_asks_for_it(
+    async def test_activated_v7_retires_v6_permanently(
         self,
         app: FastAPI,
         client: httpx.AsyncClient,
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
-        """v6 is retired: no new lease for it, knob or no knob asked first.
+        """v6 is retired, and there is no longer a knob that un-retires it.
 
         The rollout below has ACTIVATED, so no v6 score will ever join a quorum
-        again. Every ticket the source-backfill lane issues here is a validator
-        slot spent on a number nobody will read. Once an operator asks for the
-        lane by name, the rest of its contract -- the fleet reservation, resume,
-        and a v6 quorum that still finalizes into the v6 ledger -- is unchanged.
+        again, and every ticket the source-backfill lane could issue here is a
+        validator slot spent on a number nobody will read.
+
+        This test used to continue past the assertions below: it turned on
+        ``allow_retired_era_backfill`` and asserted the whole v6 contract came
+        back -- lease, resume, quorum, a finalized v6 ledger entry. That half is
+        gone with the setting. It was the proof that "v6 is closed" was a
+        statement about a default rather than about the system, which is exactly
+        what the floor replaced. What survives is the half that is still true,
+        and now permanently: the lane issues nothing, and nothing can ask it to.
         """
         now = datetime.now(UTC)
         cohort = (
@@ -4282,19 +4302,26 @@ class TestRequestJob:
             capabilities=source_only_capabilities,
             stack=_V7_STACK,
         )
-        rollout_id = uuid4()
-        async with session_maker() as session, session.begin():
-            session.add(
-                BenchmarkRollout(
-                    rollout_id=rollout_id,
-                    from_version=6,
-                    desired_version=7,
-                    status="activated",
-                    cohort_size=5,
-                    created_at=now - timedelta(hours=1),
-                    activated_at=now,
+        # The v6 -> v7 activation is already on record -- the autouse
+        # ``_current_era`` fixture seeds it and (from_version, desired_version)
+        # is unique -- so attach the cohort to that row instead of inserting a
+        # duplicate transition.
+        async with session_maker() as probe:
+            rollout_id = await probe.scalar(
+                select(BenchmarkRollout.rollout_id).where(
+                    BenchmarkRollout.desired_version == _BENCH_VERSION
                 )
             )
+        assert rollout_id is not None
+        # The v6 rows this test needs are HISTORY. In production they are
+        # grandfathered by the NOT VALID floor; a fresh test database has to
+        # write them beneath a lifted floor, which the helper restores before
+        # the assertions run against a live one.
+        async with (
+            session_maker() as session,
+            retired_era_writes_allowed(session),
+            session.begin(),
+        ):
             for position, agent_id in enumerate(cohort, start=1):
                 session.add(
                     BenchmarkRolloutMember(
@@ -4395,102 +4422,6 @@ class TestRequestJob:
                 == 0
             )
 
-        await _enable_retired_era_backfill(app, session_maker)
-
-        primary = await client.post(
-            "/api/v1/validator/job",
-            headers=_AUTH_HEADER,
-            json=_job_payload(slot_id="slot-0"),
-        )
-        assert primary.status_code == 200, primary.text
-        assert primary.json()["agent_id"] == str(source_agent)
-        assert primary.json()["bench_version"] == 6
-        assert primary.json()["slot_id"] == "slot-0"
-        assert primary.json()["inference"] is None
-
-        capped = await client.post(
-            "/api/v1/validator/job",
-            headers={"X-Validator-Hotkey": _DAVE.ss58_address},
-            json=_job_payload(_DAVE, slot_id="slot-0"),
-        )
-        assert capped.status_code == 204
-
-        resumed = await client.post(
-            "/api/v1/validator/job",
-            headers=_AUTH_HEADER,
-            json=_job_payload(slot_id="slot-0"),
-        )
-        assert resumed.status_code == 200, resumed.text
-        assert resumed.json()["agent_id"] == str(source_agent)
-        async with session_maker() as session:
-            ticket = await session.get(
-                ValidatorTicket, (source_agent, 6, _VALIDATOR_HOTKEY)
-            )
-            assert ticket is not None
-            assert ticket.status == TicketStatus.ISSUED
-            assert ticket.attempt_count == 1
-
-        deadline = datetime.fromisoformat(primary.json()["deadline"])
-        async with session_maker() as session, session.begin():
-            for index, keypair in enumerate((_KEYPAIRS[1],), start=2):
-                session.add(
-                    ValidatorTicket(
-                        agent_id=source_agent,
-                        bench_version=6,
-                        validator_hotkey=keypair.ss58_address,
-                        status=TicketStatus.SCORED,
-                        issued_at=now - timedelta(minutes=5),
-                        deadline=deadline,
-                        attempt_count=1,
-                    )
-                )
-                session.add(
-                    Score(
-                        agent_id=source_agent,
-                        bench_version=6,
-                        validator_hotkey=keypair.ss58_address,
-                        run_id=f"historical-v6-{index}",
-                        signature="aa",
-                        seed=8675309,
-                        composite=0.7 + index / 100,
-                        tool_mean=0.7,
-                        memory_mean=0.7,
-                        median_ms=100,
-                        n=114,
-                        details={"bench_version": 6},
-                        generated_at=now,
-                    )
-                )
-
-        finalized = await client.post(
-            f"/api/v1/validator/agent/{source_agent}/score",
-            json=_score_payload(
-                source_agent,
-                run_id="historical-v6-3",
-                ticket_deadline=deadline,
-                bench_version=6,
-                n=114,
-                details={"bench_version": 6},
-            ),
-        )
-        assert finalized.status_code == 200, finalized.text
-        assert finalized.json()["status"] == AgentStatus.SCORED
-        from ditto.db.queries.scores import list_eligible_ledger
-
-        async with session_maker() as session:
-            active_v7 = await list_eligible_ledger(session, bench_version=7)
-            historical_v6 = await list_eligible_ledger(session, bench_version=6)
-        assert source_agent not in {row.agent_id for row in active_v7}
-        assert source_agent in {row.agent_id for row in historical_v6}
-        assert [
-            awaited.kwargs["key"] for awaited in storage.put_object.await_args_list
-        ] == [
-            f"scored/{source_agent}/v6.json",
-            f"scored/{source_agent}.json",
-        ]
-        record = json.loads(storage.put_object.await_args.kwargs["body"])
-        assert record["bench_version"] == 6
-        assert record["dataset_sha256"] == "cd" * 32
 
     async def test_fresh_submission_lane_uses_three_of_four_completed_jobs(
         self, session_maker: async_sessionmaker[AsyncSession]
@@ -5447,6 +5378,9 @@ class TestFailJob:
         # deadline) instead of resuming.
         agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
         await _seed_ticket(session_maker, agent_id)
+        # The reissue is the point, so the validator has to be one the allocator
+        # will hand a v7 lease to.
+        await _seed_capable_pool(session_maker, keypairs=(_KEYPAIR,))
         _install_db(app, session_maker)
         _install_chain(app)
 
@@ -5458,7 +5392,9 @@ class TestFailJob:
         assert failed.status_code == 200, failed.text
 
         reissued = await client.post(
-            "/api/v1/validator/job", headers=_AUTH_HEADER, json=_job_payload()
+            "/api/v1/validator/job",
+            headers=_AUTH_HEADER,
+            json=_job_payload(slot_id=_SLOT_ID),
         )
         assert reissued.status_code == 200, reissued.text
         job = reissued.json()
@@ -7573,7 +7509,9 @@ class TestMultiValidatorConsensus:
             lapsed.deadline = datetime.now(UTC) - timedelta(minutes=1)
 
         cooling_down = await client.post(
-            "/api/v1/validator/job", headers=headers, json=_job_payload(keypair)
+            "/api/v1/validator/job",
+            headers=headers,
+            json=_job_payload(keypair, slot_id=_SLOT_ID),
         )
         assert cooling_down.status_code == 204
 
@@ -7585,7 +7523,9 @@ class TestMultiValidatorConsensus:
             lapsed.retry_after = datetime.now(UTC) - timedelta(seconds=1)
 
         retried = await client.post(
-            "/api/v1/validator/job", headers=headers, json=_job_payload(keypair)
+            "/api/v1/validator/job",
+            headers=headers,
+            json=_job_payload(keypair, slot_id=_SLOT_ID),
         )
         assert retried.status_code == 200, retried.text
         assert retried.json()["agent_id"] == str(agent_id)
