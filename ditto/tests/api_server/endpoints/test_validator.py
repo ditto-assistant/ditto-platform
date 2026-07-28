@@ -8,6 +8,7 @@ keypair so the signature-verification path runs for real.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
@@ -109,6 +110,7 @@ from ditto.db.queries.artifact_fetch_audit import (
     record_artifact_fetch,
 )
 from ditto.db.queries.audit import EVENT_SCORE_RETEST_QUEUED, append_audit_entry
+from ditto.db.queries.benchmark_rollout import MIN_SCOREABLE_BENCH_VERSION
 from ditto.db.queries.confirmation_scores import (
     ConfirmationSeedScore,
     append_confirmation_scores,
@@ -1127,37 +1129,78 @@ async def _seed_ticket(
     issued = (
         issued_at if issued_at is not None else datetime.now(UTC) - timedelta(seconds=1)
     )
-    async with maker() as s, s.begin():
-        existing = await s.get(
-            ValidatorTicket, (agent_id, bench_version, keypair.ss58_address)
-        )
-        if existing is None:
-            s.add(
-                ValidatorTicket(
-                    agent_id=agent_id,
-                    bench_version=bench_version,
-                    validator_hotkey=keypair.ss58_address,
-                    slot_id=slot_id,
-                    status=TicketStatus.ISSUED,
-                    purpose=purpose,
-                    purpose_revision=purpose_revision,
-                    legacy_completion_allowed=legacy_completion_allowed,
-                    issued_at=issued,
-                    deadline=deadline,
-                    seed=seed,
-                    dataset_sha256=dataset_sha256,
-                )
-            )
+    async with maker() as s:
+        # A ticket in a RETIRED era is a lease that predates the floor. The
+        # trigger refuses to create or re-lease one, which is the whole point,
+        # so seeding it needs the floor lifted -- exactly as production's
+        # surviving v6 leases predate the constraint. The floor is restored
+        # before the test runs, so the drain it then asserts is a real drain.
+        if bench_version < MIN_SCOREABLE_BENCH_VERSION:
+            ctx = retired_era_writes_allowed(s)
         else:
-            existing.status = TicketStatus.ISSUED
-            existing.purpose = purpose
-            existing.purpose_revision = purpose_revision
-            existing.legacy_completion_allowed = legacy_completion_allowed
-            existing.slot_id = slot_id
-            existing.issued_at = issued
-            existing.deadline = deadline
-            existing.seed = seed
-            existing.dataset_sha256 = dataset_sha256
+            ctx = contextlib.nullcontext()
+        async with ctx, s.begin():
+            await _seed_ticket_row(
+                s,
+                agent_id=agent_id,
+                bench_version=bench_version,
+                keypair=keypair,
+                slot_id=slot_id,
+                purpose=purpose,
+                purpose_revision=purpose_revision,
+                legacy_completion_allowed=legacy_completion_allowed,
+                issued=issued,
+                deadline=deadline,
+                seed=seed,
+                dataset_sha256=dataset_sha256,
+            )
+
+
+async def _seed_ticket_row(
+    s: AsyncSession,
+    *,
+    agent_id: UUID,
+    bench_version: int,
+    keypair: bittensor.Keypair,
+    slot_id: str,
+    purpose: TicketPurpose,
+    purpose_revision: int,
+    legacy_completion_allowed: bool,
+    issued: datetime,
+    deadline: datetime,
+    seed: int | None,
+    dataset_sha256: str | None,
+) -> None:
+    existing = await s.get(
+        ValidatorTicket, (agent_id, bench_version, keypair.ss58_address)
+    )
+    if existing is None:
+        s.add(
+            ValidatorTicket(
+                agent_id=agent_id,
+                bench_version=bench_version,
+                validator_hotkey=keypair.ss58_address,
+                slot_id=slot_id,
+                status=TicketStatus.ISSUED,
+                purpose=purpose,
+                purpose_revision=purpose_revision,
+                legacy_completion_allowed=legacy_completion_allowed,
+                issued_at=issued,
+                deadline=deadline,
+                seed=seed,
+                dataset_sha256=dataset_sha256,
+            )
+        )
+    else:
+        existing.status = TicketStatus.ISSUED
+        existing.purpose = purpose
+        existing.purpose_revision = purpose_revision
+        existing.legacy_completion_allowed = legacy_completion_allowed
+        existing.slot_id = slot_id
+        existing.issued_at = issued
+        existing.deadline = deadline
+        existing.seed = seed
+        existing.dataset_sha256 = dataset_sha256
 
 
 async def _seed_validator_heartbeat(
@@ -4517,18 +4560,28 @@ class TestRequestJob:
             agent.screened_image_ref = f"ditto-screen/{agent_id}:latest"
             agent.screened_image_upload_id = uuid4()
             agent.screened_image_verified_at = now
-            rollout_id = uuid4()
-            session.add(
-                BenchmarkRollout(
-                    rollout_id=rollout_id,
-                    from_version=bench_version - 1,
-                    desired_version=bench_version,
-                    status="activated",
-                    cohort_size=5,
-                    created_at=now,
-                    activated_at=now,
+            # (from_version, desired_version) is UNIQUE, and the autouse
+            # ``_current_era`` fixture may already have recorded this exact
+            # transition. Attach to that row rather than inserting a duplicate.
+            rollout_id = await session.scalar(
+                select(BenchmarkRollout.rollout_id).where(
+                    BenchmarkRollout.from_version == bench_version - 1,
+                    BenchmarkRollout.desired_version == bench_version,
                 )
             )
+            if rollout_id is None:
+                rollout_id = uuid4()
+                session.add(
+                    BenchmarkRollout(
+                        rollout_id=rollout_id,
+                        from_version=bench_version - 1,
+                        desired_version=bench_version,
+                        status="activated",
+                        cohort_size=5,
+                        created_at=now,
+                        activated_at=now,
+                    )
+                )
             session.add(
                 BenchmarkRolloutMember(
                     rollout_id=rollout_id,
@@ -4538,15 +4591,19 @@ class TestRequestJob:
                     frozen_composite=0.0,
                 )
             )
-            session.add(
-                BenchmarkDataset(
-                    agent_id=agent_id,
-                    bench_version=bench_version,
-                    seed=8675309,
-                    sha256="cd" * 32,
-                    run_size="full",
+            # ``_seed_agent`` already pins a dataset at the active era, so
+            # activating that same era would collide on (agent_id,
+            # bench_version). Only pin what is missing.
+            if (await session.get(BenchmarkDataset, (agent_id, bench_version))) is None:
+                session.add(
+                    BenchmarkDataset(
+                        agent_id=agent_id,
+                        bench_version=bench_version,
+                        seed=8675309,
+                        sha256="cd" * 32,
+                        run_size="full",
+                    )
                 )
-            )
 
     @staticmethod
     def _enable_compatibility_gate(app: FastAPI) -> None:
@@ -4732,39 +4789,44 @@ class TestRequestJob:
             assert ticket is not None
             assert ticket.status == TicketStatus.EXPIRED
 
-    @pytest.mark.parametrize("active_version", [3, 4])
+    # Parametrized over the RETIRED era, not the active one.
+    #
+    # It used to range over active_version [3, 4] to show the behaviour held
+    # across post-legacy benchmarks. That axis no longer exists: shipped
+    # contracts stop at v7 and the floor is 7, so exactly one era is both
+    # leasable and writable. The narrowing is inherent to there being one live
+    # era, not a weakening -- and moving the parameter to the retired side keeps
+    # two cases exercising both halves of the boundary, which is what the test
+    # was really about.
+    @pytest.mark.parametrize("legacy_version", [5, 6])
     async def test_after_activation_capable_validator_replaces_retired_ticket(
         self,
         app: FastAPI,
         client: httpx.AsyncClient,
         session_maker: async_sessionmaker[AsyncSession],
-        active_version: int,
+        legacy_version: int,
     ) -> None:
+        active_version = _BENCH_VERSION
         active_agent = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
         await self._activate_benchmark(
             session_maker, active_agent, bench_version=active_version
         )
         legacy_agent = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
-        await _seed_ticket(session_maker, legacy_agent)
-        capabilities = self._v8_capabilities()
-        capabilities["scorer_benchmarks"] = {
-            "status": "fresh_verified",
-            "supported_bench_versions": list(range(2, active_version + 1)),
-            "observed_at": int(datetime.now(UTC).timestamp()),
-            "software_version": "1.2.2",
-            "source_revision": "2" * 40,
-        }
-        await _seed_validator_heartbeat(
-            session_maker,
-            protocol_version=8,
-            capabilities=capabilities,
-            stack=_V7_STACK,
-        )
+        await _seed_ticket(session_maker, legacy_agent, bench_version=legacy_version)
+        # A protocol-8 heartbeat was enough to be handed work in the v2/v3 era
+        # this test was written for. It is not enough now: a v7 lease requires
+        # the v10 capacity blob and a ticket-scoped inference grant, so the
+        # capable-pool helper is the only shape that still gets a job issued.
+        # The autouse ``_current_era`` fixture already installed the routing
+        # policy; only the capable heartbeat is missing.
+        await _seed_capable_pool(session_maker, keypairs=[_KEYPAIR])
         _install_db(app, session_maker)
         _install_chain(app)
 
         response = await client.post(
-            "/api/v1/validator/job", headers=_AUTH_HEADER, json=_job_payload()
+            "/api/v1/validator/job",
+            headers=_AUTH_HEADER,
+            json=_job_payload(slot_id="slot-0"),
         )
 
         assert response.status_code == 200, response.text
@@ -4772,7 +4834,7 @@ class TestRequestJob:
         assert response.json()["bench_version"] == active_version
         async with session_maker() as session:
             legacy_ticket = await session.get(
-                ValidatorTicket, (legacy_agent, 2, _VALIDATOR_HOTKEY)
+                ValidatorTicket, (legacy_agent, legacy_version, _VALIDATOR_HOTKEY)
             )
             assert legacy_ticket is not None
             assert legacy_ticket.status == TicketStatus.EXPIRED
