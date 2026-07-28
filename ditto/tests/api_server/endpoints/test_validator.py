@@ -1017,6 +1017,18 @@ _V9_STACK_HEALTH: dict[str, object] = {
 }
 
 
+# A v10+ capacity that claims no occupied slot. The lease roster is derived from
+# the ledger and not from this, so an idle claim is the cleanest way to show the
+# two are independent: the platform answers with the leases it issued regardless
+# of what the reporter says it is running.
+_IDLE_CAPACITY: dict[str, object] = {
+    "configured_slots": 2,
+    "healthy_slots": ["slot-0", "slot-1"],
+    "admission": "accepting",
+    "active": [],
+}
+
+
 def _quorum_capabilities() -> dict[str, object]:
     """A fresh, mutable v12+ capability set (signed score quorum is required)."""
     capabilities = json.loads(json.dumps(_V9_CAPABILITIES))
@@ -1397,6 +1409,207 @@ class TestHeartbeat:
             active = stored.benchmark_capacity["active"]
             assert [slot["slot_id"] for slot in active] == ["slot-0"]
             assert active[0]["progress"] is None
+
+    async def test_v17_answers_with_the_leases_the_ledger_holds(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """The roster is the platform's assignment truth, not the reporter's."""
+        first = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        second = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await _seed_ticket(session_maker, first, slot_id="slot-0")
+        await _seed_ticket(session_maker, second, slot_id="slot-1", bench_version=3)
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        response = await client.post(
+            "/api/v1/validator/heartbeat",
+            headers=_AUTH_HEADER,
+            json=_heartbeat_payload(
+                protocol_version=17,
+                capabilities=_quorum_capabilities(),
+                stack=_V7_STACK,
+                stack_health=_V9_STACK_HEALTH,
+                benchmark_capacity=_IDLE_CAPACITY,
+            ),
+        )
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["accepted"] is True
+        assert [(lease["slot_id"], lease["agent_id"]) for lease in body["leases"]] == [
+            ("slot-0", str(first)),
+            ("slot-1", str(second)),
+        ]
+        assert [lease["bench_version"] for lease in body["leases"]] == [2, 3]
+        for lease in body["leases"]:
+            assert datetime.fromisoformat(lease["deadline"]) == _TICKET_DEADLINE
+
+    async def test_v17_holding_nothing_answers_an_empty_roster_not_null(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """``[]`` and ``null`` are different answers and must stay different.
+
+        ``[]`` is the authoritative "you hold no lease" a reporter may act on;
+        ``null`` is "not answered" and never authorizes stopping anything. A
+        platform that collapsed the empty roster to ``null`` would silently
+        disable cancellation in the one case it matters most -- every lease
+        evicted at once.
+        """
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        response = await client.post(
+            "/api/v1/validator/heartbeat",
+            headers=_AUTH_HEADER,
+            json=_heartbeat_payload(
+                protocol_version=17,
+                capabilities=_quorum_capabilities(),
+                stack=_V7_STACK,
+                stack_health=_V9_STACK_HEALTH,
+                benchmark_capacity=_IDLE_CAPACITY,
+            ),
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["leases"] == []
+
+    async def test_a_pre_v17_reporter_is_told_nothing_about_its_leases(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """The fleet is mixed; an older validator must see today's response.
+
+        Protocols 15 and 16 are both live in production. Neither understands the
+        roster, so neither is sent one -- and because ``null`` is the "not
+        answered" value, a v16 build that later learns to parse the field still
+        cannot be talked into cancelling by an older platform.
+        """
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await _seed_ticket(session_maker, agent_id, slot_id="slot-0")
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        for protocol_version in (15, 16):
+            response = await client.post(
+                "/api/v1/validator/heartbeat",
+                headers=_AUTH_HEADER,
+                json=_heartbeat_payload(
+                    protocol_version=protocol_version,
+                    capabilities=_quorum_capabilities(),
+                    stack=_V7_STACK,
+                    stack_health=_V9_STACK_HEALTH,
+                    benchmark_capacity=_IDLE_CAPACITY,
+                ),
+            )
+            assert response.status_code == 200, response.text
+            assert response.json()["leases"] is None
+
+    async def test_an_evicted_lease_leaves_the_roster_immediately(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """This is the whole point: eviction becomes visible to the reporter.
+
+        Before v17 an operator eviction (#515) freed the platform-side slot
+        instantly while the validator kept running the benchmark to completion on
+        a lease it no longer held -- a full host slot burned for up to the lease
+        TTL to produce a score the platform then refuses with a 409.
+        """
+        evicted = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        kept = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await _seed_ticket(session_maker, evicted, slot_id="slot-0")
+        await _seed_ticket(session_maker, kept, slot_id="slot-1")
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        async def _roster() -> list[dict]:
+            response = await client.post(
+                "/api/v1/validator/heartbeat",
+                headers=_AUTH_HEADER,
+                json=_heartbeat_payload(
+                    protocol_version=17,
+                    capabilities=_quorum_capabilities(),
+                    stack=_V7_STACK,
+                    stack_health=_V9_STACK_HEALTH,
+                    benchmark_capacity=_IDLE_CAPACITY,
+                ),
+            )
+            assert response.status_code == 200, response.text
+            return response.json()["leases"]
+
+        assert [lease["slot_id"] for lease in await _roster()] == ["slot-0", "slot-1"]
+
+        # Exactly what `force_expire_lease` writes on an operator eviction.
+        now = datetime.now(UTC)
+        async with session_maker() as session, session.begin():
+            ticket = await session.get(ValidatorTicket, (evicted, 2, _VALIDATOR_HOTKEY))
+            assert ticket is not None
+            ticket.status = TicketStatus.EXPIRED
+            ticket.deadline = now
+            ticket.retry_after = now
+
+        remaining = await _roster()
+        assert [lease["slot_id"] for lease in remaining] == ["slot-1"]
+        assert [lease["agent_id"] for lease in remaining] == [str(kept)]
+
+    async def test_a_failed_roster_read_answers_null_and_never_an_empty_list(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A broken read must degrade to silence, never to "you hold nothing".
+
+        This is the single most dangerous line in the feature. A reporter cancels
+        on an authoritative empty roster, so answering ``[]`` when the query blew
+        up would kill every run on the fleet at once. Absence of information has
+        to stay absence of information -- the same inverted burden of proof that
+        #437, #443 and #496 each had to be written to restore.
+        """
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await _seed_ticket(session_maker, agent_id, slot_id="slot-0")
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        async def boom(*_args: object, **_kwargs: object) -> list[ValidatorTicket]:
+            raise RuntimeError("lease roster read exploded")
+
+        monkeypatch.setattr(
+            "ditto.api_server.endpoints.validator.list_validator_live_leases", boom
+        )
+
+        response = await client.post(
+            "/api/v1/validator/heartbeat",
+            headers=_AUTH_HEADER,
+            json=_heartbeat_payload(
+                protocol_version=17,
+                capabilities=_quorum_capabilities(),
+                stack=_V7_STACK,
+                stack_health=_V9_STACK_HEALTH,
+                benchmark_capacity=_IDLE_CAPACITY,
+            ),
+        )
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["leases"] is None
+        # Liveness still lands: a failed roster read is not a failed heartbeat.
+        assert body["accepted"] is True
+        async with session_maker() as session:
+            stored = await session.get(ValidatorHeartbeat, _VALIDATOR_HOTKEY)
+            assert stored is not None
+            assert stored.protocol_version == 17
 
     async def test_capacity_validation_failure_still_advances_liveness(
         self,

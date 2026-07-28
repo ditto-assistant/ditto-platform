@@ -95,7 +95,7 @@ from ditto.api_models.system_health import (
 )
 from ditto.api_models.ticket_status import TicketPurpose, TicketStatus
 from ditto.api_models.upload import _SS58_PATTERN
-from ditto.api_models.validator import ConfirmationDatasetPin
+from ditto.api_models.validator import ConfirmationDatasetPin, HeldLease
 from ditto.api_models.validator_capabilities import (
     ValidatorCapabilities,
     ValidatorStackIdentity,
@@ -238,6 +238,7 @@ from ditto.db.queries.tickets import (
     get_open_ticket,
     issue_confirmation_ticket,
     issue_ticket,
+    list_validator_live_leases,
     mark_ticket_scored,
 )
 from ditto.db.queries.validator_auth import (
@@ -1435,6 +1436,69 @@ def _claimed_slots(capacity: BenchmarkCapacity | None) -> list[dict] | None:
     ]
 
 
+# Heartbeat protocol 17 adds the authoritative lease roster to the *response*.
+# The platform owns lease assignment, so it is the only party that can tell a
+# reporter its lease is gone; before v17 a revoked lease was discoverable only
+# by a 409 at score time, i.e. after a full benchmark had already been burned.
+_LEASE_ROSTER_PROTOCOL = 17
+
+
+async def _lease_roster(
+    session: AsyncSession,
+    *,
+    validator_hotkey: str,
+    protocol_version: int,
+    now: datetime,
+) -> list[HeldLease] | None:
+    """Enumerate the leases the ledger holds for this validator, or ``None``.
+
+    ``None`` is "the platform is not answering" and is the only safe default.
+    It is returned when the reporter declared a protocol below v17 — an older
+    validator must behave exactly as it does today — and whenever the read
+    itself failed. It is emphatically *not* the same value as ``[]``, which is
+    the authoritative "you hold no lease" a reporter may act on. A reporter that
+    treated a failed read as an empty roster would kill every run on the fleet
+    the first time this query threw, which is the failure mode #437/#443/#496
+    were each written to prevent.
+
+    Runs in its own savepoint so a failure here rolls back only itself: the
+    liveness half of a heartbeat must survive anything that goes wrong while
+    describing work, exactly as it does for the work-validation path above.
+    """
+    if protocol_version < _LEASE_ROSTER_PROTOCOL:
+        return None
+    try:
+        async with session.begin_nested():
+            tickets = await list_validator_live_leases(
+                session, validator_hotkey=validator_hotkey, now=now
+            )
+    except Exception as error:  # noqa: BLE001 - a failed read must not stop work
+        VALIDATOR_HEARTBEAT_PAYLOAD_DEGRADED.labels(
+            stage="lease_roster", reason=type(error).__name__
+        ).inc()
+        logger.exception(
+            "validator heartbeat answered without a lease roster after the read "
+            "failed validator=%s protocol=%s",
+            validator_hotkey,
+            protocol_version,
+        )
+        return None
+    return [
+        HeldLease(
+            slot_id=ticket.slot_id,
+            agent_id=ticket.agent_id,
+            bench_version=ticket.bench_version,
+            deadline=_as_utc_deadline(ticket.deadline),
+        )
+        for ticket in tickets
+    ]
+
+
+def _as_utc_deadline(value: datetime) -> datetime:
+    """Stamp a naive stored deadline as UTC so the wire is unambiguous."""
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+
 async def _validated_heartbeat_work(
     session: AsyncSession,
     *,
@@ -1783,10 +1847,18 @@ async def heartbeat(
             seen_at=now,
             signature=request_body.signature,
         )
+        # Read after the upsert and inside the same transaction, so the roster
+        # the reporter acts on is consistent with the heartbeat just stored.
+        leases = await _lease_roster(
+            session,
+            validator_hotkey=validator_hotkey,
+            protocol_version=request_body.protocol_version,
+            now=now,
+        )
     seen_at = row.seen_at
     if seen_at.tzinfo is None:
         seen_at = seen_at.replace(tzinfo=UTC)
-    return ValidatorHeartbeatResponse(accepted=accepted, seen_at=seen_at)
+    return ValidatorHeartbeatResponse(accepted=accepted, seen_at=seen_at, leases=leases)
 
 
 @router.post(

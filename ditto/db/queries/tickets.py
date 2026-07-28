@@ -931,6 +931,38 @@ async def get_live_slot_ticket(
     return ticket
 
 
+async def list_validator_live_leases(
+    session: AsyncSession,
+    *,
+    validator_hotkey: str,
+    now: datetime,
+) -> list[ValidatorTicket]:
+    """Return every lease this validator holds, as the ledger sees it.
+
+    This is the *assignment* truth the platform owes a reporter, and it infers
+    nothing about validator liveness — it is the exact complement of
+    :mod:`ditto.db.queries.lease_liveness`, which infers whether a validator is
+    still working a lease. A lease is here iff it is ``issued`` and not yet past
+    its deadline, which is the same predicate that lets a score be accepted in
+    :func:`get_open_ticket`. Anything revoked, expired, or scored is absent by
+    construction, so a reporter comparing its running slots against this list
+    learns exactly which of its runs the platform no longer wants.
+
+    Read-only and lock-free on purpose: it must never be able to block, stall,
+    or fail the heartbeat write it rides along with.
+    """
+    rows = await session.scalars(
+        select(ValidatorTicket)
+        .where(
+            ValidatorTicket.validator_hotkey == validator_hotkey,
+            ValidatorTicket.status == TicketStatus.ISSUED,
+            ValidatorTicket.deadline > now,
+        )
+        .order_by(ValidatorTicket.slot_id)
+    )
+    return list(rows)
+
+
 async def mark_ticket_scored(
     session: AsyncSession,
     *,
