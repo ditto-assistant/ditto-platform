@@ -1074,18 +1074,16 @@
        .tip-chip: hover bubble for pointer users, aria-describedby text for
        screen readers (wired by wireTips). They stay out of the tab order —
        the row itself opens the full breakdown for keyboard users. */
-    .tip-chip { position: relative; cursor: help; }
-    .retry-info::after,
-    .tip::after,
-    .tip-chip::after {
-      content: attr(data-tooltip);
-      /* display:none until revealed (not just opacity:0): a hidden absolutely
-         positioned box still contributes to its scroll container's scrollable
-         overflow, which added ~250px of blank horizontal scroll to the board. */
-      display: none;
-      position: absolute;
-      z-index: 70;
-      width: min(270px, calc(100vw - 72px));
+    .tip-chip { cursor: help; }
+    /* One fixed-position bubble serves every [data-tooltip] trigger,
+       positioned by script from the trigger's screen rect. Pseudo-element
+       bubbles could never escape an overflow ancestor, and the page is a
+       nest of scroll containers (panes, the board, the rail); a fixed
+       element ignores them all and clamps to the viewport instead. */
+    #tip-bubble {
+      position: fixed;
+      z-index: 90;
+      max-width: min(270px, calc(100vw - 16px));
       padding: 8px 10px;
       border-radius: 4px;
       background: var(--text);
@@ -1097,17 +1095,6 @@
       text-align: left;
       text-transform: none;
       white-space: normal;
-    }
-    /* The marker's bubble sits above it; the .tip bubble drops below the term so
-       it is never clipped by the table's horizontal-scroll container. */
-    .retry-info::after { left: -88px; bottom: calc(100% + 8px); }
-    .tip::after, .tip-chip::after { left: 0; top: calc(100% + 8px); }
-    .retry-info:hover::after,
-    .retry-info:focus-visible::after,
-    .tip[data-tooltip]:hover::after,
-    .tip[data-tooltip]:focus-visible::after,
-    .tip-chip[data-tooltip]:hover::after {
-      display: block;
     }
     .retry-info:focus-visible,
     .tip:focus-visible { outline: 2px solid var(--focus); outline-offset: 3px; }
@@ -1138,15 +1125,6 @@
       .run-telemetry-panel { width: calc(100vw - 72px); max-width: 100%; box-sizing: border-box; }
       .run-telemetry-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .screening-dispute-wallets { grid-template-columns: 1fr; }
-      .retry-info::after,
-      .tip::after,
-      .tip-chip::after { width: min(240px, calc(100vw - 72px)); }
-      /* In the 2-col mobile stat grid the hidden "Subnet snapshot" h2 is child 1
-         and the primary card (child 2) owns its full row, so right-column cards
-         are the even children >= 4. Left-anchored bubbles on those cards run off
-         the right viewport edge; anchor them right so the whole bubble stays on
-         screen. */
-      .cards > .card:nth-child(2n+4) .tip::after { left: auto; right: 0; }
     }
 
     @media (max-width: 960px) {
@@ -5097,6 +5075,54 @@
     // announced rather than only drawn. Rebuilt wholesale because board rows
     // regenerate on every data change.
     var tipDescSeq = 0;
+    // The visual half of the tooltip system: one fixed-position bubble shown
+    // for whichever [data-tooltip] trigger is hovered or focused, clamped to
+    // the viewport and flipped above the trigger when there is no room below.
+    // Screen readers ignore it (aria-hidden) — they get the same text through
+    // the aria-describedby nodes wireTips maintains.
+    (function () {
+      var bubble = document.createElement("div");
+      bubble.id = "tip-bubble";
+      bubble.setAttribute("aria-hidden", "true");
+      bubble.hidden = true;
+      document.body.appendChild(bubble);
+      var current = null;
+      function hide() { current = null; bubble.hidden = true; }
+      function show(el) {
+        var text = el.getAttribute("data-tooltip");
+        if (!text) return;
+        current = el;
+        bubble.textContent = text;
+        bubble.hidden = false;
+        // Measure at a neutral position first, then place.
+        bubble.style.visibility = "hidden";
+        bubble.style.left = "0px";
+        bubble.style.top = "0px";
+        var r = el.getBoundingClientRect();
+        var b = bubble.getBoundingClientRect();
+        var x = Math.min(Math.max(r.left, 8), window.innerWidth - b.width - 8);
+        var y = r.bottom + 8;
+        if (y + b.height > window.innerHeight - 8) y = r.top - b.height - 8;
+        bubble.style.left = x + "px";
+        bubble.style.top = Math.max(8, y) + "px";
+        bubble.style.visibility = "";
+      }
+      document.addEventListener("mouseover", function (ev) {
+        var el = ev.target.closest ? ev.target.closest("[data-tooltip]") : null;
+        if (el) show(el);
+        else if (current) hide();
+      });
+      document.addEventListener("focusin", function (ev) {
+        var el = ev.target.closest ? ev.target.closest("[data-tooltip]") : null;
+        if (el) show(el); else if (current) hide();
+      });
+      document.addEventListener("focusout", hide);
+      // Any scroll shifts the trigger out from under the bubble; hiding beats
+      // tracking (capture catches the inner scroll containers too).
+      document.addEventListener("scroll", function () { if (current) hide(); }, true);
+      window.addEventListener("resize", hide);
+    })();
+
     function wireTips() {
       var host = document.getElementById("tip-descs");
       if (!host) {
