@@ -1699,6 +1699,41 @@ async def test_lists_only_unambiguous_finalized_score_outliers(
     assert str(broad_id) not in by_agent
 
 
+async def test_score_outliers_cover_only_the_active_benchmark_era(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    retry_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """A previous-era outlier is not an operator's problem any more.
+
+    The only action this page offers is a re-test, and a re-test runs the
+    contract the platform scores today. Replaying a submission finalized under
+    an older era cannot produce a number comparable with the one it holds, so
+    listing it would offer a button that cannot honestly be pressed — and the
+    response names the era it scanned so the page cannot imply otherwise.
+    """
+    current_id = await _seed(retry_maker, score_count=3, composites=[0.12, 0.81, 0.83])
+    previous_id = await _seed(
+        retry_maker,
+        score_count=3,
+        composites=[0.14, 0.79, 0.82],
+        bench_version=DEFAULT_BENCH_VERSION - 1,
+    )
+    async with retry_maker() as session, session.begin():
+        for agent_id in (current_id, previous_id):
+            agent = await session.get(Agent, agent_id)
+            assert agent is not None
+            agent.status = AgentStatus.SCORED
+    _install(app, retry_maker)
+
+    response = await client.get("/api/v1/admin/score-outliers", headers=_HEADERS)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["bench_version"] == DEFAULT_BENCH_VERSION
+    assert [item["agent_id"] for item in body["items"]] == [str(current_id)]
+    assert body["count"] == 1
+
+
 async def test_score_outlier_scan_reads_the_fleet_in_bulk(
     app: FastAPI,
     retry_engine: AsyncEngine,

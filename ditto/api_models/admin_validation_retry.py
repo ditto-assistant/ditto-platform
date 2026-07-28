@@ -527,3 +527,12 @@ class AdminScoreOutlierList(BaseModel):
     count: int
     limit: int
     offset: int
+    bench_version: int
+    """The benchmark era every listed outlier belongs to.
+
+    Scanned as well as reported: a re-test replays the outlier's run on the
+    era the platform is scoring *now*, so a submission finalized under an
+    older contract cannot be re-tested into a comparable score and does not
+    belong in an operator's queue. Naming the era on the response keeps the
+    page from silently implying it covers submissions it never scanned.
+    """
