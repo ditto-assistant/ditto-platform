@@ -4,6 +4,9 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
   merge_group:
+  push:
+    branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -15,6 +18,7 @@ concurrency:
 jobs:
   migration-order:
     name: Migration order
+    if: github.event_name != 'push'
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - name: Checkout
@@ -22,5 +26,32 @@ jobs:
         with:
           fetch-depth: 0
 
+      # Asserts the *merge result* resolves to a single head, not just this
+      # branch. A branch cut before another migration landed on main is
+      # perfectly linear on its own and still forks the chain once merged.
       - name: Check Alembic migration order
         run: python scripts/check_migration_order.py origin/main
+
+  # The job above is only ever as fresh as the PR's last push. GitHub does not
+  # re-run a PR's checks when its *base* moves, and this repo does not require
+  # branches to be up to date before merging, so a green check can quietly go
+  # stale and stay mergeable -- which is exactly what shipped the 2026-07-28
+  # two-head outage. Re-check every open PR whenever main moves.
+  recheck-open-prs:
+    name: Re-check open PRs against new main
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    permissions:
+      contents: read
+      pull-requests: read
+      statuses: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Re-check open PRs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./scripts/recheck_open_pr_migrations.sh
