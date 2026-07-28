@@ -19,6 +19,7 @@ import ditto.api_server.koth as koth_module
 import ditto.db.queries.scores as scores_module
 from ditto.api_models.agent_status import AgentStatus
 from ditto.db.models import Agent, EvaluationPayment
+from ditto.db.queries.benchmark_rollout import MIN_SCOREABLE_BENCH_VERSION
 from ditto.db.queries.attestation import (
     AttestationReplayedError,
     get_bound_coldkey_for_hotkey,
