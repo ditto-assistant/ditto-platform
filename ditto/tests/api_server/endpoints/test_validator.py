@@ -82,6 +82,7 @@ from ditto.api_server.fingerprint import reference_corpus_provenance
 from ditto.api_server.middleware.error_envelope import (
     ERROR_CODE_AGENT_NOT_EVALUATABLE,
     ERROR_CODE_AGENT_NOT_FOUND,
+    ERROR_CODE_BENCH_VERSION_RETIRED,
     ERROR_CODE_VALIDATION,
     ERROR_CODE_VALIDATOR_AUTH,
 )
@@ -6270,38 +6271,47 @@ class TestSubmitScore:
         )
         assert accepted.status_code == 200, accepted.text
 
-    @pytest.mark.parametrize("ticket_version", [3, 4])
     async def test_post_legacy_ticket_requires_explicit_bench_version_binding(
         self,
-        ticket_version: int,
         app: FastAPI,
         client: httpx.AsyncClient,
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
         """A post-v2 lease is only satisfiable by a report that binds it.
 
-        v3 is no longer the canary, so this is exactly the case that a
-        canary-keyed check would stop covering once the canary moved to v4. The
-        binding is enforced twice: the ticket lookup pins a version-less report
-        to LEGACY_BENCH_VERSION (so it can never find a post-v2 lease), and the
-        endpoint re-checks the bound version against the lease it found.
-        """
-        from ditto.db.queries.benchmark_rollout import CANARY_BENCH_VERSION
+        The binding is enforced twice: the ticket lookup pins a version-less
+        report to LEGACY_BENCH_VERSION (so it can never find a post-v2 lease),
+        and the endpoint re-checks the bound version against the lease it found.
 
-        assert CANARY_BENCH_VERSION != 3
+        This used to range over ticket_version [3, 4] to show the rule was not
+        keyed to whichever version happened to be the canary. That axis is gone,
+        and unlike the retired-ticket test next door it cannot simply move to
+        the retired side: the accepting case has to WRITE a score, and only v7
+        is writable. One era is all there is, which is the same inherent
+        narrowing, not a weaker test.
+
+        The version-less case also changed answer. It used to 409 ("no open
+        scoring ticket") because it looked for a v2 lease and found none. It now
+        410s before the lookup happens: pinning to LEGACY_BENCH_VERSION means
+        pinning to a RETIRED era, and that is terminal rather than a conflict.
+        Asserting the new code here is what stops a future reader reading the
+        410 as a regression.
+        """
+        ticket_version = _BENCH_VERSION
         agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
         _install_db(app, session_maker)
         _install_chain(app)
         await _seed_ticket(session_maker, agent_id, bench_version=ticket_version)
 
-        # A version-less (legacy-shaped) report cannot consume a post-v2 lease:
-        # it is pinned to v2 and finds no ticket there.
+        # A version-less (legacy-shaped) report still cannot consume a post-v2
+        # lease. It is pinned to LEGACY_BENCH_VERSION, and that era is retired,
+        # so the refusal is now terminal (410) rather than a conflict (409).
         unbound = await client.post(
             f"/api/v1/validator/agent/{agent_id}/score",
-            json=_score_payload(agent_id),
+            json=_score_payload(agent_id, bench_version=None),
         )
-        assert unbound.status_code == 409
-        assert "no open scoring ticket" in unbound.text
+        assert unbound.status_code == 410
+        assert unbound.json()["error_code"] == ERROR_CODE_BENCH_VERSION_RETIRED
 
         # Binding the WRONG post-v2 version is refused too.
         mismatched = await client.post(
@@ -6310,8 +6320,7 @@ class TestSubmitScore:
         )
         assert mismatched.status_code == 409
 
-        # Binding the lease's own version is accepted -- including for v3, which
-        # keeps working after the canary moved off it.
+        # Binding the lease's own version is accepted.
         bound = await client.post(
             f"/api/v1/validator/agent/{agent_id}/score",
             json=_score_payload(agent_id, bench_version=ticket_version),
