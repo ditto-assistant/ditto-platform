@@ -38,11 +38,15 @@ from ditto.db.models import (
     ValidatorHeartbeat,
 )
 from ditto.db.queries.benchmark_rollout import (
+    MIN_SCOREABLE_BENCH_VERSION,
     DatasetPin,
     RolloutSnapshotMember,
     create_rollout_snapshot,
 )
-from ditto.tests.legacy_era import retired_era_writes_allowed
+from ditto.tests.legacy_era import (
+    grandfather_active_era,
+    retired_era_writes_allowed,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -304,9 +308,26 @@ def _add_ready_route(session: AsyncSession, now: datetime) -> None:
 async def _seed_start_ready(
     maker: async_sessionmaker[AsyncSession], now: datetime
 ) -> list[RolloutSnapshotMember]:
-    """Seed the five-miner cohort and just enough capable validators to start."""
+    """Seed the five-miner cohort and just enough capable validators to start.
+
+    Also records the activation that makes v2 -- the era this cohort is ranked
+    out of -- the one actually in force. ``active_bench_version`` answers from
+    durable authority decisions and, with none on record, answers the FLOOR.
+    That is the honest reply for a ledger with no activation history, but it
+    leaves an operator start with nowhere to go: ``_TARGET`` is 7 and so is the
+    floor, so ``expected_active_version`` never matches and the forward-only
+    guard would refuse 7 -> 7 even if it did.
+
+    A grandfathered pre-floor rollout row is a state the database legitimately
+    holds -- the floor is ``NOT VALID`` precisely so production keeps its
+    activation history -- and it is the shape production was in before the v7
+    transition. Re-point this at the 7 -> 8 transition once the v8 contract
+    lands (ditto-assistant/ditto-platform#513); only then is there a legal
+    forward target above the floor.
+    """
     capabilities, stack = _capabilities(now)
     async with maker() as session, retired_era_writes_allowed(session), session.begin():
+        await grandfather_active_era(session, version=2, now=now - timedelta(days=30))
         _add_ready_route(session, now)
         members = [
             _add_cohort_agent(
@@ -337,9 +358,21 @@ async def _seed_start_ready(
 
 
 async def _rollout_count(maker: async_sessionmaker[AsyncSession]) -> int:
+    """How many rollouts exist for the transition under test.
+
+    Scoped to ``_TARGET`` rather than counting the whole table: the fixture also
+    seeds the grandfathered activation that puts the ledger on v2, and "did the
+    start leave a rollout behind" is a question about the v7 transition, not
+    about the history it starts from.
+    """
     async with maker() as session:
         return int(
-            await session.scalar(select(func.count(BenchmarkRollout.rollout_id))) or 0
+            await session.scalar(
+                select(func.count(BenchmarkRollout.rollout_id)).where(
+                    BenchmarkRollout.desired_version == _TARGET
+                )
+            )
+            or 0
         )
 
 
@@ -365,9 +398,18 @@ async def test_control_discovery_is_authenticated_read_only_and_dynamic(
     response = await client.get("/api/v1/admin/benchmark-rollout", headers=_HEADERS)
     assert response.status_code == 200, response.text
     body = response.json()
-    assert body["active_version"] == 2
+    # Nothing has activated in this database, so the ledger's honest answer is
+    # the floor rather than the version the subnet started on.
+    assert body["active_version"] == MIN_SCOREABLE_BENCH_VERSION
     assert body["status"] == "inactive"
-    assert body["available_target_versions"] == [3, 4, 5, 6, 7]
+    # Nothing is offered. A target must be both above the active version and at
+    # or above the floor, and with v7 shipped as the newest contract those two
+    # meet at exactly one era -- the one already in force. The console cannot
+    # suggest what ``start_rollout`` would refuse, and until the v8 contract
+    # lands (ditto-assistant/ditto-platform#513) there is nothing to suggest.
+    assert body["available_target_versions"] == []
+    # Still derived from the shipped registry, which is what "dynamic" means
+    # here: the floor filters what may be STARTED, not what exists.
     assert [contract["version"] for contract in body["contracts"]] == [2, 3, 4, 5, 6, 7]
     assert all(
         contract["capable_validator_count"] == 0 for contract in body["contracts"]
@@ -450,6 +492,24 @@ async def test_control_degrades_the_slow_section_instead_of_hanging(
     is the test's own speed knob, not a property of the endpoint.
     """
     _install(app, session_maker)
+    # There has to be a candidate target for the qualification loop to be slow
+    # ABOUT. Candidates are the shipped contracts above the active version and
+    # at or above the floor, so on an empty database -- where the ledger
+    # answers the floor -- that list is empty, the loop never runs and the stub
+    # below is never called: the test would pass while proving nothing.
+    #
+    # Putting the ledger on v6, through the grandfathered activation that put
+    # it there in production, leaves exactly one candidate (v7) to hang on.
+    async with (
+        session_maker() as session,
+        retired_era_writes_allowed(session),
+        session.begin(),
+    ):
+        await grandfather_active_era(
+            session,
+            version=_TARGET - 1,
+            now=datetime.now(UTC).replace(microsecond=0) - timedelta(days=30),
+        )
 
     async def _slow(*_args: object, **_kwargs: object) -> dict[str, object]:
         await asyncio.sleep(60)
@@ -463,8 +523,10 @@ async def test_control_degrades_the_slow_section_instead_of_hanging(
     assert response.status_code == 200, response.text
     body = response.json()
     # The durable rollout status -- the part the operator came for -- survives.
-    assert body["active_version"] == 2
-    assert body["status"] == "inactive"
+    # ``activated`` rather than ``inactive`` because the seeded authority is a
+    # real rollout row: nothing is open, and the last transition finished.
+    assert body["active_version"] == _TARGET - 1
+    assert body["status"] == "activated"
     assert [contract["version"] for contract in body["contracts"]] == [2, 3, 4, 5, 6, 7]
     # Fail closed on what could not be proven: no candidate is offered for
     # activation, and the omission is named rather than mistaken for "none".

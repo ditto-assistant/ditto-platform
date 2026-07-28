@@ -88,7 +88,10 @@ from ditto.db.queries.benchmark_rollout import (
     MIN_SCOREABLE_BENCH_VERSION,
 )
 from ditto.db.queries.scores import upsert_score
-from ditto.tests.legacy_era import retired_era_writes_allowed
+from ditto.tests.legacy_era import (
+    grandfather_active_era,
+    retired_era_writes_allowed,
+)
 
 _MINER_A = "5DhaT8U7LVwnnJNUU8VL1XEipicatoaDVVq7cHo227gogVZm"
 _MINER_B = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
@@ -119,11 +122,14 @@ async def _activate_era(
 ) -> None:
     """Record the activated rollout that makes ``version`` the ledger authority.
 
-    ``DEFAULT_BENCH_VERSION`` is still 2, so with no rollout row at all the
-    ledger reads v2 and every board built from live-era scores comes back
-    empty -- ``list_eligible_ledger`` serves one version, the active one.
-    Production reaches the live era through an activated rollout, so a fixture
-    that scores on the live era has to say so as well.
+    ``list_eligible_ledger`` serves exactly one version -- the active one -- so
+    a board built from scores on any other era comes back empty. Production
+    reaches an era through an activated rollout, and a fixture that scores on
+    one has to say so as well rather than leaning on whatever the no-activation
+    fallback happens to answer.
+
+    Keep this explicit even for ``_ERA``, where the fallback currently agrees by
+    coincidence: the floor is a floor, and it will move again.
     """
     async with maker() as s, s.begin():
         s.add(
@@ -2720,11 +2726,15 @@ class TestPublicLeaderboard:
         _install_db(app, session_maker)
 
         live = await client.get("/api/v1/public/leaderboard")
+        # "In play" and "settled" are the subject here, not any particular
+        # generation. With no rollout on record the ledger's authority is the
+        # floor, so ``_ERA`` is the version still in play and ``_PREV_ERA`` --
+        # the newest retired one -- is the finished work behind it.
         pinned_live = await client.get(
-            f"/api/v1/public/leaderboard?bench_version={DEFAULT_BENCH_VERSION}"
+            f"/api/v1/public/leaderboard?bench_version={_ERA}"
         )
         settled = await client.get(
-            f"/api/v1/public/leaderboard?bench_version={DEFAULT_BENCH_VERSION - 1}"
+            f"/api/v1/public/leaderboard?bench_version={_PREV_ERA}"
         )
 
         live_window = "public, max-age=30, stale-while-revalidate=120"
@@ -7471,13 +7481,19 @@ class TestBenchConfig:
         assert resp.status_code == 200
         assert "max-age=300" in resp.headers["Cache-Control"]
         body = resp.json()
-        assert body["bench_version"] == DEFAULT_BENCH_VERSION
+        # Nothing has activated in this database, so the ledger's honest answer
+        # is the floor. Which generation that is happens to be incidental to
+        # everything else asserted below.
+        assert body["bench_version"] == _ERA
         h = body["harness"]
         assert h["locked"] is True
-        assert h["canonical_id"] == "qwen/qwen3-32b"
-        assert h["serving"] == "Qwen/Qwen3-32B-TEE"
-        assert h["thinking"] is False
-        assert h["reasoning_effort"] is None
+        # The harness block is derived from the era being reported, so it moves
+        # with it: from v7 on the canonical model is the proxy-routed one and
+        # reasoning effort is pinned rather than absent.
+        assert h["canonical_id"] == "openai/gpt-oss-20b"
+        assert h["serving"] == "OpenRouter dynamic provider route"
+        assert h["thinking"] is True
+        assert h["reasoning_effort"] == "medium"
         assert body["grading"]["judge_free"] is True
         assert "dittobench-datagen" in body["grading"]["grader"]
         assert "dataset_sha256" in body["dataset"]["reproduce"]
@@ -7498,12 +7514,31 @@ class TestBenchConfig:
         _install_db(app, session_maker)
         monkeypatch.delenv("BENCH_HARNESS_MODEL_ID", raising=False)
         monkeypatch.delenv("BENCH_HARNESS_SERVING", raising=False)
+        # The active era has to be the RETIRED one this test is named after, or
+        # there is nothing to assert: with no activation on record the ledger
+        # answers the floor, which is the rollout's own target, and
+        # "active != desired" -- the whole point -- collapses to 7 == 7.
+        #
+        # v6 held authority exactly this way in production, through an activated
+        # rollout that now sits beneath the floor. Grandfathering it is
+        # reproducing that row, not inventing one.
+        async with (
+            session_maker() as floor_session,
+            retired_era_writes_allowed(floor_session),
+            floor_session.begin(),
+        ):
+            await grandfather_active_era(
+                floor_session,
+                version=_PREV_ERA,
+                now=datetime(2026, 6, 1, tzinfo=UTC),
+                from_version=DEFAULT_BENCH_VERSION,
+            )
         async with session_maker() as session, session.begin():
             session.add(
                 BenchmarkRollout(
                     rollout_id=uuid4(),
-                    from_version=DEFAULT_BENCH_VERSION,
-                    desired_version=7,
+                    from_version=_PREV_ERA,
+                    desired_version=_ERA,
                     status="collecting",
                     cohort_size=5,
                     created_at=datetime.now(UTC),
@@ -7512,8 +7547,8 @@ class TestBenchConfig:
 
         body = (await client.get("/api/v1/public/bench/config")).json()
 
-        assert body["bench_version"] == DEFAULT_BENCH_VERSION
-        assert body["desired_bench_version"] == 7
+        assert body["bench_version"] == _PREV_ERA
+        assert body["desired_bench_version"] == _ERA
         assert body["harness"]["canonical_id"] == "qwen/qwen3-32b"
         assert body["harness"]["serving"] == "Qwen/Qwen3-32B-TEE"
         assert body["harness"]["thinking"] is False

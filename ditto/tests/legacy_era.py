@@ -32,10 +32,13 @@ from __future__ import annotations
 
 import contextlib
 from collections.abc import AsyncIterator
+from datetime import datetime
+from uuid import uuid4
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ditto.db.models import BenchmarkRollout
 from ditto.db.queries.benchmark_rollout import MIN_SCOREABLE_BENCH_VERSION
 
 # (table, constraint) pairs the migration adds as NOT VALID CHECKs, and the
@@ -87,3 +90,51 @@ async def retired_era_writes_allowed(session: AsyncSession) -> AsyncIterator[Non
             text(f"ALTER TABLE validator_tickets ENABLE TRIGGER {_TICKET_TRIGGER}")
         )
         await session.commit()
+
+
+async def grandfather_active_era(
+    session: AsyncSession,
+    *,
+    version: int,
+    now: datetime,
+    from_version: int | None = None,
+) -> BenchmarkRollout:
+    """Put a RETIRED era in force, the way production put it in force.
+
+    ``active_bench_version`` answers from durable authority decisions -- the
+    newest ``activated`` rollout, or the newest ``authority_selected`` audit.
+    With neither on record it answers the FLOOR. That is the honest reply for a
+    ledger holding no activation history, and the only one ``request_job`` can
+    act on without cutting a lease the ticket trigger would refuse.
+
+    A test whose subject is a TRANSITION cannot live on that fallback. A rollout
+    must move the version forward, the newest shipped contract is v7 and the
+    floor is 7, so the source era of any rollout that can still be built lies
+    beneath the floor -- and if nothing says so, source and target read as the
+    same era and the test asserts nothing. Such a test needs the activation that
+    gave the source era authority to be on record: exactly the grandfathered
+    pre-floor rollout row production still holds, because the floor is ``NOT
+    VALID`` and never touched it.
+
+    Call INSIDE :func:`retired_era_writes_allowed`; ``version`` is below
+    ``benchmark_rollout_desired_floor`` and the INSERT is refused otherwise.
+    Pass a ``now`` that predates anything the test itself creates, so this stays
+    history rather than becoming the newest rollout row.
+
+    Every caller should be re-pointed at a 7 -> 8 transition once the v8
+    contract lands (ditto-assistant/ditto-platform#513). Only then does a legal
+    forward target exist above the floor, and only then can these fixtures state
+    their transition without reaching back into retired history.
+    """
+    rollout = BenchmarkRollout(
+        rollout_id=uuid4(),
+        from_version=version - 1 if from_version is None else from_version,
+        desired_version=version,
+        status="activated",
+        cohort_size=5,
+        created_at=now,
+        activated_at=now,
+    )
+    session.add(rollout)
+    await session.flush()
+    return rollout

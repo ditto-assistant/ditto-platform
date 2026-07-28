@@ -54,6 +54,7 @@ from ditto.db.queries.benchmark_rollout import (
     DEFAULT_BENCH_VERSION,
     DEFAULT_RESCORE_COHORT_SIZE,
     MIN_DESIRED_AUTHORITY_AGENTS,
+    MIN_SCOREABLE_BENCH_VERSION,
     DatasetPin,
     InferenceActivationRequirements,
     RolloutConflictError,
@@ -81,7 +82,10 @@ from ditto.db.queries.queue_policy_settings import (
 )
 from ditto.db.queries.scores import count_ranked_quorum_agents, list_eligible_ledger
 from ditto.db.queries.screening import claim_screening_attempts
-from ditto.tests.legacy_era import retired_era_writes_allowed
+from ditto.tests.legacy_era import (
+    grandfather_active_era,
+    retired_era_writes_allowed,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -94,8 +98,11 @@ async def test_admin_status_read_does_not_start_rollout(
     async with session_maker() as session:
         state = await get_rollout(None, session, "v3")
         assert state == {
-            "active_version": 2,
-            "desired_version": 2,
+            # No activation on record, so the ledger answers the floor. Which
+            # era that is is incidental to this test; that the read starts
+            # nothing is the subject.
+            "active_version": MIN_SCOREABLE_BENCH_VERSION,
+            "desired_version": MIN_SCOREABLE_BENCH_VERSION,
             "status": "inactive",
             "capability_bench_version": 3,
             "ranked_quorum_agents": 0,
@@ -118,7 +125,12 @@ async def test_admin_status_read_does_not_start_rollout(
         assert count == 0
 
         control = await get_rollout_control(None, session)
-        assert control["available_target_versions"] == [3, 4, 5, 6, 7]
+        # A target must be both above the active version and at or above the
+        # floor; with v7 the newest shipped contract those meet at the era
+        # already in force, so nothing is offered. The console must not suggest
+        # what ``start_rollout`` would refuse. Becomes ``[8]`` when the v8
+        # contract lands (ditto-assistant/ditto-platform#513).
+        assert control["available_target_versions"] == []
         contracts = control["contracts"]
         assert isinstance(contracts, list)
         assert [item["version"] for item in contracts] == [2, 3, 4, 5, 6, 7]
@@ -235,6 +247,14 @@ def _activation_requirements() -> InferenceActivationRequirements:
 
 async def _seed_rollout(session, now: datetime) -> tuple[list[UUID], BenchmarkRollout]:
     bind_inference_activation_requirements(session, _activation_requirements())
+    # The activation that makes the inherited v2 era the one in force. Without
+    # it ``active_bench_version`` has no durable decision to read and answers
+    # the FLOOR -- which is this rollout's own target, so source and target
+    # collapse onto one era and every "the ledger has not moved yet" assertion
+    # below becomes 7 == 7. See ``grandfather_active_era``.
+    await grandfather_active_era(
+        session, version=DEFAULT_BENCH_VERSION, now=now - timedelta(days=30)
+    )
     _add_ready_v7_route(session, now)
     agent_ids = [uuid4() for _ in range(5)]
     members = []
@@ -1903,6 +1923,21 @@ async def test_capable_validator_cannot_automatically_seed_rollout_work(
         retired_era_writes_allowed(session),
         session.begin(),
     ):
+        # This test's subject is a PERMISSION distinction -- the validator
+        # cannot seed rollout work, the operator can start the rollout the
+        # validator could not -- and its second half needs a legal forward
+        # target to exercise that. ``CANARY_BENCH_VERSION`` and the floor are
+        # both 7, so from == target == 7 violates forward-only and there is no
+        # active-era form of this test. Putting the inherited v2 era genuinely
+        # in force keeps the 2 -> 7 start legal, on a grandfathered pre-floor
+        # row the database legitimately holds.
+        #
+        # Re-point at a 7 -> 8 rollout once the v8 contract lands
+        # (ditto-assistant/ditto-platform#513); only then does a forward target
+        # above the floor exist.
+        await grandfather_active_era(
+            session, version=DEFAULT_BENCH_VERSION, now=now - timedelta(days=30)
+        )
         for position in range(1, 6):
             agent_id = uuid4()
             session.add(
@@ -2467,6 +2502,16 @@ async def test_admin_supersede_endpoint_audits_and_refuses_activated(
 ) -> None:
     now = datetime.now(UTC).replace(microsecond=0)
     async with session_maker() as session:
+        # v6 has to be the era actually in force. ``supersede_open_rollout``
+        # refuses a rollout that already owns active authority, and with no
+        # activation on record the ledger answers the floor -- which is this
+        # rollout's own target, so the supersede under test would 409 before it
+        # ever ran. v6 held authority through an activated rollout now beneath
+        # the floor; this is that grandfathered row.
+        async with retired_era_writes_allowed(session), session.begin():
+            await grandfather_active_era(
+                session, version=6, now=now - timedelta(days=30)
+            )
         async with session.begin():
             members, pins = await _seed_members(session, now)
             await create_rollout_snapshot(
@@ -2855,6 +2900,12 @@ async def test_rollout_state_active_version_matches_start_guard_authority(
 
 async def _seed_eligible_v2_era(session, now: datetime, *, count: int) -> None:
     """``count`` distinctly-owned v2 agents any rollout could inherit."""
+    # v2 is the era in force, which the operator start below asserts with
+    # ``expected_active_version``. It only holds authority because an
+    # activation says so; see ``grandfather_active_era``.
+    await grandfather_active_era(
+        session, version=DEFAULT_BENCH_VERSION, now=now - timedelta(days=30)
+    )
     for position in range(1, count + 1):
         agent_id = uuid4()
         session.add(

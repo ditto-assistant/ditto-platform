@@ -51,7 +51,10 @@ from ditto.db.queries.benchmark_carryover import (
 )
 from ditto.db.queries.benchmark_rollout import DatasetPin, arrival_bench_version
 from ditto.db.queries.tickets import MAX_ATTEMPTS_PER_VERSION, issue_ticket
-from ditto.tests.legacy_era import retired_era_writes_allowed
+from ditto.tests.legacy_era import (
+    grandfather_active_era,
+    retired_era_writes_allowed,
+)
 
 _ROLLOUT_START = datetime(2026, 7, 20, 12, 0, 0, tzinfo=UTC)
 _NOW = _ROLLOUT_START + timedelta(days=2)
@@ -112,6 +115,13 @@ async def _seed_rollout(
     session.add(rollout)
     await session.flush()
     return rollout
+
+
+async def _seed_activated_source_era(session: AsyncSession) -> BenchmarkRollout:
+    """The activation that made ``_FROM_VERSION`` the era in force."""
+    return await grandfather_active_era(
+        session, version=_FROM_VERSION, now=_ROLLOUT_START - timedelta(days=30)
+    )
 
 
 async def _seed_stranded(
@@ -386,13 +396,26 @@ class TestThreeLegsMoveTogether:
             return await arrival_bench_version(session, agent=agent)
 
         async with _seeding_the_retired_era(session):
+            # The un-adopted answer has to be the SOURCE era, so the source era
+            # has to be the one in force. With no activation on record the
+            # ledger answers the floor -- which is ``_DESIRED_VERSION`` -- and
+            # the first assertion below would be 7 != 7 before adoption ever
+            # happened. v6 held authority through an activated rollout that now
+            # sits beneath the floor; this is that grandfathered row.
+            await _seed_activated_source_era(session)
             rollout = await _seed_rollout(session)
             agent_id = await _seed_stranded(session, name="stranded")
 
         async with session.begin():
-            assert await arrival(agent_id) != _DESIRED_VERSION
+            assert await arrival(agent_id) == _FROM_VERSION
         async with session.begin():
-            rollout = (await session.scalars(select(BenchmarkRollout))).one()
+            rollout = (
+                await session.scalars(
+                    select(BenchmarkRollout).where(
+                        BenchmarkRollout.desired_version == _DESIRED_VERSION
+                    )
+                )
+            ).one()
             assert await _adopt(session, rollout=rollout, agent_id=agent_id)
         async with session.begin():
             assert await arrival(agent_id) == _DESIRED_VERSION
