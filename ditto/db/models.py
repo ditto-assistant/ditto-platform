@@ -1709,7 +1709,24 @@ class ArtifactReleaseSettingsRevision(Base):
 
     revision: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     parent_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    disclosure: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default=text("'public'")
+    )
+    """Whether the public release path is reachable at all (``public`` |
+    ``never``).
+
+    Values are :class:`~ditto.api_models.source_disclosure.SourceDisclosure`;
+    the check constraint is the authority. Typed ``str`` rather than a
+    PostgreSQL ENUM on purpose -- adding a value to a native enum needs its own
+    migration, whereas a CHECK constraint is a one-line swap, and the set of
+    release policies is exactly the kind of thing that grows. Not nullable: the
+    one thing a privacy setting must never be is ambiguous.
+    """
+
     embargo_hours: Mapped[int] = mapped_column(Integer, nullable=False)
+    """The window in hours. Stays ``NOT NULL`` and in range under every policy,
+    including ``never``, where it is retained but inert."""
+
     reason: Mapped[str] = mapped_column(Text, nullable=False)
     actor: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
@@ -1718,8 +1735,12 @@ class ArtifactReleaseSettingsRevision(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "embargo_hours BETWEEN 6 AND 720",
+            "embargo_hours BETWEEN 6 AND 8760",
             name="artifact_release_settings_embargo_hours_check",
+        ),
+        CheckConstraint(
+            "disclosure IN ('public', 'never')",
+            name="artifact_release_settings_disclosure_check",
         ),
         CheckConstraint(
             "parent_revision >= 0",

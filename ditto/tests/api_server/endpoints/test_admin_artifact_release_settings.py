@@ -102,7 +102,7 @@ async def test_lengthens_shortens_and_rejects_stale_or_wrong_confirmation(
     assert first.status_code == 200, first.text
     revision = first.json()["revision"]
 
-    # Lengthening is now allowed, up to the 720-hour ceiling.
+    # Lengthening is now allowed, up to the one-year ceiling.
     increase = await client.post(
         "/api/v1/admin/artifact-release-settings",
         headers=_HEADERS,
@@ -120,19 +120,32 @@ async def test_lengthens_shortens_and_rejects_stale_or_wrong_confirmation(
     assert beyond_default.status_code == 200, beyond_default.text
     assert beyond_default.json()["embargo_hours"] == 168
 
-    ceiling = await client.post(
+    # A month, still an ordinary write.
+    month = await client.post(
         "/api/v1/admin/artifact-release-settings",
         headers=_HEADERS,
         json=_payload(720, expected=beyond_default.json()["revision"]),
     )
-    assert ceiling.status_code == 200, ceiling.text
-    assert ceiling.json()["embargo_hours"] == 720
+    assert month.status_code == 200, month.text
+    assert month.json()["embargo_hours"] == 720
 
-    # One hour past the ceiling is rejected by the request contract.
+    # A year: one of the four options under discussion, so the range has to
+    # reach it. A ceiling that stopped at 30 days would mean another migration
+    # and another deploy the moment that option was chosen.
+    ceiling = await client.post(
+        "/api/v1/admin/artifact-release-settings",
+        headers=_HEADERS,
+        json=_payload(8760, expected=month.json()["revision"]),
+    )
+    assert ceiling.status_code == 200, ceiling.text
+    assert ceiling.json()["embargo_hours"] == 8760
+
+    # One hour past the ceiling is rejected by the request contract. Past a
+    # year the honest value is `never`, which has its own representation.
     over = await client.post(
         "/api/v1/admin/artifact-release-settings",
         headers=_HEADERS,
-        json=_payload(721, expected=ceiling.json()["revision"]),
+        json=_payload(8761, expected=ceiling.json()["revision"]),
     )
     assert over.status_code == 422
 
@@ -162,3 +175,142 @@ async def test_lengthens_shortens_and_rejects_stale_or_wrong_confirmation(
     )
     assert confirmation.status_code == 409
     assert "must be exactly" in confirmation.text
+
+
+def _never(expected: int) -> dict[str, object]:
+    return {
+        "expected_revision": expected,
+        "disclosure": "never",
+        # Required and in range even under `never`. It is retained, not used,
+        # so returning to `public` restores an agreed window rather than
+        # forcing one to be invented during the reversal.
+        "embargo_hours": 48,
+        "reason": "subnet policy: source is not published",
+        "actor": "operator@example.com",
+        "confirmation": "SET SOURCE DISCLOSURE NEVER",
+    }
+
+
+async def test_never_is_a_setting_the_board_can_hold_and_come_back_from(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    session_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """The four options Peyton is choosing between must all be expressible.
+
+    Short window, long window and a year are hours. `never` is not any number
+    of hours, so it is a second field on the same revision -- one decision,
+    one write, one confirmation, one audit row.
+    """
+    _install(app, session_maker)
+    head = (
+        await client.get("/api/v1/admin/artifact-release-settings", headers=_HEADERS)
+    ).json()["current"]
+    # The board starts where the subnet already is, and this change does not
+    # move it: shipping the mechanism must not ship a policy.
+    assert head["disclosure"] == "public"
+    assert head["embargo_hours"] == 48
+
+    applied = await client.post(
+        "/api/v1/admin/artifact-release-settings",
+        headers=_HEADERS,
+        json=_never(head["revision"]),
+    )
+    assert applied.status_code == 200, applied.text
+    assert applied.json()["disclosure"] == "never"
+    assert applied.json()["embargo_hours"] == 48
+
+    current = (
+        await client.get("/api/v1/admin/artifact-release-settings", headers=_HEADERS)
+    ).json()
+    assert current["current"]["disclosure"] == "never"
+
+    # Reversible, and the reversal is an ordinary audited revision rather than
+    # a special case: the audit trail is the whole guarantee here.
+    back = await client.post(
+        "/api/v1/admin/artifact-release-settings",
+        headers=_HEADERS,
+        json={
+            "expected_revision": applied.json()["revision"],
+            "disclosure": "public",
+            "embargo_hours": 72,
+            "reason": "subnet agreed a three-day window instead",
+            "actor": "peyton@omniaura.ai",
+            "confirmation": "SET SOURCE EMBARGO 72 HOURS",
+        },
+    )
+    assert back.status_code == 200, back.text
+    assert back.json()["disclosure"] == "public"
+
+    history = (
+        await client.get("/api/v1/admin/artifact-release-settings", headers=_HEADERS)
+    ).json()["history"]
+    assert [row["disclosure"] for row in history[:2]] == ["public", "never"]
+    assert history[0]["actor"] == "peyton@omniaura.ai"
+    assert history[0]["reason"] == "subnet agreed a three-day window instead"
+
+
+async def test_never_needs_its_own_phrase_and_rejects_an_unknown_policy(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    session_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    _install(app, session_maker)
+    head = (
+        await client.get("/api/v1/admin/artifact-release-settings", headers=_HEADERS)
+    ).json()["current"]["revision"]
+
+    # The hours phrase must not apply a `never` policy. These two are one
+    # keystroke apart in intent and a world apart in effect.
+    borrowed = {**_never(head), "confirmation": "SET SOURCE EMBARGO 48 HOURS"}
+    assert (
+        await client.post(
+            "/api/v1/admin/artifact-release-settings",
+            headers=_HEADERS,
+            json=borrowed,
+        )
+    ).status_code == 409
+
+    # And a policy the enum does not know is a 422, not a silently stored
+    # string that the release gate would later read as "not public".
+    unknown = {**_never(head), "disclosure": "private"}
+    assert (
+        await client.post(
+            "/api/v1/admin/artifact-release-settings",
+            headers=_HEADERS,
+            json=unknown,
+        )
+    ).status_code == 422
+
+
+async def test_omitting_disclosure_keeps_the_write_public(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    session_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """The strip hazard, from the platform side.
+
+    Backroom boards submit whole policies and `z.object` drops what it does not
+    declare, so a console that never learned about `disclosure` would omit it
+    on every embargo save. The safe direction for that omission is `public` --
+    the status quo, and a visible one -- rather than inheriting `never` and
+    silently keeping the subnet dark after an unrelated window change.
+    """
+    _install(app, session_maker)
+    head = (
+        await client.get("/api/v1/admin/artifact-release-settings", headers=_HEADERS)
+    ).json()["current"]["revision"]
+    applied = await client.post(
+        "/api/v1/admin/artifact-release-settings",
+        headers=_HEADERS,
+        json=_never(head),
+    )
+    assert applied.json()["disclosure"] == "never"
+
+    legacy = await client.post(
+        "/api/v1/admin/artifact-release-settings",
+        headers=_HEADERS,
+        json=_payload(12, expected=applied.json()["revision"]),
+    )
+    assert legacy.status_code == 200, legacy.text
+    assert legacy.json()["disclosure"] == "public"
