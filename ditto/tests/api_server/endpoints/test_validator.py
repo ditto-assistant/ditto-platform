@@ -3924,7 +3924,10 @@ class TestRequestJob:
         """
         now = datetime.now(UTC)
         rollout = MagicMock(
-            rollout_id=uuid4(), from_version=_BENCH_VERSION, desired_version=_BENCH_VERSION + 1, cohort_size=10
+            rollout_id=uuid4(),
+            from_version=_BENCH_VERSION,
+            desired_version=_BENCH_VERSION + 1,
+            cohort_size=10,
         )
         session = AsyncMock()
         session.get_bind = MagicMock(
@@ -4160,7 +4163,11 @@ class TestRequestJob:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         now = datetime.now(UTC)
-        rollout = MagicMock(from_version=_BENCH_VERSION, desired_version=_BENCH_VERSION + 1, cohort_size=10)
+        rollout = MagicMock(
+            from_version=_BENCH_VERSION,
+            desired_version=_BENCH_VERSION + 1,
+            cohort_size=10,
+        )
         heartbeat = MagicMock()
         session = AsyncMock()
         session.get_bind = MagicMock(
@@ -4421,7 +4428,6 @@ class TestRequestJob:
                 )
                 == 0
             )
-
 
     async def test_fresh_submission_lane_uses_three_of_four_completed_jobs(
         self, session_maker: async_sessionmaker[AsyncSession]

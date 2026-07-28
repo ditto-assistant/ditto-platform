@@ -309,8 +309,7 @@ async def get_rollout_control(
     targets = [
         contract.version
         for contract in contracts
-        if contract.version > active
-        and contract.version >= MIN_SCOREABLE_BENCH_VERSION
+        if contract.version > active and contract.version >= MIN_SCOREABLE_BENCH_VERSION
     ]
     degraded: list[str] = []
     candidates: list[dict[str, object]] = []

@@ -54,9 +54,7 @@ async def test_a_retired_era_is_reported_as_gone_not_as_a_conflict(
     clears, so it must not share a status that means "try again later".
     """
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(
-        transport=transport, base_url="http://test"
-    ) as client:
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.get("/boom")
 
     assert response.status_code == 410
@@ -74,9 +72,7 @@ async def test_the_refusal_is_not_a_server_error(app: FastAPI) -> None:
     well-formed request, so it belongs in the 4xx range.
     """
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(
-        transport=transport, base_url="http://test"
-    ) as client:
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.get("/boom")
 
     assert 400 <= response.status_code < 500
