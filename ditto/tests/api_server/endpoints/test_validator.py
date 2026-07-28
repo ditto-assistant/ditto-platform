@@ -4522,19 +4522,6 @@ class TestRequestJob:
                 assert due is (completed != 2)
 
     @staticmethod
-    def _v8_capabilities() -> dict[str, object]:
-        return {
-            **_V7_CAPABILITIES,
-            "scorer_benchmarks": {
-                "status": "fresh_verified",
-                "supported_bench_versions": [2, 3],
-                "observed_at": int(datetime.now(UTC).timestamp()),
-                "software_version": "1.2.2",
-                "source_revision": "2" * 40,
-            },
-        }
-
-    @staticmethod
     async def _activate_benchmark(
         session_maker: async_sessionmaker[AsyncSession],
         agent_id: UUID,
@@ -4755,14 +4742,37 @@ class TestRequestJob:
         assert issued.json()["agent_id"] == str(agent_id)
         assert issued.json()["inference"]["grant_id"]
 
-    async def test_after_activation_v2_only_expires_v2_and_stays_idle(
+    async def test_retired_era_only_validator_is_permanently_unserviceable(
         self,
         app: FastAPI,
         client: httpx.AsyncClient,
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
-        v3_agent = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
-        await self._activate_benchmark(session_maker, v3_agent, bench_version=3)
+        """A validator that can only serve a retired era never works again.
+
+        This used to be a statement about a moment -- v2 had just been
+        superseded, so a v2-only validator was idle until it upgraded. The floor
+        makes it a statement about the system: v2 through v6 cannot be written
+        at all, so there is no future rollout, setting or backfill lane that
+        gives this validator work. Permanently unserviceable is the intended
+        consequence of the floor, not an accident of the fixture.
+
+        The full arc, and all of it terminal: it is OFFERED nothing (204 with an
+        active-era agent sitting in the queue), it LEASES nothing (204 again,
+        with no new ticket cut in any era), it DRAINS what it already holds (the
+        grandfathered v2 lease it is carrying moves to EXPIRED, which is the one
+        transition the ticket trigger still permits below the floor), and then it
+        STAYS IDLE, with nothing left to drain and nothing it can be given.
+
+        The v2 lease is seeded beneath a lifted floor because that is the only
+        way such a row can exist now -- exactly like the real pre-floor leases
+        production is still draining. The floor is live again by the time the
+        endpoint is called, so the drain asserted below is a real drain.
+        """
+        active_agent = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        await self._activate_benchmark(
+            session_maker, active_agent, bench_version=_BENCH_VERSION
+        )
         await _seed_validator_heartbeat(
             session_maker,
             protocol_version=7,
@@ -4778,7 +4788,7 @@ class TestRequestJob:
         assert no_new_work.status_code == 204
 
         legacy_agent = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
-        await _seed_ticket(session_maker, legacy_agent)
+        await _seed_ticket(session_maker, legacy_agent, bench_version=2)
         resumed = await client.post(
             "/api/v1/validator/job", headers=_AUTH_HEADER, json=_job_payload()
         )
@@ -4789,6 +4799,27 @@ class TestRequestJob:
             )
             assert ticket is not None
             assert ticket.status == TicketStatus.EXPIRED
+            # Nothing was cut to replace it, in any era. The drain is the end of
+            # this validator's work, not a handover to a new lease.
+            live = (
+                (
+                    await session.execute(
+                        select(ValidatorTicket).where(
+                            ValidatorTicket.validator_hotkey == _VALIDATOR_HOTKEY,
+                            ValidatorTicket.status == TicketStatus.ISSUED,
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            assert live == []
+
+        # Asked again with nothing left to drain, it is still offered nothing.
+        still_idle = await client.post(
+            "/api/v1/validator/job", headers=_AUTH_HEADER, json=_job_payload()
+        )
+        assert still_idle.status_code == 204, still_idle.text
 
     # Parametrized over the RETIRED era, not the active one.
     #
@@ -4850,15 +4881,16 @@ class TestRequestJob:
         await self._activate_benchmark(
             session_maker, agent_id, bench_version=_BENCH_VERSION
         )
-        capabilities = self._v8_capabilities()
-        for keypair in _KEYPAIRS:
-            await _seed_validator_heartbeat(
-                session_maker,
-                keypair=keypair,
-                protocol_version=8,
-                capabilities=capabilities,
-                stack=_V7_STACK,
-            )
+        # These three used to be protocol-8 heartbeats advertising
+        # ``supported_bench_versions: [2, 3]``. Neither half survives the floor:
+        # a validator that offers only retired eras is offered nothing, and a
+        # protocol-8 validator cannot take a v7 lease at all (inference is not
+        # treated as ready below protocol 11, and protocol >= 10 makes published
+        # capacity and a named slot mandatory). The quorum-of-three behaviour
+        # under test is unchanged -- only the shape of a validator that can
+        # reach it is, so the fixture is the capable pool the rest of the class
+        # leases through.
+        await _seed_capable_pool(session_maker)
         _install_db(app, session_maker)
         _install_chain(app, extra_keypairs=tuple(_KEYPAIRS[1:]))
 
@@ -4866,7 +4898,7 @@ class TestRequestJob:
             job = await client.post(
                 "/api/v1/validator/job",
                 headers={"X-Validator-Hotkey": keypair.ss58_address},
-                json=_job_payload(keypair),
+                json=_job_payload(keypair, slot_id=_SLOT_ID),
             )
             assert job.status_code == 200, job.text
             assert job.json()["bench_version"] == _BENCH_VERSION
@@ -7718,6 +7750,12 @@ async def _seed_top5_emission_set(
     ``DEFAULT_BENCH_VERSION`` (2). While these scores lived at v2 that happened
     to line up; now that the floor forces them to v7 it does not, and without
     the activation the whole set would be an island nothing reads.
+
+    The activation goes through ``_seed_activated_era`` rather than being
+    inserted here. ``(from_version, desired_version)`` is UNIQUE, so a second
+    writer of the same transition is a duplicate-key error, not a second era --
+    and every test class that leases work already installs that exact row from
+    an autouse fixture. Sharing the one idempotent writer lets the two compose.
     """
     composites = composites or [0.90, 0.88, 0.86, 0.84, 0.82, 0.80]
     agent_ids = [
@@ -7732,18 +7770,8 @@ async def _seed_top5_emission_set(
         for rank in range(len(composites))
     ]
     activated_at = datetime.now(UTC) - timedelta(hours=2)
+    await _seed_activated_era(maker, version=bench_version, activated_at=activated_at)
     async with maker() as session, session.begin():
-        session.add(
-            BenchmarkRollout(
-                rollout_id=uuid4(),
-                from_version=bench_version - 1,
-                desired_version=bench_version,
-                status="activated",
-                cohort_size=5,
-                created_at=activated_at,
-                activated_at=activated_at,
-            )
-        )
         for agent_id, composite in zip(agent_ids, composites, strict=True):
             for index, keypair in enumerate(_KEYPAIRS):
                 session.add(
