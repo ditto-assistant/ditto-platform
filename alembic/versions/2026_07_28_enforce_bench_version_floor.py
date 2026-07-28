@@ -1,7 +1,7 @@
 """make a retired benchmark era unscoreable in the database, not in a setting
 
 Revision ID: d4b8e6c1a205
-Revises: c7a4f1e2b903
+Revises: 45ef71514f21
 Create Date: 2026-07-28
 
 v2-v5 were already dead by construction: three forward-only guards

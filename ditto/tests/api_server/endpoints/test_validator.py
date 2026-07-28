@@ -5220,7 +5220,7 @@ class TestRequestJob:
             session.add(
                 ValidatorTicket(
                     agent_id=retest_agent,
-                    bench_version=2,
+                    bench_version=MIN_SCOREABLE_BENCH_VERSION,
                     validator_hotkey=_VALIDATOR_HOTKEY,
                     status=TicketStatus.SCORED,
                     issued_at=now - timedelta(hours=2),
@@ -5232,7 +5232,7 @@ class TestRequestJob:
             session.add(
                 Score(
                     agent_id=retest_agent,
-                    bench_version=2,
+                    bench_version=MIN_SCOREABLE_BENCH_VERSION,
                     validator_hotkey=_VALIDATOR_HOTKEY,
                     run_id="queued-retest-run",
                     seed=1,
@@ -5241,7 +5241,7 @@ class TestRequestJob:
                     memory_mean=0.8,
                     median_ms=100,
                     n=114,
-                    details={"bench_version": 2},
+                    details={"bench_version": MIN_SCOREABLE_BENCH_VERSION},
                     generated_at=now - timedelta(hours=1),
                 )
             )
@@ -5252,36 +5252,27 @@ class TestRequestJob:
                 event=EVENT_SCORE_RETEST_QUEUED,
                 payload={
                     "request_id": str(uuid4()),
-                    "bench_version": 2,
+                    "bench_version": MIN_SCOREABLE_BENCH_VERSION,
                     "run_id": "queued-retest-run",
                 },
                 recorded_at=now,
             )
-        capabilities = {
-            **_V7_CAPABILITIES,
-            "scorer_benchmarks": {
-                **_V9_SCORER,
-                "observed_at": int(now.timestamp()),
-            },
-        }
-        await _seed_validator_heartbeat(
-            session_maker,
-            protocol_version=9,
-            capabilities=capabilities,
-            stack=_V7_STACK,
-        )
+        await _seed_capable_pool(session_maker, keypairs=(_KEYPAIR,))
         _install_db(app, session_maker)
         _install_chain(app)
 
         response = await client.post(
-            "/api/v1/validator/job", headers=_AUTH_HEADER, json=_job_payload()
+            "/api/v1/validator/job",
+            headers=_AUTH_HEADER,
+            json=_job_payload(slot_id=_SLOT_ID),
         )
 
         assert response.status_code == 200, response.text
         assert response.json()["agent_id"] == str(canonical_agent)
         async with session_maker() as session:
             retest_ticket = await session.get(
-                ValidatorTicket, (retest_agent, 2, _VALIDATOR_HOTKEY)
+                ValidatorTicket,
+                (retest_agent, MIN_SCOREABLE_BENCH_VERSION, _VALIDATOR_HOTKEY),
             )
             assert retest_ticket is not None
             assert retest_ticket.status == TicketStatus.SCORED
