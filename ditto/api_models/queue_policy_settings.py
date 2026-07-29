@@ -162,8 +162,14 @@ class PrevGenCarryoverSettings(BaseModel):
     * :attr:`enabled`, :attr:`max_agents`, :attr:`min_score_count`,
       :attr:`include_exhausted`, :attr:`dedupe_scope` and
       :attr:`require_cohort_complete` shape the adopted carryover.
-    * :attr:`allow_retired_era_backfill` shapes the retired-era source backfill.
     * :attr:`require_desired_era_drained` applies to both.
+
+    Neither lane can reach a RETIRED era any more, and no setting on this board
+    can put one back. ``allow_retired_era_backfill`` used to live here and did
+    exactly that; it is gone, along with the branch that read it. The floor now
+    sits in the database (``MIN_SCOREABLE_BENCH_VERSION`` and the constraints
+    named there), so what these fields tune is priority WITHIN the scoreable
+    versions -- never whether a dead one comes back.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
@@ -260,41 +266,6 @@ class PrevGenCarryoverSettings(BaseModel):
     backfill. They differ in which era's dataset the artifact runs under, not in
     priority -- a miner waiting behind either one is waiting behind the previous
     generation.
-    """
-
-    allow_retired_era_backfill: bool = False
-    """Whether the source-backfill lane may ticket an era that has RETIRED.
-
-    Ships ``False``, which is a change in behaviour and the point of the field.
-
-    The source-backfill lane
-    (``ditto.api_server.endpoints.validator._issue_source_backfill_ticket``)
-    was written to keep a source-version validator busy *during* a rollout: the
-    era it tickets is still the active one, so the scores it collects still
-    count, and the alternative is an idle slot. That case is untouched -- while a
-    rollout is open, ``rollout.from_version`` IS the active version and this
-    setting never comes up.
-
-    It also kept running after activation, and there the same lane means
-    something else entirely. The active version has moved on, so every ticket it
-    issues is for a version no quorum will ever be assembled on: the benchmark is
-    retired, the score cannot be recorded against the leaderboard, and the slot
-    it occupies is a slot the live era does not get. On a four-slot validator
-    that is up to three of four slots producing nothing.
-
-    :attr:`require_desired_era_drained` was aimed at this and cannot reach it. It
-    asks whether any desired-era submission is leasable *at this instant*, and a
-    deep queue is routinely momentarily unleasable -- owner serialization, one
-    ticket per (agent, version, validator), and a capable fleet no larger than
-    the quorum all conspire to empty the leasable set while the queue behind it
-    is long. The gate then answers "drained", truthfully, and the retired lane
-    floods in. Priority was the wrong axis: a retired era does not need to be
-    last, it needs to be never.
-
-    Set ``True`` to restore the old post-activation behaviour -- the retired era
-    then resumes issuing under the priority gates above -- without a deploy. It
-    is worth turning on only for something that still consumes retired-era
-    scores; nothing in the ledger does.
     """
 
     require_cohort_complete: bool = True

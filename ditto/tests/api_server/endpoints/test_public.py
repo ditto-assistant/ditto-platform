@@ -69,6 +69,7 @@ from ditto.db.models import (
     AthReview,
     BenchmarkDataset,
     BenchmarkRollout,
+    BenchmarkRolloutAudit,
     EvaluationPayment,
     Score,
     ScreeningAttempt,
@@ -84,12 +85,127 @@ from ditto.db.queries.audit import (
 from ditto.db.queries.benchmark_rollout import (
     DEFAULT_BENCH_VERSION,
     LEGACY_BENCH_VERSION,
+    MIN_SCOREABLE_BENCH_VERSION,
 )
 from ditto.db.queries.scores import upsert_score
+from ditto.tests.legacy_era import (
+    grandfather_active_era,
+    retired_era_writes_allowed,
+)
 
 _MINER_A = "5DhaT8U7LVwnnJNUU8VL1XEipicatoaDVVq7cHo227gogVZm"
 _MINER_B = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
 _VALIDATOR_C = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
+# The era every generic fixture in this file sits on. Almost nothing here is
+# about a particular benchmark generation -- these tests need *a* score, and v2
+# was only ever the value ``DEFAULT_BENCH_VERSION`` happened to hold. The
+# bench-version floor refuses to write anything below
+# ``MIN_SCOREABLE_BENCH_VERSION``, so a fixture that wants a score the ledger
+# can still serve has to write one on an era that can still be scored.
+_ERA = MIN_SCOREABLE_BENCH_VERSION
+# A second, distinct era for the handful of tests that separate one generation
+# from another. Raw ``scores``/``confirmation_scores`` rows are only floored, so
+# a version above the newest shipped contract is fine there -- but never feed
+# this to ticket issuance or a rollout target, because ``benchmark_contract(8)``
+# does not exist.
+_NEXT_ERA = _ERA + 1
+# The newest *retired* era: the last generation below the floor. Rows on it can
+# only be written through ``retired_era_writes_allowed``, which is the point --
+# production still holds and still publishes its pre-floor history, so a test
+# about "the previous generation" is a test about a version the ledger would
+# now refuse. Never a generic fixture value; use ``_ERA`` for that.
+_PREV_ERA = _ERA - 1
+
+
+async def _activate_era(
+    maker: async_sessionmaker[AsyncSession], version: int = _ERA
+) -> None:
+    """Record the activated rollout that makes ``version`` the ledger authority.
+
+    ``list_eligible_ledger`` serves exactly one version -- the active one -- so
+    a board built from scores on any other era comes back empty. Production
+    reaches an era through an activated rollout, and a fixture that scores on
+    one has to say so as well rather than leaning on whatever the no-activation
+    fallback happens to answer.
+
+    Keep this explicit even for ``_ERA``, where the fallback currently agrees by
+    coincidence: the floor is a floor, and it will move again.
+    """
+    async with maker() as s, s.begin():
+        s.add(
+            BenchmarkRollout(
+                rollout_id=uuid4(),
+                from_version=DEFAULT_BENCH_VERSION,
+                desired_version=version,
+                status="activated",
+                cohort_size=5,
+                created_at=datetime(2026, 6, 1, tzinfo=UTC),
+                activated_at=datetime(2026, 6, 1, tzinfo=UTC),
+            )
+        )
+
+
+def _screened_image(agent_id: UUID, verified_at: datetime) -> dict:
+    """The verified screened-image columns the live contract demands.
+
+    From v7 on, ``queue_candidate_predicate`` filters out every submission that
+    has no fully verified screened image, so a fixture that omits these columns
+    is not merely missing metadata -- its agent silently leaves the queue and
+    the rank being asserted is a rank nobody is standing in.
+    """
+    return {
+        "screened_image_sha256": "12" * 32,
+        "screened_image_size_bytes": 123,
+        "screened_image_id": "sha256:" + "34" * 32,
+        "screened_image_ref": f"ditto-screen/{agent_id}:latest",
+        "screened_image_upload_id": uuid4(),
+        "screened_image_verified_at": verified_at,
+    }
+
+
+def _dataset_pin(
+    agent_id: UUID,
+    bench_version: int = _ERA,
+    *,
+    seed: int = 1,
+    sha256: str = "cd" * 32,
+    run_size: str = "full",
+) -> BenchmarkDataset:
+    """The per-agent dataset pin every post-v2 contract requires to lease."""
+    return BenchmarkDataset(
+        agent_id=agent_id,
+        bench_version=bench_version,
+        seed=seed,
+        sha256=sha256,
+        run_size=run_size,
+    )
+
+
+async def _take_authority(
+    maker: async_sessionmaker[AsyncSession],
+    *,
+    rollout_id: UUID,
+    at: datetime,
+) -> None:
+    """Hand ledger authority to a rollout that is still collecting.
+
+    ``persisted_active_bench_version`` honours an ``authority_selected`` audit
+    event as well as an activation, which is how a transition can be the era in
+    force while its qualification is still settling -- the state these fixtures
+    describe. They used to reach it for free, because the era in force was
+    ``DEFAULT_BENCH_VERSION`` and the rollout happened to target it; now that
+    the target sits above the default, the transfer has to be written down.
+    """
+    async with maker() as s, s.begin():
+        s.add(
+            BenchmarkRolloutAudit(
+                audit_id=uuid4(),
+                rollout_id=rollout_id,
+                event="authority_selected",
+                payload={},
+                recorded_at=at,
+            )
+        )
 
 
 def _anchor_seeds(champion_id: str, count: int = 3) -> tuple[int, ...]:
@@ -103,7 +219,7 @@ def _anchor_seeds(champion_id: str, count: int = 3) -> tuple[int, ...]:
     return tuple(
         champion_anchored_seeds(
             UUID(champion_id),
-            version=DEFAULT_BENCH_VERSION,
+            version=_ERA,
             max_seeds=TOP5_MAX_CONFIRMATION_SEEDS,
         )[:count]
     )
@@ -380,6 +496,7 @@ async def _seed_scored(
     generated_at: datetime = datetime(2026, 6, 8, 12, 0, 0, tzinfo=UTC),
     recorded_at: datetime | None = None,
     details: dict | None = None,
+    bench_version: int = _ERA,
 ) -> None:
     async with maker() as s, s.begin():
         agent = Agent(
@@ -407,13 +524,14 @@ async def _seed_scored(
             generated_at=generated_at,
             signature="ab" * 64,
             details=details,
+            bench_version=bench_version,
         )
         if recorded_at is not None:
             score = await s.get(
                 Score,
                 (
                     agent.agent_id,
-                    2,
+                    bench_version,
                     "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
                 ),
             )
@@ -437,6 +555,7 @@ async def _seed_k3(
     base_time: datetime = datetime(2026, 6, 8, 12, 0, 0, tzinfo=UTC),
     created_at: datetime | None = None,
     accepted_tickets: bool = True,
+    queue_ready: bool = True,
 ) -> str:
     """Seed one agent scored by ``len(composites)`` distinct validators.
 
@@ -448,6 +567,12 @@ async def _seed_k3(
     allocator's contender lane counts *accepted tickets*, not recorded scores,
     so a fixture with scores and no tickets silently disables the lane it is
     trying to exercise.
+
+    ``queue_ready`` writes the verified screened image and the dataset pin the
+    live contract requires of a queue candidate. Same reasoning: from v7 on, a
+    submission missing either is filtered out of the queue entirely, so a
+    fixture without them quietly stops exercising the lane it set up. Pass
+    ``False`` only when the submission is meant to be unservable.
     """
     validators = [
         "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
@@ -456,7 +581,7 @@ async def _seed_k3(
         "5CZq6MdanxF3j8ACp8oVtiaphTeyrA7QFPU92ke2jEFzK1mp",
     ]
     agent_id = uuid4()
-    bench_version = int(details.get("bench_version", 2)) if details else 2
+    bench_version = int(details.get("bench_version", _ERA)) if details else _ERA
     async with maker() as s, s.begin():
         agent = Agent(
             agent_id=agent_id,
@@ -471,9 +596,28 @@ async def _seed_k3(
             dataset_seed_block=dataset_seed_block,
             dataset_seed_block_hash=dataset_seed_block_hash,
             created_at=created_at or datetime.now(UTC),
+            **(
+                _screened_image(agent_id, created_at or datetime.now(UTC))
+                if queue_ready
+                else {}
+            ),
         )
         s.add(agent)
         await s.flush()
+        # The pin mirrors the agent's own dataset columns: a fixture that says
+        # this submission has no dataset must not be handed one through the
+        # back door, because "no pinned dataset" is a state the pipeline
+        # reports on.
+        if queue_ready and dataset_seed is not None and dataset_sha256 is not None:
+            s.add(
+                _dataset_pin(
+                    agent_id,
+                    bench_version,
+                    seed=dataset_seed,
+                    sha256=dataset_sha256,
+                    run_size=dataset_run_size or "full",
+                )
+            )
         for i, composite in enumerate(composites):
             await upsert_score(
                 s,
@@ -514,7 +658,7 @@ async def _seed_top_five_floor(
     maker: async_sessionmaker[AsyncSession],
     *,
     fifth_place: float = 0.80,
-    bench_version: int = DEFAULT_BENCH_VERSION,
+    bench_version: int = _ERA,
 ) -> None:
     for rank, marker in enumerate(("A", "B", "C", "D", "E")):
         composite = fifth_place + (4 - rank) * 0.01
@@ -530,7 +674,7 @@ async def _seed_top_ten_floor(
     maker: async_sessionmaker[AsyncSession],
     *,
     tenth_place: float = 0.60,
-    bench_version: int = DEFAULT_BENCH_VERSION,
+    bench_version: int = _ERA,
 ) -> None:
     for rank, marker in enumerate("ABCDEFGHJK"):
         composite = tenth_place + (9 - rank) * 0.01
@@ -553,9 +697,11 @@ async def _seed_agent(
     duplicate_of: UUID | None = None,
     review_reason: str | None = None,
     screening_policy_version: int = 0,
+    queue_ready: bool = True,
 ) -> str:
     """Seed a submission with no score (e.g. still uploaded/evaluating)."""
     agent_id = uuid4()
+    arrived_at = created_at or datetime.now(UTC)
     async with maker() as s, s.begin():
         s.add(
             Agent(
@@ -565,13 +711,16 @@ async def _seed_agent(
                 sha256="cd" * 32,
                 size_bytes=524288,
                 status=status,
-                created_at=created_at or datetime.now(UTC),
+                created_at=arrived_at,
                 screening_reason=screening_reason,
                 duplicate_of=duplicate_of,
                 review_reason=review_reason,
                 screening_policy_version=screening_policy_version,
+                **(_screened_image(agent_id, arrived_at) if queue_ready else {}),
             )
         )
+        if queue_ready:
+            s.add(_dataset_pin(agent_id))
     return str(agent_id)
 
 
@@ -886,51 +1035,65 @@ class TestPublicBenchmarkTimeline:
         client: httpx.AsyncClient,
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
-        first_id = await _seed_k3(
-            session_maker,
-            miner=_MINER_A,
-            composites=[0.41, 0.42, 0.43],
-            details={"bench_version": 2},
-            base_time=datetime(2026, 7, 8, tzinfo=UTC),
-        )
-        second_id = await _seed_k3(
-            session_maker,
-            miner=_MINER_B,
-            composites=[0.71, 0.72, 0.73],
-            details={"bench_version": 2},
-            base_time=datetime(2026, 7, 9, tzinfo=UTC),
-        )
-        async with session_maker() as session, session.begin():
-            session.add(
-                BenchmarkRollout(
-                    rollout_id=uuid4(),
-                    from_version=2,
-                    desired_version=3,
-                    status="activated",
-                    cohort_size=5,
-                    created_at=datetime(2026, 7, 18, 14, 30, tzinfo=UTC),
-                    activated_at=datetime(2026, 7, 18, 16, 0, tzinfo=UTC),
-                )
+        """The chart is release history, so it has to render retired eras.
+
+        Every shipped contract is on this timeline, v2 included: the endpoint
+        dates a release from the rollout that activated it and falls back to the
+        changelog epoch. That history is exactly what the bench-version floor
+        refuses to write, and exactly what production still holds -- the v2/v3
+        rows predate the constraint and are grandfathered by it. Reproducing
+        that state is the only way to assert the fallback and the rollout-dated
+        release in the same read.
+        """
+        async with (
+            session_maker() as floor_session,
+            retired_era_writes_allowed(floor_session),
+        ):
+            first_id = await _seed_k3(
+                session_maker,
+                miner=_MINER_A,
+                composites=[0.41, 0.42, 0.43],
+                details={"bench_version": 2},
+                base_time=datetime(2026, 7, 8, tzinfo=UTC),
             )
-            for agent_id, recorded_at in (
-                (UUID(first_id), datetime(2026, 7, 8, tzinfo=UTC)),
-                (UUID(second_id), datetime(2026, 7, 9, tzinfo=UTC)),
-            ):
-                scores = list(
-                    await session.scalars(
-                        select(Score).where(Score.agent_id == agent_id)
+            second_id = await _seed_k3(
+                session_maker,
+                miner=_MINER_B,
+                composites=[0.71, 0.72, 0.73],
+                details={"bench_version": 2},
+                base_time=datetime(2026, 7, 9, tzinfo=UTC),
+            )
+            async with session_maker() as session, session.begin():
+                session.add(
+                    BenchmarkRollout(
+                        rollout_id=uuid4(),
+                        from_version=2,
+                        desired_version=3,
+                        status="activated",
+                        cohort_size=5,
+                        created_at=datetime(2026, 7, 18, 14, 30, tzinfo=UTC),
+                        activated_at=datetime(2026, 7, 18, 16, 0, tzinfo=UTC),
                     )
                 )
-                for index, score in enumerate(scores):
-                    score.created_at = recorded_at + timedelta(minutes=index)
-                    score.updated_at = recorded_at + timedelta(minutes=index)
-        await _seed_k3(
-            session_maker,
-            miner="5" + "A" * 47,
-            composites=[0.51, 0.52],
-            details={"bench_version": 3},
-            base_time=datetime(2026, 7, 19, tzinfo=UTC),
-        )
+                for agent_id, recorded_at in (
+                    (UUID(first_id), datetime(2026, 7, 8, tzinfo=UTC)),
+                    (UUID(second_id), datetime(2026, 7, 9, tzinfo=UTC)),
+                ):
+                    scores = list(
+                        await session.scalars(
+                            select(Score).where(Score.agent_id == agent_id)
+                        )
+                    )
+                    for index, score in enumerate(scores):
+                        score.created_at = recorded_at + timedelta(minutes=index)
+                        score.updated_at = recorded_at + timedelta(minutes=index)
+            await _seed_k3(
+                session_maker,
+                miner="5" + "A" * 47,
+                composites=[0.51, 0.52],
+                details={"bench_version": 3},
+                base_time=datetime(2026, 7, 19, tzinfo=UTC),
+            )
         _install_db(app, session_maker)
 
         response = await client.get("/api/v1/public/bench/timeline")
@@ -1017,21 +1180,28 @@ class TestPublicLeaderboard:
         client: httpx.AsyncClient,
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
-        details = {"bench_version": DEFAULT_BENCH_VERSION, "composite_stderr": 0.03}
+        details = {"bench_version": _ERA, "composite_stderr": 0.03}
+        # Both reigns sit under ``KOTH_BAND_DECAY_START_COMPOSITE`` (0.60) so the
+        # v6-and-later indifference-band decay leaves the required lead at its
+        # unscaled value. What is on trial here is the dethrone decision itself
+        # -- that a real 0.05 lead is still short of the statistical bar -- and
+        # the decay has its own test; on the live era a 0.80 champion shrinks the
+        # band enough to flip this challenger and hide the distinction entirely.
         incumbent_id = await _seed_k3(
             session_maker,
             miner=_MINER_A,
-            composites=[0.80, 0.80, 0.80],
+            composites=[0.50, 0.50, 0.50],
             details=details,
             created_at=datetime(2026, 7, 15, tzinfo=UTC),
         )
         raw_leader_id = await _seed_k3(
             session_maker,
             miner=_MINER_B,
-            composites=[0.85, 0.85, 0.85],
+            composites=[0.55, 0.55, 0.55],
             details=details,
             created_at=datetime(2026, 7, 16, tzinfo=UTC),
         )
+        await _activate_era(session_maker)
         _install_db(app, session_maker)
         app.state.chain = SimpleNamespace(
             get_recent_neurons=AsyncMock(
@@ -1097,14 +1267,14 @@ class TestPublicLeaderboard:
             session_maker,
             miner=_MINER_A,
             composites=[0.90, 0.90, 0.90],
-            details={"bench_version": DEFAULT_BENCH_VERSION},
+            details={"bench_version": _ERA},
             created_at=datetime(2026, 6, 1, tzinfo=UTC),
         )
         tail_id = await _seed_k3(
             session_maker,
             miner=_MINER_B,
             composites=[0.80, 0.80, 0.80],
-            details={"bench_version": DEFAULT_BENCH_VERSION},
+            details={"bench_version": _ERA},
             created_at=datetime(2026, 6, 2, tzinfo=UTC),
         )
         # A wave counts only after every emission-set member has the seed.
@@ -1120,9 +1290,7 @@ class TestPublicLeaderboard:
                     reported_at=now,
                     seen_at=now,
                     signature="cd" * 64,
-                    capabilities=_scorer_capabilities(
-                        now, versions=[DEFAULT_BENCH_VERSION]
-                    ),
+                    capabilities=_scorer_capabilities(now, versions=[_ERA]),
                 )
             )
             await append_confirmation_scores(
@@ -1139,9 +1307,10 @@ class TestPublicLeaderboard:
                     for agent_id in (champion_id, tail_id)
                     for seed in _anchor_seeds(champion_id)
                 ],
-                bench_version=DEFAULT_BENCH_VERSION,
+                bench_version=_ERA,
                 created_at=datetime.now(UTC),
             )
+        await _activate_era(session_maker)
         _install_db(app, session_maker)
 
         mixed = (await client.get("/api/v1/public/leaderboard")).json()
@@ -1216,14 +1385,14 @@ class TestPublicLeaderboard:
             session_maker,
             miner=_MINER_A,
             composites=[0.90, 0.90, 0.90],
-            details={"bench_version": DEFAULT_BENCH_VERSION},
+            details={"bench_version": _ERA},
             created_at=datetime(2026, 6, 1, tzinfo=UTC),
         )
         tail_id = await _seed_k3(
             session_maker,
             miner=_MINER_B,
             composites=[0.80, 0.80, 0.80],
-            details={"bench_version": DEFAULT_BENCH_VERSION},
+            details={"bench_version": _ERA},
             created_at=datetime(2026, 6, 2, tzinfo=UTC),
         )
         async with session_maker() as s, s.begin():
@@ -1238,9 +1407,7 @@ class TestPublicLeaderboard:
                     reported_at=now,
                     seen_at=now,
                     signature="cd" * 64,
-                    capabilities=_scorer_capabilities(
-                        now, versions=[DEFAULT_BENCH_VERSION]
-                    ),
+                    capabilities=_scorer_capabilities(now, versions=[_ERA]),
                 )
             )
             s.add(
@@ -1271,9 +1438,10 @@ class TestPublicLeaderboard:
                     for agent_id in (champion_id, tail_id)
                     for seed in _anchor_seeds(champion_id)
                 ],
-                bench_version=DEFAULT_BENCH_VERSION,
+                bench_version=_ERA,
                 created_at=datetime.now(UTC),
             )
+        await _activate_era(session_maker)
         _install_db(app, session_maker)
         # The strict pin above is only honoured if the settings cache re-reads.
         app.state.session_maker = session_maker
@@ -1299,7 +1467,7 @@ class TestPublicLeaderboard:
             # re-anchors the seed set -- pinned separately in
             # ``test_a_dethrone_resets_the_fold_but_keeps_the_audit_trail``.
             composites=[0.85, 0.85, 0.85],
-            details={"bench_version": DEFAULT_BENCH_VERSION},
+            details={"bench_version": _ERA},
             created_at=datetime(2026, 6, 3, tzinfo=UTC),
         )
 
@@ -1360,7 +1528,7 @@ class TestPublicLeaderboard:
                 session_maker,
                 miner=miner,
                 composites=[composite] * 3,
-                details={"bench_version": DEFAULT_BENCH_VERSION},
+                details={"bench_version": _ERA},
                 created_at=datetime(2026, 6, 1, tzinfo=UTC) + timedelta(days=index),
             )
             for index, (miner, composite) in enumerate(ladder)
@@ -1381,9 +1549,7 @@ class TestPublicLeaderboard:
                     reported_at=now,
                     seen_at=now,
                     signature="cd" * 64,
-                    capabilities=_scorer_capabilities(
-                        now, versions=[DEFAULT_BENCH_VERSION]
-                    ),
+                    capabilities=_scorer_capabilities(now, versions=[_ERA]),
                 )
             )
             s.add(
@@ -1415,9 +1581,10 @@ class TestPublicLeaderboard:
                     for agent_id in agent_ids
                     for seed in live_seeds
                 ],
-                bench_version=DEFAULT_BENCH_VERSION,
+                bench_version=_ERA,
                 created_at=datetime.now(UTC),
             )
+        await _activate_era(session_maker)
         _install_db(app, session_maker)
         app.state.session_maker = session_maker
         app.state.continual_retest_settings.invalidate()
@@ -1474,14 +1641,14 @@ class TestPublicLeaderboard:
             session_maker,
             miner=_MINER_A,
             composites=[0.90, 0.90, 0.90],
-            details={"bench_version": DEFAULT_BENCH_VERSION},
+            details={"bench_version": _ERA},
             created_at=datetime(2026, 6, 1, tzinfo=UTC),
         )
         tail_id = await _seed_k3(
             session_maker,
             miner=_MINER_B,
             composites=[0.80, 0.80, 0.80],
-            details={"bench_version": DEFAULT_BENCH_VERSION},
+            details={"bench_version": _ERA},
             created_at=datetime(2026, 6, 2, tzinfo=UTC),
         )
         # The lihai analogue: deep trail, none of it on the current anchor.
@@ -1489,7 +1656,7 @@ class TestPublicLeaderboard:
             session_maker,
             miner="5Cq" + "z" * 45,
             composites=[0.70, 0.70, 0.70],
-            details={"bench_version": DEFAULT_BENCH_VERSION},
+            details={"bench_version": _ERA},
             created_at=datetime(2026, 6, 3, tzinfo=UTC),
         )
         # A reign this board never had: seeds anchored on some other agent, the
@@ -1510,9 +1677,7 @@ class TestPublicLeaderboard:
                     reported_at=now,
                     seen_at=now,
                     signature="cd" * 64,
-                    capabilities=_scorer_capabilities(
-                        now, versions=[DEFAULT_BENCH_VERSION]
-                    ),
+                    capabilities=_scorer_capabilities(now, versions=[_ERA]),
                 )
             )
             s.add(
@@ -1554,9 +1719,10 @@ class TestPublicLeaderboard:
                     )
                     for seed in stale_seeds
                 ],
-                bench_version=DEFAULT_BENCH_VERSION,
+                bench_version=_ERA,
                 created_at=datetime.now(UTC),
             )
+        await _activate_era(session_maker)
         _install_db(app, session_maker)
         app.state.session_maker = session_maker
         app.state.continual_retest_settings.invalidate()
@@ -1619,14 +1785,14 @@ class TestPublicLeaderboard:
             session_maker,
             miner=_MINER_A,
             composites=[0.90, 0.90, 0.90],
-            details={"bench_version": DEFAULT_BENCH_VERSION},
+            details={"bench_version": _ERA},
             created_at=datetime(2026, 6, 1, tzinfo=UTC),
         )
         tail_id = await _seed_k3(
             session_maker,
             miner=_MINER_B,
             composites=[0.80, 0.80, 0.80],
-            details={"bench_version": DEFAULT_BENCH_VERSION},
+            details={"bench_version": _ERA},
             created_at=datetime(2026, 6, 2, tzinfo=UTC),
         )
         async with session_maker() as s, s.begin():
@@ -1641,9 +1807,7 @@ class TestPublicLeaderboard:
                     reported_at=now,
                     seen_at=now,
                     signature="cd" * 64,
-                    capabilities=_scorer_capabilities(
-                        now, versions=[DEFAULT_BENCH_VERSION]
-                    ),
+                    capabilities=_scorer_capabilities(now, versions=[_ERA]),
                 )
             )
             s.add(
@@ -1674,9 +1838,10 @@ class TestPublicLeaderboard:
                     for agent_id in (champion_id, tail_id)
                     for seed in _anchor_seeds(champion_id)
                 ],
-                bench_version=DEFAULT_BENCH_VERSION,
+                bench_version=_ERA,
                 created_at=datetime.now(UTC),
             )
+        await _activate_era(session_maker)
         _install_db(app, session_maker)
         app.state.session_maker = session_maker
         app.state.continual_retest_settings.invalidate()
@@ -1691,7 +1856,7 @@ class TestPublicLeaderboard:
             session_maker,
             miner="5Cq" + "z" * 45,
             composites=[0.95, 0.95, 0.95],
-            details={"bench_version": DEFAULT_BENCH_VERSION},
+            details={"bench_version": _ERA},
             created_at=datetime(2026, 6, 3, tzinfo=UTC),
         )
 
@@ -1740,14 +1905,14 @@ class TestPublicLeaderboard:
             session_maker,
             miner=_MINER_A,
             composites=[0.90, 0.90, 0.90],
-            details={"bench_version": DEFAULT_BENCH_VERSION},
+            details={"bench_version": _ERA},
             created_at=datetime(2026, 6, 1, tzinfo=UTC),
         )
         tail_id = await _seed_k3(
             session_maker,
             miner=_MINER_B,
             composites=[0.80, 0.80, 0.80],
-            details={"bench_version": DEFAULT_BENCH_VERSION},
+            details={"bench_version": _ERA},
             created_at=datetime(2026, 6, 2, tzinfo=UTC),
         )
         async with session_maker() as s, s.begin():
@@ -1762,9 +1927,7 @@ class TestPublicLeaderboard:
                     reported_at=now,
                     seen_at=now,
                     signature="cd" * 64,
-                    capabilities=_scorer_capabilities(
-                        now, versions=[DEFAULT_BENCH_VERSION]
-                    ),
+                    capabilities=_scorer_capabilities(now, versions=[_ERA]),
                 )
             )
             s.add(
@@ -1798,9 +1961,10 @@ class TestPublicLeaderboard:
                     for agent_id in (champion_id, tail_id)
                     for seed in _anchor_seeds(champion_id)
                 ],
-                bench_version=DEFAULT_BENCH_VERSION,
+                bench_version=_ERA,
                 created_at=datetime.now(UTC),
             )
+        await _activate_era(session_maker)
         _install_db(app, session_maker)
         app.state.session_maker = session_maker
         app.state.continual_retest_settings.invalidate()
@@ -1815,7 +1979,7 @@ class TestPublicLeaderboard:
             # re-anchors the seed set -- pinned separately in
             # ``test_a_dethrone_resets_the_fold_but_keeps_the_audit_trail``.
             composites=[0.85, 0.85, 0.85],
-            details={"bench_version": DEFAULT_BENCH_VERSION},
+            details={"bench_version": _ERA},
             created_at=datetime(2026, 6, 3, tzinfo=UTC),
         )
 
@@ -1870,7 +2034,7 @@ class TestPublicLeaderboard:
             session_maker,
             miner=_MINER_A,
             composites=[0.90, 0.90, 0.90],
-            details={"bench_version": DEFAULT_BENCH_VERSION},
+            details={"bench_version": _ERA},
             created_at=datetime(2026, 6, 1, tzinfo=UTC),
         )
         # ... but trails once the completed waves land.
@@ -1878,7 +2042,7 @@ class TestPublicLeaderboard:
             session_maker,
             miner=_MINER_B,
             composites=[0.80, 0.80, 0.80],
-            details={"bench_version": DEFAULT_BENCH_VERSION},
+            details={"bench_version": _ERA},
             created_at=datetime(2026, 6, 2, tzinfo=UTC),
         )
         wave_scores = {median_leader_id: 0.60, mean_leader_id: 0.95}
@@ -1894,9 +2058,7 @@ class TestPublicLeaderboard:
                     reported_at=now,
                     seen_at=now,
                     signature="cd" * 64,
-                    capabilities=_scorer_capabilities(
-                        now, versions=[DEFAULT_BENCH_VERSION]
-                    ),
+                    capabilities=_scorer_capabilities(now, versions=[_ERA]),
                 )
             )
             await append_confirmation_scores(
@@ -1913,9 +2075,10 @@ class TestPublicLeaderboard:
                     for agent_id, value in wave_scores.items()
                     for seed in _anchor_seeds(median_leader_id)
                 ],
-                bench_version=DEFAULT_BENCH_VERSION,
+                bench_version=_ERA,
                 created_at=datetime.now(UTC),
             )
+        await _activate_era(session_maker)
         _install_db(app, session_maker)
 
         body = (await client.get("/api/v1/public/leaderboard")).json()
@@ -1985,14 +2148,14 @@ class TestPublicLeaderboard:
             session_maker,
             miner=_MINER_A,
             composites=[0.90, 0.90, 0.90],
-            details={"bench_version": DEFAULT_BENCH_VERSION},
+            details={"bench_version": _ERA},
             created_at=datetime(2026, 6, 1, tzinfo=UTC),
         )
         tail_id = await _seed_k3(
             session_maker,
             miner=_MINER_B,
             composites=[0.80, 0.80, 0.80],
-            details={"bench_version": DEFAULT_BENCH_VERSION},
+            details={"bench_version": _ERA},
             created_at=datetime(2026, 6, 2, tzinfo=UTC),
         )
         async with session_maker() as s, s.begin():
@@ -2007,9 +2170,7 @@ class TestPublicLeaderboard:
                     reported_at=now,
                     seen_at=now,
                     signature="cd" * 64,
-                    capabilities=_scorer_capabilities(
-                        now, versions=[DEFAULT_BENCH_VERSION]
-                    ),
+                    capabilities=_scorer_capabilities(now, versions=[_ERA]),
                 )
             )
             s.add(
@@ -2040,9 +2201,10 @@ class TestPublicLeaderboard:
                     for agent_id in (champion_id, tail_id)
                     for seed in _anchor_seeds(champion_id)
                 ],
-                bench_version=DEFAULT_BENCH_VERSION,
+                bench_version=_ERA,
                 created_at=datetime.now(UTC),
             )
+        await _activate_era(session_maker)
         _install_db(app, session_maker)
         app.state.session_maker = session_maker
         app.state.continual_retest_settings.invalidate()
@@ -2057,7 +2219,7 @@ class TestPublicLeaderboard:
             # re-anchors the seed set -- pinned separately in
             # ``test_a_dethrone_resets_the_fold_but_keeps_the_audit_trail``.
             composites=[0.85, 0.85, 0.85],
-            details={"bench_version": DEFAULT_BENCH_VERSION},
+            details={"bench_version": _ERA},
             created_at=datetime(2026, 6, 3, tzinfo=UTC),
         )
 
@@ -2079,14 +2241,15 @@ class TestPublicLeaderboard:
             session_maker,
             miner=_MINER_A,
             composites=[0.7, 0.8, 0.9],
-            details={"bench_version": DEFAULT_BENCH_VERSION},
+            details={"bench_version": _ERA},
         )
         await _seed_k3(
             session_maker,
             miner=_MINER_B,
             composites=[0.6, 0.7, 0.8],
-            details={"bench_version": DEFAULT_BENCH_VERSION},
+            details={"bench_version": _ERA},
         )
+        await _activate_era(session_maker)
         _install_db(app, session_maker)
         app.state.chain = SimpleNamespace(
             get_recent_neurons=AsyncMock(
@@ -2116,8 +2279,9 @@ class TestPublicLeaderboard:
             session_maker,
             miner=_MINER_A,
             composites=[0.7, 0.8, 0.9],
-            details={"bench_version": 2},
+            details={"bench_version": _ERA},
         )
+        await _activate_era(session_maker)
         _install_db(app, session_maker)
         app.state.chain = SimpleNamespace(
             get_recent_neurons=AsyncMock(side_effect=ChainError("pylon unavailable"))
@@ -2141,8 +2305,9 @@ class TestPublicLeaderboard:
             session_maker,
             miner=_MINER_A,
             composites=[0.7, 0.8, 0.9],
-            details={"bench_version": 2},
+            details={"bench_version": _ERA},
         )
+        await _activate_era(session_maker)
         _install_db(app, session_maker)
 
         async def _never_returns(_netuid: int) -> list[object]:
@@ -2172,8 +2337,9 @@ class TestPublicLeaderboard:
             session_maker,
             miner=_MINER_A,
             composites=[0.7, 0.8, 0.9],
-            details={"bench_version": DEFAULT_BENCH_VERSION},
+            details={"bench_version": _ERA},
         )
+        await _activate_era(session_maker)
         _install_db(app, session_maker)
         get_recent_neurons = AsyncMock(
             return_value=[SimpleNamespace(hotkey=_MINER_A, uid=42)]
@@ -2209,8 +2375,9 @@ class TestPublicLeaderboard:
             session_maker,
             miner=_MINER_A,
             composites=[0.7, 0.8, 0.9],
-            details={"bench_version": DEFAULT_BENCH_VERSION},
+            details={"bench_version": _ERA},
         )
+        await _activate_era(session_maker)
         _install_db(app, session_maker)
         get_recent_neurons = AsyncMock(
             return_value=[SimpleNamespace(hotkey=_MINER_A, uid=42)]
@@ -2239,7 +2406,7 @@ class TestPublicLeaderboard:
             session_maker,
             miner=_MINER_A,
             composites=[0.7, 0.8, 0.9],
-            details={"bench_version": 2},
+            details={"bench_version": _ERA},
         )
         _install_db(app, session_maker)
 
@@ -2275,6 +2442,7 @@ class TestPublicLeaderboard:
             composites=[0.6, 0.8],
             status=AgentStatus.EVALUATING,
         )
+        await _activate_era(session_maker)
         _install_db(app, session_maker)
 
         body = (await client.get("/api/v1/public/leaderboard")).json()
@@ -2288,7 +2456,7 @@ class TestPublicLeaderboard:
         assert entry["finalized"] is False
         assert entry["score_count"] == 2
         assert entry["score_quorum"] == 3
-        assert entry["bench_version"] == DEFAULT_BENCH_VERSION
+        assert entry["bench_version"] == _ERA
 
     async def test_provisional_overlay_gives_one_row_per_coldkey_not_per_hotkey(
         self,
@@ -2346,6 +2514,7 @@ class TestPublicLeaderboard:
                 miner_coldkey=coldkey,
                 index=index,
             )
+        await _activate_era(session_maker)
         _install_db(app, session_maker)
 
         body = (await client.get("/api/v1/public/leaderboard")).json()
@@ -2360,10 +2529,12 @@ class TestPublicLeaderboard:
         client: httpx.AsyncClient,
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
-        """Mid-rollout, every entry carries the settled v2 median plus the v3
-        settlement state (median so far + score count). With the temporary
-        authority pin, even a complete v3 quorum stays on its v2 median until
-        the rollout activates."""
+        """Mid-rollout, every entry carries the settled median of the era in
+        force plus the next era's settlement state (median so far + score
+        count). With the temporary authority pin, even a complete quorum on the
+        target version stays on the settled median until the rollout
+        activates."""
+        await _activate_era(session_maker)
         flipped_id = await _seed_k3(
             session_maker,
             miner=_MINER_A,
@@ -2378,8 +2549,8 @@ class TestPublicLeaderboard:
             s.add(
                 BenchmarkRollout(
                     rollout_id=uuid4(),
-                    from_version=2,
-                    desired_version=3,
+                    from_version=_ERA,
+                    desired_version=_NEXT_ERA,
                     status="collecting",
                     cohort_size=5,
                     created_at=datetime.now(UTC),
@@ -2390,7 +2561,7 @@ class TestPublicLeaderboard:
                     s,
                     agent_id=UUID(flipped_id),
                     validator_hotkey=f"5Validator{i}Flipped",
-                    bench_version=3,
+                    bench_version=_NEXT_ERA,
                     run_id=f"v3_run_{i}",
                     seed=1,
                     composite=composite,
@@ -2405,7 +2576,7 @@ class TestPublicLeaderboard:
                 s,
                 agent_id=UUID(partial_id),
                 validator_hotkey="5Validator0Partial",
-                bench_version=3,
+                bench_version=_NEXT_ERA,
                 run_id="v3_run_partial",
                 seed=1,
                 composite=0.5,
@@ -2420,18 +2591,18 @@ class TestPublicLeaderboard:
 
         body = (await client.get("/api/v1/public/leaderboard")).json()
 
-        assert body["active_bench_version"] == 2
-        assert body["desired_bench_version"] == 3
-        assert body["available_bench_versions"] == [3, 2]
+        assert body["active_bench_version"] == _ERA
+        assert body["desired_bench_version"] == _NEXT_ERA
+        assert body["available_bench_versions"] == [_NEXT_ERA, _ERA]
         by_agent = {e["agent_id"]: e for e in body["entries"]}
         flipped = by_agent[flipped_id]
-        assert flipped["bench_version"] == DEFAULT_BENCH_VERSION
+        assert flipped["bench_version"] == _ERA
         assert flipped["composite"] == pytest.approx(0.80)
         assert flipped["settled_composite"] == pytest.approx(0.80)
         assert flipped["rollout_composite"] == pytest.approx(0.92)
         assert flipped["rollout_score_count"] == 3
         partial = by_agent[partial_id]
-        assert partial["bench_version"] == DEFAULT_BENCH_VERSION
+        assert partial["bench_version"] == _ERA
         assert partial["composite"] == pytest.approx(0.85)
         assert partial["settled_composite"] == pytest.approx(0.85)
         assert partial["rollout_composite"] == pytest.approx(0.5)
@@ -2448,6 +2619,7 @@ class TestPublicLeaderboard:
             miner=_MINER_A,
             composites=[0.7, 0.8, 0.9],
         )
+        await _activate_era(session_maker)
         _install_db(app, session_maker)
 
         body = (await client.get("/api/v1/public/leaderboard")).json()
@@ -2474,6 +2646,7 @@ class TestPublicLeaderboard:
             composites=[0.99],
             status=AgentStatus.EVALUATING,
         )
+        await _activate_era(session_maker)
         _install_db(app, session_maker)
 
         body = (await client.get("/api/v1/public/leaderboard")).json()
@@ -2509,6 +2682,7 @@ class TestPublicLeaderboard:
             memory_mean=0.99,
             status=AgentStatus.ATH_PENDING_REVIEW,
         )
+        await _activate_era(session_maker)
         _install_db(app, session_maker)
 
         resp = await client.get("/api/v1/public/leaderboard")
@@ -2519,10 +2693,10 @@ class TestPublicLeaderboard:
         )
         body = resp.json()
         assert body["selection_mode"] == "authoritative"
-        assert body["active_bench_version"] == DEFAULT_BENCH_VERSION
-        assert body["desired_bench_version"] == DEFAULT_BENCH_VERSION
-        assert body["current_bench_version"] == DEFAULT_BENCH_VERSION
-        assert body["available_bench_versions"] == [DEFAULT_BENCH_VERSION]
+        assert body["active_bench_version"] == _ERA
+        assert body["desired_bench_version"] == _ERA
+        assert body["current_bench_version"] == _ERA
+        assert body["available_bench_versions"] == [_ERA]
         assert body["count"] == 2
         assert [e["rank"] for e in body["entries"]] == [1, 2]
         assert [e["miner_hotkey"] for e in body["entries"]] == [_MINER_B, _MINER_A]
@@ -2536,14 +2710,12 @@ class TestPublicLeaderboard:
         assert top["memory_mean"] == pytest.approx(0.8)
 
         historical = (
-            await client.get(
-                f"/api/v1/public/leaderboard?bench_version={DEFAULT_BENCH_VERSION}"
-            )
+            await client.get(f"/api/v1/public/leaderboard?bench_version={_ERA}")
         ).json()
         assert historical["selection_mode"] == "historical"
         assert historical["entries"] == body["entries"]
         assert historical["emissions"] is None
-        assert historical["available_bench_versions"] == [DEFAULT_BENCH_VERSION]
+        assert historical["available_bench_versions"] == [_ERA]
 
     async def test_settled_bench_version_board_caches_longer_than_the_live_one(
         self,
@@ -2554,11 +2726,15 @@ class TestPublicLeaderboard:
         _install_db(app, session_maker)
 
         live = await client.get("/api/v1/public/leaderboard")
+        # "In play" and "settled" are the subject here, not any particular
+        # generation. With no rollout on record the ledger's authority is the
+        # floor, so ``_ERA`` is the version still in play and ``_PREV_ERA`` --
+        # the newest retired one -- is the finished work behind it.
         pinned_live = await client.get(
-            f"/api/v1/public/leaderboard?bench_version={DEFAULT_BENCH_VERSION}"
+            f"/api/v1/public/leaderboard?bench_version={_ERA}"
         )
         settled = await client.get(
-            f"/api/v1/public/leaderboard?bench_version={DEFAULT_BENCH_VERSION - 1}"
+            f"/api/v1/public/leaderboard?bench_version={_PREV_ERA}"
         )
 
         live_window = "public, max-age=30, stale-while-revalidate=120"
@@ -2596,6 +2772,7 @@ class TestPublicLeaderboard:
             memory_mean=0.6,
             details={"calibration_brier": 7.5},  # out of range → dropped
         )
+        await _activate_era(session_maker)
         _install_db(app, session_maker)
 
         body = (await client.get("/api/v1/public/leaderboard")).json()
@@ -2614,7 +2791,7 @@ class TestPublicLeaderboard:
         # Seed a run whose details carry the raw per-case answer key so we can
         # assert it is redacted out, not merely absent because it was never set.
         details = {
-            "bench_version": 2,
+            "bench_version": _ERA,
             "per_case": [
                 {
                     "kind": "tool",
@@ -2637,6 +2814,7 @@ class TestPublicLeaderboard:
             memory_mean=0.3,
             details=details,
         )
+        await _activate_era(session_maker)
         _install_db(app, session_maker)
 
         resp = await client.get("/api/v1/public/leaderboard")
@@ -3679,6 +3857,7 @@ class TestPublicActivity:
                     },
                 )
             )
+        await _activate_era(session_maker)
         _install_db(app, session_maker)
 
         response = await client.get(
@@ -3742,19 +3921,21 @@ class TestPublicActivity:
             created_at=rollout_started + timedelta(days=1),
             screening_policy_version=SCREENING_POLICY_VERSION,
         )
+        rollout_id = uuid4()
         async with session_maker() as session, session.begin():
             session.add(
                 # Live production shape: authority taken, qualification still
                 # settling, so the rollout row is "collecting" not "activated".
                 BenchmarkRollout(
-                    rollout_id=uuid4(),
-                    from_version=1,
-                    desired_version=2,
+                    rollout_id=rollout_id,
+                    from_version=_ERA - 1,
+                    desired_version=_ERA,
                     status="collecting",
                     cohort_size=5,
                     created_at=rollout_started,
                 )
             )
+        await _take_authority(session_maker, rollout_id=rollout_id, at=rollout_started)
         _install_db(app, session_maker)
 
         response = await client.get("/api/v1/public/activity")
@@ -3813,17 +3994,19 @@ class TestPublicActivity:
             created_at=rollout_started - timedelta(days=3),
             screening_policy_version=SCREENING_POLICY_VERSION,
         )
+        rollout_id = uuid4()
         async with session_maker() as session, session.begin():
             session.add(
                 BenchmarkRollout(
-                    rollout_id=uuid4(),
-                    from_version=1,
-                    desired_version=2,
+                    rollout_id=rollout_id,
+                    from_version=_ERA - 1,
+                    desired_version=_ERA,
                     status="collecting",
                     cohort_size=5,
                     created_at=rollout_started,
                 )
             )
+        await _take_authority(session_maker, rollout_id=rollout_id, at=rollout_started)
         _install_db(app, session_maker)
 
         response = await client.get("/api/v1/public/activity")
@@ -3878,6 +4061,7 @@ class TestPublicActivity:
                 agent = await session.get(Agent, UUID(agent_id))
                 assert agent is not None
                 agent.screening_policy_version = SCREENING_POLICY_VERSION
+        await _activate_era(session_maker)
         _install_db(app, session_maker)
 
         response = await client.get("/api/v1/public/activity")
@@ -3962,6 +4146,7 @@ class TestPublicActivity:
                 agent = await session.get(Agent, UUID(agent_id))
                 assert agent is not None
                 agent.screening_policy_version = SCREENING_POLICY_VERSION
+        await _activate_era(session_maker)
         _install_db(app, session_maker)
 
         response = await client.get("/api/v1/public/activity")
@@ -4102,6 +4287,7 @@ class TestPublicActivity:
                 score.created_at = recorded_at - timedelta(minutes=index)
                 score.updated_at = recorded_at - timedelta(minutes=index)
 
+        await _activate_era(session_maker)
         _install_db(app, session_maker)
 
         entry = (await client.get("/api/v1/public/activity")).json()["entries"][0]
@@ -4183,15 +4369,16 @@ class TestPublicActivity:
         client: httpx.AsyncClient,
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
-        """A v3 score must not be published with the v2 dataset digest.
+        """A newer score must not be published with the older era's digest.
 
         Dataset provenance is per bench version, but the agent row carries only
         the version it was first pinned at. Pairing every score with that column
-        advertised the v2 digest next to a verification_command naming v3, so a
-        verifier would render v3 and get a mismatch on a perfectly good score.
+        advertised the older digest next to a verification_command naming the
+        newer era, so a verifier would render the newer era and get a mismatch
+        on a perfectly good score.
         """
         agent_id = uuid4()
-        v2_sha, v3_sha = "a1" * 32, "b2" * 32
+        era_sha, next_sha = "a1" * 32, "b2" * 32
         async with session_maker() as session, session.begin():
             session.add(
                 Agent(
@@ -4202,24 +4389,24 @@ class TestPublicActivity:
                     size_bytes=524288,
                     status=AgentStatus.SCORED,
                     dataset_seed=42,
-                    dataset_sha256=v2_sha,
+                    dataset_sha256=era_sha,
                     dataset_run_size="full",
                     created_at=datetime.now(UTC),
                 )
             )
             await session.flush()
-            # Only v3 is pinned; v2 predates versioned pins and falls back to the
+            # Only the newer era is pinned; the older one falls back to the
             # agent column, which is exactly the mixed state production is in.
             session.add(
                 BenchmarkDataset(
                     agent_id=agent_id,
-                    bench_version=3,
+                    bench_version=_NEXT_ERA,
                     seed=42,
-                    sha256=v3_sha,
+                    sha256=next_sha,
                     run_size="full",
                 )
             )
-            for bench_version, hotkey in ((2, _VALIDATOR_C), (3, _MINER_B)):
+            for bench_version, hotkey in ((_ERA, _VALIDATOR_C), (_NEXT_ERA, _MINER_B)):
                 await upsert_score(
                     session,
                     agent_id=agent_id,
@@ -4245,7 +4432,7 @@ class TestPublicActivity:
             score["bench_version"]: score["dataset_sha256"]
             for score in response.json()["provisional_scores"]
         }
-        assert by_version == {2: v2_sha, 3: v3_sha}
+        assert by_version == {_ERA: era_sha, _NEXT_ERA: next_sha}
 
     async def test_stale_rejection_projects_as_waiting_for_rescreen(
         self,
@@ -4537,6 +4724,7 @@ class TestPublicActivity:
                 screening_policy_version=SCREENING_POLICY_VERSION,
             )
         )
+        await _activate_era(session_maker)
         _install_db(app, session_maker)
 
         waiting = (await client.get("/api/v1/public/activity")).json()["entries"][0]
@@ -4561,6 +4749,7 @@ class TestPublicActivity:
                 ValidatorTicket(
                     agent_id=agent_id,
                     validator_hotkey=_MINER_B,
+                    bench_version=_ERA,
                     status=TicketStatus.ISSUED,
                     issued_at=now - timedelta(seconds=1),
                     deadline=now + timedelta(minutes=30),
@@ -4593,6 +4782,7 @@ class TestPublicActivity:
                     session,
                     agent_id=agent_id,
                     validator_hotkey=validator,
+                    bench_version=_ERA,
                     run_id=f"below-floor-{index}",
                     seed=42,
                     composite=composite,
@@ -4619,6 +4809,7 @@ class TestPublicActivity:
                         ]
                     },
                 )
+        await _activate_era(session_maker)
         _install_db(app, session_maker)
 
         entries = (await client.get("/api/v1/public/activity")).json()["entries"]
@@ -4671,6 +4862,7 @@ class TestPublicActivity:
                 ValidatorTicket(
                     agent_id=agent_id,
                     validator_hotkey=_MINER_A,
+                    bench_version=_ERA,
                     status=TicketStatus.ISSUED,
                     issued_at=now,
                     deadline=now + timedelta(minutes=30),
@@ -4693,8 +4885,16 @@ class TestPublicActivity:
         client: httpx.AsyncClient,
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
-        """love-v8's v3 and v4 scores are one score in each era, not two."""
-        await _seed_top_five_floor(session_maker, fifth_place=0.80, bench_version=4)
+        """love-v8's two eras are one score in each era, not two.
+
+        The older era here is a *retired* one, which is the only shape this
+        state has left in production: the floor stops anything below
+        ``MIN_SCOREABLE_BENCH_VERSION`` being written or re-leased, but the
+        grandfathered rows -- and the lease that was live when the floor
+        landed -- still have to be projected in their own era rather than
+        folded into the live one.
+        """
+        await _seed_top_five_floor(session_maker, fifth_place=0.80)
         now = datetime.now(UTC)
         agent_id = UUID(
             await _seed_agent(
@@ -4706,19 +4906,24 @@ class TestPublicActivity:
                 created_at=now - timedelta(hours=2),
             )
         )
-        async with session_maker() as session, session.begin():
+        deadline = now + timedelta(minutes=30)
+        async with (
+            session_maker() as floor_session,
+            retired_era_writes_allowed(floor_session),
+            session_maker() as session,
+            session.begin(),
+        ):
             session.add(
                 BenchmarkRollout(
                     rollout_id=uuid4(),
-                    from_version=2,
-                    desired_version=4,
+                    from_version=_PREV_ERA,
+                    desired_version=_ERA,
                     status="activated",
                     cohort_size=5,
                     created_at=now - timedelta(hours=1),
                     activated_at=now,
                 )
             )
-            deadline = now + timedelta(minutes=30)
             session.add(
                 ValidatorHeartbeat(
                     validator_hotkey=_MINER_A,
@@ -4743,7 +4948,7 @@ class TestPublicActivity:
                 ValidatorTicket(
                     agent_id=agent_id,
                     validator_hotkey=_MINER_A,
-                    bench_version=3,
+                    bench_version=_PREV_ERA,
                     status=TicketStatus.ISSUED,
                     issued_at=now - timedelta(seconds=1),
                     deadline=deadline,
@@ -4753,7 +4958,7 @@ class TestPublicActivity:
                 ValidatorTicket(
                     agent_id=agent_id,
                     validator_hotkey="5AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-                    bench_version=4,
+                    bench_version=_ERA,
                     status=TicketStatus.EXPIRED,
                     issued_at=now - timedelta(minutes=30),
                     deadline=now - timedelta(minutes=15),
@@ -4763,8 +4968,8 @@ class TestPublicActivity:
                 )
             )
             for bench_version, validator, composite in (
-                (3, _VALIDATOR_C, 0.391235),
-                (4, _MINER_B, 0.391897),
+                (_PREV_ERA, _VALIDATOR_C, 0.391235),
+                (_ERA, _MINER_B, 0.391897),
             ):
                 await upsert_score(
                     session,
@@ -4796,10 +5001,12 @@ class TestPublicActivity:
         assert activity["validator_queue_rank"] is None
         assert activity["retry_state"] is None
         assert activity_body["status_counts"]["not_queued"] == 1
-        assert [work["bench_version"] for work in activity["active_benchmarks"]] == [3]
+        assert [work["bench_version"] for work in activity["active_benchmarks"]] == [
+            _PREV_ERA
+        ]
 
         operations = (await client.get("/api/v1/public/operations")).json()
-        assert operations["active_bench_version"] == 4
+        assert operations["active_bench_version"] == _ERA
         assert not any(
             entry["agent_id"] == str(agent_id)
             for entry in operations["activity"]["entries"]
@@ -4809,7 +5016,7 @@ class TestPublicActivity:
         pipeline = (
             await client.get(f"/api/v1/public/agent/{agent_id}/pipeline")
         ).json()
-        assert pipeline["active_bench_version"] == 4
+        assert pipeline["active_bench_version"] == _ERA
         assert pipeline["status"] == "not_queued"
         assert pipeline["score_count"] == 1
         assert pipeline["score_floor"] == pytest.approx(0.80)
@@ -4817,13 +5024,13 @@ class TestPublicActivity:
             score["bench_version"]: score["composite"]
             for score in pipeline["provisional_scores"]
         }
-        assert scores_by_version[3] == pytest.approx(0.391235)
-        assert scores_by_version[4] == pytest.approx(0.391897)
+        assert scores_by_version[_PREV_ERA] == pytest.approx(0.391235)
+        assert scores_by_version[_ERA] == pytest.approx(0.391897)
         running_by_version = {
             attempt["bench_version"]: attempt["actively_running"]
             for attempt in pipeline["validation_attempts"]
         }
-        assert running_by_version[3] is True
+        assert running_by_version[_PREV_ERA] is True
 
     async def test_retry_state_surfaces_exhausted_and_cooling_submissions(
         self,
@@ -4874,7 +5081,7 @@ class TestPublicActivity:
                             status=TicketStatus.EXPIRED,
                             issued_at=now - timedelta(hours=3),
                             deadline=now - timedelta(hours=2, minutes=index),
-                            bench_version=2,
+                            bench_version=_ERA,
                             attempt_count=2,
                             manual_retry_grants=0,
                             retry_after=now - timedelta(hours=1),
@@ -4887,7 +5094,7 @@ class TestPublicActivity:
                     status=TicketStatus.EXPIRED,
                     issued_at=now - timedelta(hours=1),
                     deadline=now - timedelta(minutes=30),
-                    bench_version=2,
+                    bench_version=_ERA,
                     attempt_count=1,
                     manual_retry_grants=0,
                     retry_after=cooldown_until,
@@ -4966,6 +5173,7 @@ class TestPublicActivity:
                     ValidatorTicket(
                         agent_id=agent_id,
                         validator_hotkey=hotkey,
+                        bench_version=_ERA,
                         status=TicketStatus.ISSUED,
                         issued_at=now - timedelta(seconds=1),
                         deadline=deadline,
@@ -5003,7 +5211,7 @@ class TestPublicActivity:
             progress for progress in shown if progress["completed_checks"] == 51
         )
         assert first["percent"] == 44  # 51/114 exactly, no 5% bucket.
-        assert first["bench_version"] == 2
+        assert first["bench_version"] == _ERA
         assert first["total_checks"] == 114
         assert datetime.fromisoformat(first["started_at"].replace("Z", "+00:00")) == (
             now - timedelta(seconds=1)
@@ -5016,7 +5224,7 @@ class TestPublicActivity:
         assert len(activity["active_benchmarks"]) == 2
         pipeline = responses[2].json()
         assert sum(a["actively_running"] for a in pipeline["validation_attempts"]) == 2
-        assert all(a["bench_version"] == 2 for a in pipeline["validation_attempts"])
+        assert all(a["bench_version"] == _ERA for a in pipeline["validation_attempts"])
 
         forbidden_keys = {
             "case_id",
@@ -5101,7 +5309,7 @@ class TestPublicActivity:
             f"deterministic {rogue_kind} match",
         ]
         details = {
-            "bench_version": 2,
+            "bench_version": _ERA,
             "per_case": [
                 {
                     "kind": "memory",
@@ -5135,6 +5343,7 @@ class TestPublicActivity:
                 session,
                 agent_id=provisional_id,
                 validator_hotkey=_VALIDATOR_C,
+                bench_version=_ERA,
                 run_id="provisional-notes",
                 seed=42,
                 composite=0.5,
@@ -5215,12 +5424,13 @@ class TestPublicActivity:
                     signature="cd" * 64,
                 )
             )
-            # The same validator already finished this agent on v2 and v3; only
-            # the v4 ticket is live.
+            # The same validator already finished this agent on the two older
+            # eras; only the newest ticket is live.
+            live_version = _NEXT_ERA + 1
             for bench_version, status in (
-                (2, TicketStatus.SCORED),
-                (3, TicketStatus.SCORED),
-                (4, TicketStatus.ISSUED),
+                (_ERA, TicketStatus.SCORED),
+                (_NEXT_ERA, TicketStatus.SCORED),
+                (live_version, TicketStatus.ISSUED),
             ):
                 session.add(
                     ValidatorTicket(
@@ -5242,12 +5452,12 @@ class TestPublicActivity:
             for attempt in pipeline["validation_attempts"]
             if attempt["actively_running"]
         ]
-        assert [attempt["bench_version"] for attempt in running] == [4]
-        assert running[0]["benchmark_progress"]["bench_version"] == 4
+        assert [attempt["bench_version"] for attempt in running] == [live_version]
+        assert running[0]["benchmark_progress"]["bench_version"] == live_version
         assert all(
             attempt["benchmark_progress"] is None
             for attempt in pipeline["validation_attempts"]
-            if attempt["bench_version"] != 4
+            if attempt["bench_version"] != live_version
         )
 
     async def test_delayed_legacy_or_omitted_progress_cannot_revive_reissued_work(
@@ -5290,6 +5500,7 @@ class TestPublicActivity:
                     ValidatorTicket(
                         agent_id=agent_id,
                         validator_hotkey=hotkey,
+                        bench_version=_ERA,
                         status=TicketStatus.ISSUED,
                         issued_at=issued_at,
                         deadline=deadline,
@@ -5354,6 +5565,7 @@ class TestPublicActivity:
             composites=[0.42],
             status=AgentStatus.EVALUATING,
         )
+        await _activate_era(session_maker)
         _install_db(app, session_maker)
 
         resp = await client.get("/api/v1/public/activity")
@@ -5382,7 +5594,7 @@ class TestPublicActivity:
                     AgentStatus.SCORED if score_count == 3 else AgentStatus.EVALUATING
                 ),
                 details={
-                    "bench_version": 2,
+                    "bench_version": _ERA,
                     "transcript_sha256": transcript_sha256,
                 },
             )
@@ -5411,13 +5623,14 @@ class TestPublicActivity:
         for score in body["provisional_scores"]:
             assert score["seed"] == "987654321"
             assert score["run_size"] == "full"
-            assert score["bench_version"] == 2
-            assert score["datagen_version"] == "v0.7.0"
+            assert score["bench_version"] == _ERA
+            assert score["datagen_version"] == "v0.12.0"
             assert score["seed_source"] == "on_chain"
             assert score["dataset_sha256"] == "cd" * 32
             assert score["reproduction_command"] == (
                 "go run github.com/ditto-assistant/dittobench-datagen/cmd/"
-                "generate@v0.7.0 -seed 987654321 -run-size full -out dataset.json"
+                f"generate@v0.12.0 -bench-version {_ERA} -seed 987654321 "
+                "-run-size full -out dataset.json"
             )
             assert score["verification_command"].endswith(
                 "-seed 987654321 -run-size full -sha"
@@ -5443,7 +5656,7 @@ class TestPublicActivity:
             status=AgentStatus.EVALUATING,
             dataset_seed_block=None,
             dataset_seed_block_hash=None,
-            details={"bench_version": 2},
+            details={"bench_version": _ERA},
         )
         _install_db(app, session_maker)
 
@@ -5468,7 +5681,7 @@ class TestPublicActivity:
             dataset_run_size=None,
             dataset_seed_block=None,
             dataset_seed_block_hash=None,
-            details={"bench_version": 2},
+            details={"bench_version": _ERA},
         )
         _install_db(app, session_maker)
 
@@ -5493,7 +5706,7 @@ class TestPublicActivity:
                 miner=_MINER_A,
                 composites=[0.52],
                 status=AgentStatus.EVALUATING,
-                details={"bench_version": 2},
+                details={"bench_version": _ERA},
             )
         )
         now = datetime.now(UTC)
@@ -5502,6 +5715,7 @@ class TestPublicActivity:
                 ValidatorTicket(
                     agent_id=agent_id,
                     validator_hotkey=_MINER_B,
+                    bench_version=_ERA,
                     status=TicketStatus.EXPIRED,
                     purpose=TicketPurpose.CANONICAL_QUORUM,
                     issued_at=now - timedelta(hours=2),
@@ -5517,7 +5731,7 @@ class TestPublicActivity:
         assert body["score_count"] == 1
         assert body["provisional_scores"][0]["composite"] == pytest.approx(0.52)
         assert body["validation_attempts"][0]["status"] == "expired"
-        assert body["validation_attempts"][0]["bench_version"] == 2
+        assert body["validation_attempts"][0]["bench_version"] == _ERA
         assert body["validation_attempts"][0]["purpose"] == "canonical_quorum"
         assert body["validation_attempts"][0]["failure_reason"] == "sandbox_oom"
         assert body["validation_attempts"][0]["failed_at"] is not None
@@ -5543,7 +5757,7 @@ class TestPublicActivity:
                 miner=_MINER_A,
                 composites=[0.84],
                 status=AgentStatus.EVALUATING,
-                details={"bench_version": 2},
+                details={"bench_version": _ERA},
             )
         )
         now = datetime.now(UTC)
@@ -5554,6 +5768,7 @@ class TestPublicActivity:
                 ValidatorTicket(
                     agent_id=agent_id,
                     validator_hotkey=_MINER_B,
+                    bench_version=_ERA,
                     status=TicketStatus.SCORED,
                     purpose=TicketPurpose.CANONICAL_QUORUM,
                     issued_at=reissued_at,
@@ -5598,7 +5813,7 @@ class TestPublicActivity:
                 miner=_MINER_A,
                 composites=[0.91, 0.92, 0.93],
                 status=AgentStatus.SCORED,
-                details={"bench_version": 2},
+                details={"bench_version": _ERA},
                 # This test writes its own continual-retest tickets on the same
                 # composite key, so the helper must not also seed the canonical
                 # quorum tickets.
@@ -5639,7 +5854,7 @@ class TestPublicActivity:
                         signature="ab" * 64,
                     ),
                 ],
-                bench_version=2,
+                bench_version=_ERA,
                 created_at=now,
             )
             session.add_all(
@@ -5651,7 +5866,7 @@ class TestPublicActivity:
                         purpose=TicketPurpose.CONTINUAL_RETEST,
                         issued_at=now - timedelta(minutes=10),
                         deadline=now - timedelta(minutes=5),
-                        bench_version=2,
+                        bench_version=_ERA,
                     ),
                     ValidatorTicket(
                         agent_id=agent_id,
@@ -5660,7 +5875,7 @@ class TestPublicActivity:
                         purpose=TicketPurpose.CONTINUAL_RETEST,
                         issued_at=now,
                         deadline=now + timedelta(minutes=30),
-                        bench_version=2,
+                        bench_version=_ERA,
                     ),
                     ValidatorTicket(
                         agent_id=agent_id,
@@ -5669,7 +5884,7 @@ class TestPublicActivity:
                         purpose=TicketPurpose.CANONICAL_QUORUM,
                         issued_at=now,
                         deadline=now + timedelta(minutes=30),
-                        bench_version=2,
+                        bench_version=_ERA,
                     ),
                 ]
             )
@@ -5707,7 +5922,7 @@ class TestPublicActivity:
                 miner=_MINER_A,
                 composites=[0.41, 0.58, 0.73],
                 status=AgentStatus.SCORED,
-                details={"bench_version": 2},
+                details={"bench_version": _ERA},
             )
         )
         now = datetime.now(UTC)
@@ -5716,7 +5931,7 @@ class TestPublicActivity:
                 session,
                 agent_id=agent_id,
                 validator_hotkey=_VALIDATOR_C,
-                run_id="v3-run",
+                run_id="next-era-run",
                 seed=123,
                 composite=0.91,
                 tool_mean=0.91,
@@ -5725,8 +5940,8 @@ class TestPublicActivity:
                 n=114,
                 generated_at=now,
                 signature="ab" * 64,
-                details={"bench_version": 3},
-                bench_version=3,
+                details={"bench_version": _NEXT_ERA},
+                bench_version=_NEXT_ERA,
             )
             session.add(
                 ValidatorTicket(
@@ -5735,29 +5950,31 @@ class TestPublicActivity:
                     status=TicketStatus.ISSUED,
                     issued_at=now,
                     deadline=now + timedelta(hours=1),
-                    bench_version=3,
+                    bench_version=_NEXT_ERA,
                 )
             )
+        await _activate_era(session_maker)
         _install_db(app, session_maker)
 
         response = await client.get(f"/api/v1/public/agent/{agent_id}/pipeline")
 
         assert response.status_code == 200
         body = response.json()
-        assert body["active_bench_version"] == 2
+        assert body["active_bench_version"] == _ERA
         # A ticket for a version being rolled out *ahead* of the active one does
         # not move the reported era. This submission is current-generation work
-        # that finished at v2; its v3 run is visible below, not in the headline.
-        assert body["score_bench_version"] == 2
+        # that finished on the active era; its next-era run is visible below,
+        # not in the headline.
+        assert body["score_bench_version"] == _ERA
         assert body["score_count"] == 3
         assert body["final_composite"] == pytest.approx(0.58)
         assert [score["bench_version"] for score in body["provisional_scores"]].count(
-            2
+            _ERA
         ) == 3
         assert [score["bench_version"] for score in body["provisional_scores"]].count(
-            3
+            _NEXT_ERA
         ) == 1
-        assert body["validation_attempts"][0]["bench_version"] == 3
+        assert body["validation_attempts"][0]["bench_version"] == _NEXT_ERA
 
     async def test_pipeline_counts_a_previous_generation_below_quorum_in_its_own_era(
         self,
@@ -5771,20 +5988,28 @@ class TestPublicActivity:
         every previous-generation detail page answered 0 -- indistinguishable
         from a submission no validator ever picked up, and to the miner who
         earned those scores it read as if the work had been thrown away.
+
+        The closed generation is a retired one now: the floor refuses new
+        writes below it, and these grandfathered rows are exactly the history
+        the page still has to count.
         """
-        agent_id = await _seed_k3(
-            session_maker,
-            miner=_MINER_A,
-            composites=[0.44, 0.61],
-            status=AgentStatus.EVALUATING,
-            details={"bench_version": 2},
-        )
+        async with (
+            session_maker() as floor_session,
+            retired_era_writes_allowed(floor_session),
+        ):
+            agent_id = await _seed_k3(
+                session_maker,
+                miner=_MINER_A,
+                composites=[0.44, 0.61],
+                status=AgentStatus.EVALUATING,
+                details={"bench_version": _PREV_ERA},
+            )
         async with session_maker() as session, session.begin():
             session.add(
                 BenchmarkRollout(
                     rollout_id=uuid4(),
-                    from_version=2,
-                    desired_version=3,
+                    from_version=_PREV_ERA,
+                    desired_version=_ERA,
                     status="activated",
                     cohort_size=5,
                     created_at=datetime.now(UTC) - timedelta(days=1),
@@ -5795,8 +6020,8 @@ class TestPublicActivity:
 
         body = (await client.get(f"/api/v1/public/agent/{agent_id}/pipeline")).json()
 
-        assert body["active_bench_version"] == 3
-        assert body["score_bench_version"] == 2
+        assert body["active_bench_version"] == _ERA
+        assert body["score_bench_version"] == _PREV_ERA
         assert body["score_count"] == 2
         assert body["final_composite"] is None
 
@@ -5810,21 +6035,26 @@ class TestPublicActivity:
 
         Reporting "3 of 3" beside a null final composite would be a new lie in
         place of the old one, so both are answered for the era the submission
-        was actually finalized in.
+        was actually finalized in -- a retired era here, whose grandfathered
+        rows the floor keeps readable but refuses to let anyone add to.
         """
-        agent_id = await _seed_k3(
-            session_maker,
-            miner=_MINER_A,
-            composites=[0.41, 0.58, 0.73],
-            status=AgentStatus.SCORED,
-            details={"bench_version": 2},
-        )
+        async with (
+            session_maker() as floor_session,
+            retired_era_writes_allowed(floor_session),
+        ):
+            agent_id = await _seed_k3(
+                session_maker,
+                miner=_MINER_A,
+                composites=[0.41, 0.58, 0.73],
+                status=AgentStatus.SCORED,
+                details={"bench_version": _PREV_ERA},
+            )
         async with session_maker() as session, session.begin():
             session.add(
                 BenchmarkRollout(
                     rollout_id=uuid4(),
-                    from_version=2,
-                    desired_version=3,
+                    from_version=_PREV_ERA,
+                    desired_version=_ERA,
                     status="activated",
                     cohort_size=5,
                     created_at=datetime.now(UTC) - timedelta(days=1),
@@ -5835,8 +6065,8 @@ class TestPublicActivity:
 
         body = (await client.get(f"/api/v1/public/agent/{agent_id}/pipeline")).json()
 
-        assert body["active_bench_version"] == 3
-        assert body["score_bench_version"] == 2
+        assert body["active_bench_version"] == _ERA
+        assert body["score_bench_version"] == _PREV_ERA
         assert body["score_count"] == 3
         assert body["final_composite"] == pytest.approx(0.58)
 
@@ -5856,7 +6086,7 @@ class TestPublicActivity:
             miner=_MINER_A,
             composites=[0.41, 0.58, 0.73],
             status=status,
-            details={"bench_version": 2},
+            details={"bench_version": _ERA},
         )
         _install_db(app, session_maker)
 
@@ -5929,14 +6159,14 @@ class TestPublicSubmissionScores:
             session_maker,
             miner=_MINER_A,
             composites=[0.40, 0.70, 0.55],
-            details={"bench_version": 2},
+            details={"bench_version": _ERA},
         )
         async with session_maker() as s, s.begin():
             await upsert_score(
                 s,
                 agent_id=UUID(agent_id),
                 validator_hotkey="5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
-                run_id="run_v3",
+                run_id="run_next_era",
                 seed=987654321,
                 composite=0.61,
                 tool_mean=0.61,
@@ -5945,15 +6175,20 @@ class TestPublicSubmissionScores:
                 n=110,
                 generated_at=datetime(2026, 6, 9, 12, 0, 0, tzinfo=UTC),
                 signature="ab" * 64,
-                details={"bench_version": 3},
-                bench_version=3,
+                details={"bench_version": _NEXT_ERA},
+                bench_version=_NEXT_ERA,
             )
         _install_db(app, session_maker)
 
         body = (await client.get(f"/api/v1/public/agent/{agent_id}/scores")).json()
 
         assert body["score_count"] == 4
-        assert sorted(s["bench_version"] for s in body["scores"]) == [2, 2, 2, 3]
+        assert sorted(s["bench_version"] for s in body["scores"]) == [
+            _ERA,
+            _ERA,
+            _ERA,
+            _NEXT_ERA,
+        ]
 
     async def test_detail_exposes_redacted_per_case_breakdown(
         self,
@@ -6232,7 +6467,7 @@ class TestPublicArtifactRelease:
             assert response.headers["Cache-Control"] == "private, no-store"
             body = response.json()
             assert body["agent_id"] == agent_id
-            assert body["bench_version"] == 2
+            assert body["bench_version"] == _ERA
             assert body["sha256"] == "ab" * 32
             assert body["download_url"].endswith(f"{agent_id}/agent.tar.gz")
 
@@ -6501,15 +6736,15 @@ class TestPublicArtifactRelease:
             miner=_MINER_A,
             composites=[0.4, 0.5],
             status=AgentStatus.SCORED,
-            details={"bench_version": 2},
+            details={"bench_version": _ERA},
         )
         async with session_maker() as session, session.begin():
             await upsert_score(
                 session,
                 agent_id=UUID(agent_id),
                 validator_hotkey=_VALIDATOR_C,
-                bench_version=3,
-                run_id="run-v3",
+                bench_version=_NEXT_ERA,
+                run_id="run-next-era",
                 seed=1,
                 composite=0.6,
                 tool_mean=0.6,
@@ -6517,7 +6752,7 @@ class TestPublicArtifactRelease:
                 median_ms=500,
                 n=110,
                 generated_at=datetime.now(UTC) - timedelta(hours=10),
-                details={"bench_version": 3},
+                details={"bench_version": _NEXT_ERA},
             )
         _install_db(app, session_maker)
         storage = AsyncMock()
@@ -6920,13 +7155,21 @@ class _FakeRevealGenerator:
         sha: str = "cd" * 32,
         fail: bool = False,
     ) -> None:
-        self._artifact = artifact if artifact is not None else {"bench_version": 2}
+        self._artifact = artifact if artifact is not None else {"bench_version": _ERA}
         self._sha = sha
         self._fail = fail
         self.calls = 0
+        self.bench_versions: list[int] = []
 
-    async def fetch_dataset(self, seed: int, run_size: str) -> tuple[dict, str]:
+    async def fetch_dataset(
+        self, seed: int, run_size: str, bench_version: int
+    ) -> tuple[dict, str]:
+        # ``bench_version`` is required, not defaulted. The reveal endpoint used
+        # to omit it and take the old default of 2, which served the v2 dataset
+        # for every finalized agent regardless of the era it ran. Recording it
+        # here is what lets a test assert the endpoint asked for the right one.
         self.calls += 1
+        self.bench_versions.append(bench_version)
         if self._fail:
             raise DataPipelineError("generate service down")
         return {**self._artifact, "seed": seed, "run_size": run_size}, self._sha
@@ -6951,7 +7194,7 @@ class TestPublicDatasetReveal:
         )
         _install_db(app, session_maker)
         # The generator returns a dataset whose sha matches the pinned "cd"*32.
-        artifact = {"bench_version": 2, "tool_cases": [{"expected_tools": ["x"]}]}
+        artifact = {"bench_version": _ERA, "tool_cases": [{"expected_tools": ["x"]}]}
         gen = _FakeRevealGenerator(artifact=artifact, sha="cd" * 32)
         _install_generator(app, gen)
 
@@ -6962,7 +7205,13 @@ class TestPublicDatasetReveal:
         assert body["seed"] == 987654321
         assert body["run_size"] == "full"
         assert body["dataset_sha256"] == "cd" * 32
-        assert body["bench_version"] == 2
+        assert body["bench_version"] == _ERA
+        # The dataset asked for is the one this agent actually ran. This is the
+        # regression: the endpoint omitted `bench_version` entirely and took the
+        # old default of 2, so every finalized agent was revealed the v2
+        # dataset. It never errored -- a v2 dataset is well-formed -- so only
+        # asserting the era the generator was ASKED for catches it coming back.
+        assert gen.bench_versions == [_ERA]
         # The FULL labeled artifact (answer keys included) is served.
         assert body["artifact"]["tool_cases"][0]["expected_tools"] == ["x"]
         assert gen.calls == 1
@@ -7021,10 +7270,12 @@ class TestPublicBenchCorpus:
         client: httpx.AsyncClient,
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
-        # A run scored under the retired v1 (current is 2). Its full per-case
-        # answer keys are released verbatim.
+        # A run scored under a retired era, with a newer one active. Its full
+        # per-case answer keys are released verbatim. The era is retired in the
+        # ledger's sense too now -- the floor refuses new rows on it -- so the
+        # grandfathered rows have to be written the way production holds them.
         details = {
-            "bench_version": 1,
+            "bench_version": _PREV_ERA,
             "per_case": [
                 {
                     "category": "web_search",
@@ -7035,15 +7286,23 @@ class TestPublicBenchCorpus:
                 }
             ],
         }
-        await _seed_k3(
-            session_maker, miner=_MINER_A, composites=[0.4, 0.5, 0.6], details=details
-        )
+        async with (
+            session_maker() as floor_session,
+            retired_era_writes_allowed(floor_session),
+        ):
+            await _seed_k3(
+                session_maker,
+                miner=_MINER_A,
+                composites=[0.4, 0.5, 0.6],
+                details=details,
+            )
+        await _activate_era(session_maker)
         _install_db(app, session_maker)
 
-        resp = await client.get("/api/v1/public/bench/1/corpus")
+        resp = await client.get(f"/api/v1/public/bench/{_PREV_ERA}/corpus")
         assert resp.status_code == 200
         body = resp.json()
-        assert body["bench_version"] == 1
+        assert body["bench_version"] == _PREV_ERA
         assert body["total"] == 3  # three validator rows
         entry = body["entries"][0]
         # The FULL answer key is present (retired = safe).
@@ -7072,24 +7331,31 @@ class TestPublicBenchCorpus:
         # ...and the live answer key is not in the refusal body.
         assert '"expected"' not in resp.text
 
-    async def test_v2_corpus_remains_private_before_v3_activation(
+    async def test_active_corpus_remains_private_before_the_next_activation(
         self,
         app: FastAPI,
         client: httpx.AsyncClient,
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
+        """The era still in force keeps its answer keys until a newer one lands.
+
+        Retirement is relative to the *active* version, not to whatever the
+        newest shipped contract happens to be, so the era being scored right
+        now is refused even though runs exist for it.
+        """
         await _seed_k3(
             session_maker,
             miner=_MINER_A,
             composites=[0.4, 0.5, 0.6],
             details={
-                "bench_version": 2,
+                "bench_version": _ERA,
                 "per_case": [{"expected": ["still-live"]}],
             },
         )
+        await _activate_era(session_maker)
         _install_db(app, session_maker)
 
-        response = await client.get("/api/v1/public/bench/2/corpus")
+        response = await client.get(f"/api/v1/public/bench/{_ERA}/corpus")
 
         assert response.status_code == 409
         assert '"expected"' not in response.text
@@ -7100,18 +7366,27 @@ class TestPublicBenchCorpus:
         client: httpx.AsyncClient,
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
-        await _seed_k3(
-            session_maker,
-            miner=_MINER_A,
-            composites=[0.4, 0.5, 0.6],
-            details={"bench_version": 1, "per_case": []},
-        )
+        async with (
+            session_maker() as floor_session,
+            retired_era_writes_allowed(floor_session),
+        ):
+            await _seed_k3(
+                session_maker,
+                miner=_MINER_A,
+                composites=[0.4, 0.5, 0.6],
+                details={"bench_version": _PREV_ERA, "per_case": []},
+            )
+        await _activate_era(session_maker)
         _install_db(app, session_maker)
-        page = (await client.get("/api/v1/public/bench/1/corpus?limit=2")).json()
+        page = (
+            await client.get(f"/api/v1/public/bench/{_PREV_ERA}/corpus?limit=2")
+        ).json()
         assert page["count"] == 2
         assert page["total"] == 3
         page2 = (
-            await client.get("/api/v1/public/bench/1/corpus?limit=2&offset=2")
+            await client.get(
+                f"/api/v1/public/bench/{_PREV_ERA}/corpus?limit=2&offset=2"
+            )
         ).json()
         assert page2["count"] == 1
 
@@ -7121,8 +7396,9 @@ class TestPublicBenchCorpus:
         client: httpx.AsyncClient,
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
+        await _activate_era(session_maker)
         _install_db(app, session_maker)
-        body = (await client.get("/api/v1/public/bench/1/corpus")).json()
+        body = (await client.get(f"/api/v1/public/bench/{_PREV_ERA}/corpus")).json()
         assert body["total"] == 0
         assert body["entries"] == []
 
@@ -7205,13 +7481,19 @@ class TestBenchConfig:
         assert resp.status_code == 200
         assert "max-age=300" in resp.headers["Cache-Control"]
         body = resp.json()
-        assert body["bench_version"] == DEFAULT_BENCH_VERSION
+        # Nothing has activated in this database, so the ledger's honest answer
+        # is the floor. Which generation that is happens to be incidental to
+        # everything else asserted below.
+        assert body["bench_version"] == _ERA
         h = body["harness"]
         assert h["locked"] is True
-        assert h["canonical_id"] == "qwen/qwen3-32b"
-        assert h["serving"] == "Qwen/Qwen3-32B-TEE"
-        assert h["thinking"] is False
-        assert h["reasoning_effort"] is None
+        # The harness block is derived from the era being reported, so it moves
+        # with it: from v7 on the canonical model is the proxy-routed one and
+        # reasoning effort is pinned rather than absent.
+        assert h["canonical_id"] == "openai/gpt-oss-20b"
+        assert h["serving"] == "OpenRouter dynamic provider route"
+        assert h["thinking"] is True
+        assert h["reasoning_effort"] == "medium"
         assert body["grading"]["judge_free"] is True
         assert "dittobench-datagen" in body["grading"]["grader"]
         assert "dataset_sha256" in body["dataset"]["reproduce"]
@@ -7232,12 +7514,31 @@ class TestBenchConfig:
         _install_db(app, session_maker)
         monkeypatch.delenv("BENCH_HARNESS_MODEL_ID", raising=False)
         monkeypatch.delenv("BENCH_HARNESS_SERVING", raising=False)
+        # The active era has to be the RETIRED one this test is named after, or
+        # there is nothing to assert: with no activation on record the ledger
+        # answers the floor, which is the rollout's own target, and
+        # "active != desired" -- the whole point -- collapses to 7 == 7.
+        #
+        # v6 held authority exactly this way in production, through an activated
+        # rollout that now sits beneath the floor. Grandfathering it is
+        # reproducing that row, not inventing one.
+        async with (
+            session_maker() as floor_session,
+            retired_era_writes_allowed(floor_session),
+            floor_session.begin(),
+        ):
+            await grandfather_active_era(
+                floor_session,
+                version=_PREV_ERA,
+                now=datetime(2026, 6, 1, tzinfo=UTC),
+                from_version=DEFAULT_BENCH_VERSION,
+            )
         async with session_maker() as session, session.begin():
             session.add(
                 BenchmarkRollout(
                     rollout_id=uuid4(),
-                    from_version=DEFAULT_BENCH_VERSION,
-                    desired_version=7,
+                    from_version=_PREV_ERA,
+                    desired_version=_ERA,
                     status="collecting",
                     cohort_size=5,
                     created_at=datetime.now(UTC),
@@ -7246,8 +7547,8 @@ class TestBenchConfig:
 
         body = (await client.get("/api/v1/public/bench/config")).json()
 
-        assert body["bench_version"] == DEFAULT_BENCH_VERSION
-        assert body["desired_bench_version"] == 7
+        assert body["bench_version"] == _PREV_ERA
+        assert body["desired_bench_version"] == _ERA
         assert body["harness"]["canonical_id"] == "qwen/qwen3-32b"
         assert body["harness"]["serving"] == "Qwen/Qwen3-32B-TEE"
         assert body["harness"]["thinking"] is False

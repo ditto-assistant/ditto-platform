@@ -78,6 +78,7 @@ from ditto.db.queries.audit import (
     get_latest_score_retest_event,
 )
 from ditto.db.queries.benchmark_rollout import (
+    MIN_SCOREABLE_BENCH_VERSION,
     active_bench_version,
     heartbeat_supports_version,
 )
@@ -1762,6 +1763,24 @@ async def replace_validator_score_after_infrastructure_failure(
         if agent is None:
             raise HTTPException(status_code=404, detail="agent not found")
         current_snapshot = _snapshot(agent=agent, scores=scores, tickets=tickets)
+        # ``bench_version`` here comes from ``resolve_bench_version``, which
+        # answers "what era was this agent last active in" -- so for an agent
+        # whose last ticket or score was v6 it answers 6. This route then flips
+        # that exact ticket back to ISSUED for another 90 minutes.
+        #
+        # It is an UPDATE, so it is not the INSERT path, and it had no era
+        # check of any kind (unlike ``reinstatement_gate``, which refuses a
+        # stale era by name). The database now refuses the re-lease outright;
+        # this is here so an operator gets a 409 that says why, rather than a
+        # 500 raised out of a trigger.
+        if bench_version < MIN_SCOREABLE_BENCH_VERSION:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"benchmark v{bench_version} is retired; a replacement "
+                    "ticket cannot be issued for it"
+                ),
+            )
         if current_snapshot != payload.expected_snapshot:
             raise HTTPException(status_code=409, detail="validation state changed")
         if target is not None and target.run_id != payload.expected_run_id:

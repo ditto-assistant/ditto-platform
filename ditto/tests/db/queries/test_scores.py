@@ -31,6 +31,44 @@ _MINER_B = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
 _VALIDATOR = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
 _GEN_AT = datetime(2026, 6, 8, 12, 0, 0, tzinfo=UTC)
 _FIRST_SEEN = datetime(2026, 6, 8, 9, 0, 0, tzinfo=UTC)
+# The generic "a benchmark version" fixture value. Nothing about the median,
+# dedupe or ranking rules below depends on which era they run in; the value used
+# to be 2 only because 2 was the oldest number available. The retired-era floor
+# makes that choice load-bearing -- ``scores_bench_version_floor`` refuses
+# anything under MIN_SCOREABLE_BENCH_VERSION -- so the arbitrary value is now the
+# live era. Tests that need two distinct versions count up from here.
+_BENCH_VERSION = 7
+
+
+@pytest.fixture(autouse=True)
+async def _live_era_has_activated(session: AsyncSession) -> None:
+    """Put the database in the state production is in: v7 is the active era.
+
+    A freshly migrated, empty database answers ``active_bench_version`` with
+    ``DEFAULT_BENCH_VERSION`` (2), because no rollout has ever activated in it.
+    That was invisible while the fixtures wrote v2 scores and it is fatal now:
+    the floor means no v2 row can exist, so every default ledger read would
+    resolve to an era with nothing in it and return an empty list for reasons
+    that have nothing to do with what these tests assert.
+
+    Production has never been in that state -- the v6 -> v7 transition activated
+    long ago -- so plant that activated row and let the reads resolve the era the
+    fleet is actually on. ``from_version`` of 6 is below the floor and stays
+    writable on purpose: only ``desired_version`` is constrained, because a
+    rollout records where the fleet came FROM.
+    """
+    async with session.begin():
+        session.add(
+            BenchmarkRollout(
+                rollout_id=uuid4(),
+                from_version=_BENCH_VERSION - 1,
+                desired_version=_BENCH_VERSION,
+                status="activated",
+                cohort_size=5,
+                created_at=_FIRST_SEEN - timedelta(days=1),
+                activated_at=_FIRST_SEEN - timedelta(hours=12),
+            )
+        )
 
 
 async def _seed_agent(session: AsyncSession) -> Agent:
@@ -51,6 +89,7 @@ async def _upsert(session: AsyncSession, agent_id: object, **overrides: object) 
     kwargs: dict = {
         "agent_id": agent_id,
         "validator_hotkey": _VALIDATOR,
+        "bench_version": _BENCH_VERSION,
         "run_id": "run_1",
         "seed": 42,
         "composite": 0.7,
@@ -92,12 +131,17 @@ class TestUpsertScore:
         with pytest.raises(DbIntegrityError):
             await _upsert(session, uuid4())
 
-    async def test_database_rejects_above_one_for_v5(
+    async def test_database_rejects_a_composite_above_one(
         self, session: AsyncSession
     ) -> None:
-        v5_agent = await _seed_agent(session)
+        # ``scores_composite_range_check`` is era-independent, so this used to
+        # say v5 for no reason other than that v5 was available. Written at the
+        # live era it still proves the range check, and only the range check --
+        # at v5 it would now be indistinguishable from the floor rejecting the
+        # row before the composite was ever looked at.
+        agent = await _seed_agent(session)
         with pytest.raises(DbIntegrityError):
-            await _upsert(session, v5_agent.agent_id, bench_version=5, composite=1.001)
+            await _upsert(session, agent.agent_id, composite=1.001)
 
     async def test_list_empty_when_unscored(self, session: AsyncSession) -> None:
         agent = await _seed_agent(session)
@@ -154,6 +198,7 @@ async def _seed_scored(
             session,
             agent_id=agent.agent_id,
             validator_hotkey=_VALIDATOR,
+            bench_version=_BENCH_VERSION,
             run_id="run_1",
             seed=42,
             composite=composite,
@@ -474,6 +519,7 @@ class TestListEligibleLedger:
                 session,
                 agent_id=agent.agent_id,
                 validator_hotkey="5Zzz_validator",
+                bench_version=_BENCH_VERSION,
                 run_id="run_low",
                 seed=111,
                 composite=0.70,
@@ -489,6 +535,7 @@ class TestListEligibleLedger:
                 session,
                 agent_id=agent.agent_id,
                 validator_hotkey="5Aaa_validator",
+                bench_version=_BENCH_VERSION,
                 run_id="run_high",
                 seed=222,
                 composite=0.90,
@@ -505,6 +552,7 @@ class TestListEligibleLedger:
                 session,
                 agent_id=agent.agent_id,
                 validator_hotkey="5Mmm_validator",
+                bench_version=_BENCH_VERSION,
                 run_id="run_mid",
                 seed=333,
                 composite=0.80,
@@ -548,6 +596,7 @@ class TestListEligibleLedger:
                     session,
                     agent_id=agent.agent_id,
                     validator_hotkey=vh,
+                    bench_version=_BENCH_VERSION,
                     run_id=f"run_{vh}",
                     seed=1,
                     composite=comp,
@@ -634,27 +683,40 @@ class TestListScoresForBenchVersion:
         from ditto.db.queries.scores import list_scores_for_bench_version
 
         agent = await _seed_agent(session)
-        # First-class v1 wins even if other rows' advisory details say v2/null.
+        # The first-class column wins even when other rows' advisory details say
+        # the next version, or say nothing. The pair used to be v1 against v2;
+        # both are beneath the floor now, so the same two-era shape is expressed
+        # one era up.
         await _upsert(
             session,
             agent.agent_id,
             validator_hotkey="5V1",
             run_id="r1",
-            bench_version=1,
-            details={"bench_version": 1, "per_case": [{"expected": ["x"]}]},
+            details={
+                "bench_version": _BENCH_VERSION,
+                "per_case": [{"expected": ["x"]}],
+            },
         )
         await _upsert(
             session,
             agent.agent_id,
             validator_hotkey="5V2",
             run_id="r2",
-            details={"bench_version": 2},
+            bench_version=_BENCH_VERSION + 1,
+            details={"bench_version": _BENCH_VERSION + 1},
         )
         await _upsert(
-            session, agent.agent_id, validator_hotkey="5V3", run_id="r3", details=None
+            session,
+            agent.agent_id,
+            validator_hotkey="5V3",
+            run_id="r3",
+            bench_version=_BENCH_VERSION + 1,
+            details=None,
         )
 
-        rows, total = await list_scores_for_bench_version(session, version=1)
+        rows, total = await list_scores_for_bench_version(
+            session, version=_BENCH_VERSION
+        )
         assert total == 1
         assert len(rows) == 1
         score, miner = rows[0]
@@ -665,13 +727,19 @@ class TestListScoresForBenchVersion:
         assert score.details["per_case"][0]["expected"] == ["x"]
 
 
-_ROLLOUT_FROM = 2
-_ROLLOUT_DESIRED = 4
+# The transition under test. It used to be v2 -> v4, chosen as two arbitrary
+# adjacent-ish numbers. Both legs have to clear the floor now: the source leg
+# because these tests write a full quorum of ``from_version`` scores, and the
+# target leg because ``benchmark_rollout_desired_floor`` refuses a rollout that
+# aims below v7. So the same shape sits one era up, on the live version and the
+# one after it.
+_ROLLOUT_FROM = _BENCH_VERSION
+_ROLLOUT_DESIRED = _BENCH_VERSION + 1
 _QUORUM_VALIDATORS = ("5Va", "5Vb", "5Vc")
 
 
 async def _open_rollout(session: AsyncSession) -> None:
-    """A collecting v2 -> v4 rollout, the state the threshold rule governs."""
+    """A collecting v7 -> v8 rollout, the state the threshold rule governs."""
     async with session.begin():
         session.add(
             BenchmarkRollout(
@@ -690,14 +758,14 @@ async def _seed_versioned_agent(
     *,
     miner: str,
     created_at: datetime,
-    v2_composite: float,
+    source_composite: float,
     desired_composite: float | None = None,
     desired_samples: int = 3,
     desired_n: int = MIN_ELIGIBLE_CASES,
     status: AgentStatus = AgentStatus.SCORED,
     coldkey: str | None = None,
 ) -> Agent:
-    """One agent with a full v2 quorum and an optional partial/full v4 quorum."""
+    """One agent with a full source-era quorum and an optional target-era one."""
     agent = Agent(
         agent_id=uuid4(),
         miner_hotkey=miner,
@@ -729,7 +797,7 @@ async def _seed_versioned_agent(
                         agent_id=agent.agent_id,
                         position=member_count + 1,
                         frozen_miner_hotkey=agent.miner_hotkey,
-                        frozen_composite=v2_composite,
+                        frozen_composite=source_composite,
                     )
                 )
         if coldkey is not None:
@@ -751,11 +819,11 @@ async def _seed_versioned_agent(
                 agent_id=agent.agent_id,
                 validator_hotkey=validator,
                 bench_version=_ROLLOUT_FROM,
-                run_id=f"v2-{miner}-{index}",
+                run_id=f"source-{miner}-{index}",
                 seed=index,
-                composite=v2_composite,
-                tool_mean=v2_composite,
-                memory_mean=v2_composite,
+                composite=source_composite,
+                tool_mean=source_composite,
+                memory_mean=source_composite,
                 median_ms=500,
                 n=MIN_ELIGIBLE_CASES,
                 generated_at=_GEN_AT,
@@ -768,7 +836,7 @@ async def _seed_versioned_agent(
                     agent_id=agent.agent_id,
                     validator_hotkey=validator,
                     bench_version=_ROLLOUT_DESIRED,
-                    run_id=f"v4-{miner}-{index}",
+                    run_id=f"desired-{miner}-{index}",
                     seed=index,
                     composite=desired_composite,
                     tool_mean=desired_composite,
@@ -814,19 +882,19 @@ class TestThresholdGatedAuthority:
 
         t0 = datetime(2026, 6, 8, 12, 0, 0, tzinfo=UTC)
         await _open_rollout(session)
-        # Five agents; only four hold a full v4 quorum — one short of the flip.
+        # Five agents; only four hold a full v8 quorum — one short of the flip.
         for index in range(MIN_DESIRED_AUTHORITY_AGENTS):
             await _seed_versioned_agent(
                 session,
                 miner=_miner(index),
                 created_at=t0,
-                v2_composite=0.50 + index / 100,
+                source_composite=0.50 + index / 100,
                 desired_composite=(
                     0.80 if index < MIN_DESIRED_AUTHORITY_AGENTS - 1 else None
                 ),
             )
         ledger = await list_eligible_ledger(session)
-        # Every agent still ranked on v2, and the emission set is still full.
+        # Every agent still ranked on v7, and the emission set is still full.
         self._assert_single_version(ledger, _ROLLOUT_FROM)
         assert len(ledger) == MIN_DESIRED_AUTHORITY_AGENTS
         assert all(row.eligible for row in ledger)
@@ -846,7 +914,7 @@ class TestThresholdGatedAuthority:
                 session,
                 miner=_miner(index),
                 created_at=t0,
-                v2_composite=0.50 + index / 100,
+                source_composite=0.50 + index / 100,
                 desired_composite=0.70 + index / 100,
             )
         ledger = await list_eligible_ledger(session)
@@ -870,7 +938,7 @@ class TestThresholdGatedAuthority:
                 miner=_miner(index),
                 coldkey=("5SharedColdkey" if index < 2 else f"5Coldkey{index:048d}"),
                 created_at=t0,
-                v2_composite=0.50 + index / 100,
+                source_composite=0.50 + index / 100,
                 desired_composite=0.70 + index / 100,
             )
 
@@ -891,19 +959,19 @@ class TestThresholdGatedAuthority:
                 session,
                 miner=_miner(index),
                 created_at=t0,
-                v2_composite=0.50,
+                source_composite=0.50,
                 desired_composite=0.70,
             )
         laggard = await _seed_versioned_agent(
             session,
             miner=_miner(99),
             created_at=t0,
-            v2_composite=0.99,
+            source_composite=0.99,
             desired_composite=None,
         )
         ledger = await list_eligible_ledger(session)
-        # Intended: a v2-only agent has no authoritative row once the pool is on
-        # v4, however high its v2 composite was. That is why the threshold waits
+        # Intended: a v7-only agent has no authoritative row once the pool is on
+        # v8, however high its v7 composite was. That is why the threshold waits
         # for a full emission set first.
         self._assert_single_version(ledger, _ROLLOUT_DESIRED)
         assert laggard.agent_id not in {row.agent_id for row in ledger}
@@ -917,13 +985,13 @@ class TestThresholdGatedAuthority:
 
         t0 = datetime(2026, 6, 8, 12, 0, 0, tzinfo=UTC)
         await _open_rollout(session)
-        # Every agent has an incomplete v4 sample: 1/3 or 2/3 is not a quorum.
+        # Every agent has an incomplete v8 sample: 1/3 or 2/3 is not a quorum.
         for index in range(MIN_DESIRED_AUTHORITY_AGENTS + 2):
             await _seed_versioned_agent(
                 session,
                 miner=_miner(index),
                 created_at=t0,
-                v2_composite=0.50,
+                source_composite=0.50,
                 desired_composite=0.90,
                 desired_samples=samples,
             )
@@ -943,16 +1011,16 @@ class TestThresholdGatedAuthority:
                 session,
                 miner=_miner(index),
                 created_at=t0,
-                v2_composite=0.50,
+                source_composite=0.50,
                 desired_composite=0.70,
             )
-        # A full 3/3 v4 quorum on a SMOKE run (below the full-benchmark floor).
+        # A full 3/3 v8 quorum on a SMOKE run (below the full-benchmark floor).
         # It is unranked, so it must not be the agent that tips the ledger over.
         await _seed_versioned_agent(
             session,
             miner=_miner(50),
             created_at=t0,
-            v2_composite=0.50,
+            source_composite=0.50,
             desired_composite=0.95,
             desired_n=MIN_ELIGIBLE_CASES - 1,
         )
@@ -961,7 +1029,7 @@ class TestThresholdGatedAuthority:
             session,
             miner=_miner(51),
             created_at=t0,
-            v2_composite=0.50,
+            source_composite=0.50,
             desired_composite=0.95,
             status=AgentStatus.ATH_PENDING_REVIEW,
         )
@@ -976,14 +1044,14 @@ class TestThresholdGatedAuthority:
 
         t0 = datetime(2026, 6, 8, 12, 0, 0, tzinfo=UTC)
         await _open_rollout(session)
-        # Below the threshold, so the default read is pinned to v2 — but an
+        # Below the threshold, so the default read is pinned to v7 — but an
         # explicit historical view must still return exactly what it asked for.
         for index in range(MIN_DESIRED_AUTHORITY_AGENTS - 1):
             await _seed_versioned_agent(
                 session,
                 miner=_miner(index),
                 created_at=t0,
-                v2_composite=0.50,
+                source_composite=0.50,
                 desired_composite=0.70,
             )
         default_ledger = await list_eligible_ledger(session)
@@ -1003,9 +1071,12 @@ class TestThresholdGatedAuthority:
         self, session: AsyncSession
     ) -> None:
         t0 = datetime(2026, 6, 8, 12, 0, 0, tzinfo=UTC)
-        # No rollout row at all: desired_version is None and nothing changes.
+        # No OPEN rollout: ``_open_rollout`` is deliberately not called, so
+        # desired_version is None and nothing changes. The activated v6 -> v7 row
+        # the module fixture plants is terminal and does not make a transition
+        # open -- it only says which era the fleet is on.
         await _seed_versioned_agent(
-            session, miner=_miner(0), created_at=t0, v2_composite=0.50
+            session, miner=_miner(0), created_at=t0, source_composite=0.50
         )
         ledger = await list_eligible_ledger(session)
         self._assert_single_version(ledger, _ROLLOUT_FROM)

@@ -41,6 +41,7 @@ from ditto.db.models import (
     ValidatorHeartbeat,
 )
 from ditto.db.queries.benchmark_rollout import (
+    MIN_SCOREABLE_BENCH_VERSION,
     PRIORITY_COHORT_SIZE,
     DatasetPin,
     RolloutConflictError,
@@ -300,7 +301,16 @@ async def get_rollout_control(
             ),
         ) from exc
     active = int(state["active_version"])
-    targets = [contract.version for contract in contracts if contract.version > active]
+    # Above the active version AND at or above the floor. The second half is
+    # not redundant when the ledger has no activation on record: `active` then
+    # falls back to the floor, but a console that listed every shipped contract
+    # above it would still offer retired targets that the start path now
+    # refuses. Do not offer what cannot be started.
+    targets = [
+        contract.version
+        for contract in contracts
+        if contract.version > active and contract.version >= MIN_SCOREABLE_BENCH_VERSION
+    ]
     degraded: list[str] = []
     candidates: list[dict[str, object]] = []
     try:
@@ -437,6 +447,21 @@ async def start_rollout(
     """Seed the bounded historical rescore cohort and target datasets."""
     target = _parse_desired_version(desired_version)
     _require_confirmation(payload.confirmation, action="START", version=target)
+    # The retired-era floor, named before anything else touches the database.
+    #
+    # ``benchmark_rollout_desired_floor`` would refuse the INSERT anyway, but a
+    # CheckViolation escaping here is an unhandled IntegrityError -- a 500 on an
+    # operator action, with the constraint name as the only explanation. The
+    # forward-only guard below already answers this shape of mistake with a 409
+    # naming both versions, and so should this one.
+    if target < MIN_SCOREABLE_BENCH_VERSION:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"benchmark v{target} is retired; a rollout can only target "
+                f"v{MIN_SCOREABLE_BENCH_VERSION} or later"
+            ),
+        )
     from_version = await active_bench_version(session)
     if payload.expected_active_version != from_version:
         raise HTTPException(

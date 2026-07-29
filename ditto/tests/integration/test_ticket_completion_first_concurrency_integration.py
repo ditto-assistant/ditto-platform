@@ -13,10 +13,51 @@ from ditto.api_models.agent_status import AgentStatus
 from ditto.api_models.screener import SCREENING_POLICY_VERSION
 from ditto.api_models.ticket_status import TicketStatus
 from ditto.db import create_db_engine
-from ditto.db.models import Agent, EvaluationPayment, Score, ValidatorTicket
+from ditto.db.models import (
+    Agent,
+    BenchmarkDataset,
+    EvaluationPayment,
+    Score,
+    ValidatorTicket,
+)
 from ditto.db.queries.tickets import issue_ticket
 
 pytestmark = pytest.mark.integration
+
+# The era these queues are ordered in. Nothing here is about a benchmark
+# version -- the subject is FIFO order and owner convergence under real
+# concurrency -- and it used to be left to ``issue_ticket``'s default of 2. That
+# default is unreachable now: the ``validator_tickets`` floor trigger refuses a
+# lease under MIN_SCOREABLE_BENCH_VERSION, so the era is named, and naming the
+# live one brings its contract with it -- v7 requires a verified screened image
+# and a pinned dataset per candidate, hence ``_provisioned_agent``.
+_BENCH_VERSION = 7
+
+
+def _provisioned_agent(agent: Agent, *, at: datetime) -> Agent:
+    """Give ``agent`` the screened artifact the live contract demands.
+
+    Without it the agent is not a queue candidate at all and every assertion
+    below would pass vacuously against an empty queue.
+    """
+    agent.screened_image_sha256 = f"{agent.agent_id.int % (16**64):064x}"
+    agent.screened_image_size_bytes = 4096
+    agent.screened_image_id = "sha256:" + f"{agent.agent_id.int % (16**64):064x}"
+    agent.screened_image_ref = f"ditto-screen/{agent.agent_id}:latest"
+    agent.screened_image_upload_id = uuid4()
+    agent.screened_image_verified_at = at
+    return agent
+
+
+def _dataset(agent_id, *, seed: int) -> BenchmarkDataset:
+    """The era's pinned dataset, which the allocator requires per candidate."""
+    return BenchmarkDataset(
+        agent_id=agent_id,
+        bench_version=_BENCH_VERSION,
+        seed=seed,
+        sha256=f"{seed + 1:064x}",
+        run_size="full",
+    )
 
 
 async def test_same_validator_slots_walk_the_fifo_head_downwards() -> None:
@@ -43,26 +84,30 @@ async def test_same_validator_slots_walk_the_fifo_head_downwards() -> None:
     newest = uuid4()
     async with maker() as session, session.begin():
         await session.execute(text("TRUNCATE TABLE agents CASCADE"))
-        session.add_all(
+        rows: list[object] = []
+        for index, (agent_id, label, letter) in enumerate(
             [
-                Agent(
-                    agent_id=agent_id,
-                    miner_hotkey=f"completion-first-{label}",
-                    name=f"completion-first-{label}",
-                    sha256=letter * 64,
-                    status=AgentStatus.EVALUATING,
-                    screening_policy_version=SCREENING_POLICY_VERSION,
-                    created_at=now + timedelta(minutes=index),
-                )
-                for index, (agent_id, label, letter) in enumerate(
-                    [
-                        (oldest, "oldest", "a"),
-                        (newer, "newer", "b"),
-                        (newest, "newest", "c"),
-                    ]
-                )
+                (oldest, "oldest", "a"),
+                (newer, "newer", "b"),
+                (newest, "newest", "c"),
             ]
-        )
+        ):
+            rows.append(
+                _provisioned_agent(
+                    Agent(
+                        agent_id=agent_id,
+                        miner_hotkey=f"completion-first-{label}",
+                        name=f"completion-first-{label}",
+                        sha256=letter * 64,
+                        status=AgentStatus.EVALUATING,
+                        screening_policy_version=SCREENING_POLICY_VERSION,
+                        created_at=now + timedelta(minutes=index),
+                    ),
+                    at=now,
+                )
+            )
+            rows.append(_dataset(agent_id, seed=index))
+        session.add_all(rows)
 
     async def claim(slot_id: str):
         async with maker() as session, session.begin():
@@ -72,6 +117,7 @@ async def test_same_validator_slots_walk_the_fifo_head_downwards() -> None:
                 slot_id=slot_id,
                 now=now,
                 ttl=timedelta(minutes=30),
+                bench_version=_BENCH_VERSION,
                 completion_first=True,
             )
             return ticket.agent_id if ticket is not None else None
@@ -128,22 +174,26 @@ async def test_same_owner_partial_scores_converge_on_one_generation(
             )
             session.add_all(
                 [
-                    Agent(
-                        agent_id=agent_id,
-                        miner_hotkey=miner_hotkey,
-                        name=f"same-owner-partial-{index}",
-                        sha256=f"{index + 1:x}" * 64,
-                        status=AgentStatus.EVALUATING,
-                        screening_policy_version=SCREENING_POLICY_VERSION,
-                        created_at=now + timedelta(minutes=index),
+                    _provisioned_agent(
+                        Agent(
+                            agent_id=agent_id,
+                            miner_hotkey=miner_hotkey,
+                            name=f"same-owner-partial-{index}",
+                            sha256=f"{index + 1:x}" * 64,
+                            status=AgentStatus.EVALUATING,
+                            screening_policy_version=SCREENING_POLICY_VERSION,
+                            created_at=now + timedelta(minutes=index),
+                        ),
+                        at=now,
                     ),
+                    _dataset(agent_id, seed=index),
                     ValidatorTicket(
                         agent_id=agent_id,
                         validator_hotkey=f"prior-validator-{index}",
                         status=TicketStatus.SCORED,
                         issued_at=now,
                         deadline=now + timedelta(minutes=30),
-                        bench_version=2,
+                        bench_version=_BENCH_VERSION,
                         attempt_count=1,
                     ),
                     Score(
@@ -158,7 +208,7 @@ async def test_same_owner_partial_scores_converge_on_one_generation(
                         median_ms=100,
                         n=206,
                         details=None,
-                        bench_version=2,
+                        bench_version=_BENCH_VERSION,
                         generated_at=now,
                     ),
                 ]
@@ -216,6 +266,7 @@ async def test_same_owner_partial_scores_converge_on_one_generation(
                 validator_hotkey=validator_hotkey,
                 now=now,
                 ttl=timedelta(minutes=30),
+                bench_version=_BENCH_VERSION,
                 completion_first=completion_first,
             )
             return ticket.agent_id if ticket is not None else None

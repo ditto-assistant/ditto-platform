@@ -1,4 +1,19 @@
-"""Real-Postgres fleet-cap proof for retired-benchmark backfill."""
+"""Real-Postgres fleet-cap proof for source-era backfill during a rollout.
+
+This used to run the lane against a RETIRED era: an activated v6 -> v7 rollout
+with ``allow_retired_era_backfill=True``, the operator knob that re-opened v6
+after the fleet had left it. That knob is gone and the lane refuses a retired
+era outright, so the fixture it was built on cannot exist any more.
+
+The concurrency property it proved is not about retirement, though, and the lane
+still has a live case: while a rollout is OPEN, ``from_version`` is the version
+the fleet is actually scoring, and this lane keeps a source-version validator
+busy draining the source backlog instead of idling through the transition. The
+fleet cap is what stops that from eating the desired era's capacity. So the same
+assertions run against an open v7 -> v8 rollout with ``active_version`` equal to
+``from_version`` -- the only shape this lane serves now -- and nothing about the
+cap, the lock ordering or the resume path is weakened.
+"""
 
 from __future__ import annotations
 
@@ -10,8 +25,9 @@ import pytest
 from sqlalchemy import delete, func, select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
+from ditto.api_models import benchmark_contract as benchmark_contract_module
 from ditto.api_models.agent_status import AgentStatus
-from ditto.api_models.queue_policy_settings import PrevGenCarryoverSettings
+from ditto.api_models.benchmark_contract import BenchmarkContract
 from ditto.api_models.screener import SCREENING_POLICY_VERSION
 from ditto.api_models.ticket_status import TicketStatus
 from ditto.api_server.endpoints import validator as validator_endpoint
@@ -26,22 +42,49 @@ from ditto.db.models import (
 
 pytestmark = pytest.mark.integration
 
+# The open transition this lane rides. ``_SOURCE_VERSION`` is what the fleet is
+# scoring right now and what the backfill tickets are for; ``_DESIRED_VERSION``
+# is where the rollout is heading. Source must be at or above
+# MIN_SCOREABLE_BENCH_VERSION or the lane declines before any of the concurrency
+# machinery is reached -- that is the floor this file used to circumvent.
+#
+# Which forces the target one higher than anything shipped: v7 is both the floor
+# and the newest contract, and a rollout moves forward. ``_next_contract_shipped``
+# registers the target contract for the duration of the test, because the state
+# being reproduced is "the next transition has opened", and the transition after
+# the current one is the only remaining customer of this lane. Nothing under
+# test reads the contract's contents; the registration exists so that
+# ``benchmark_contract`` does not fail closed on a version the fixture names.
+_SOURCE_VERSION = 7
+_DESIRED_VERSION = 8
+
+
+@pytest.fixture
+def _next_contract_shipped(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(
+        benchmark_contract_module._CONTRACTS,
+        _DESIRED_VERSION,
+        BenchmarkContract(_DESIRED_VERSION, SCREENING_POLICY_VERSION, True),
+    )
+
 
 async def test_concurrent_source_backfill_respects_atomic_fleet_cap(
     monkeypatch: pytest.MonkeyPatch,
+    _next_contract_shipped: None,
 ) -> None:
     """Two replicas cannot both consume the sole permitted source-era slot."""
     engine = create_db_engine()
     maker = async_sessionmaker(engine, expire_on_commit=False)
     now = datetime.now(UTC).replace(microsecond=0)
+    # Open, not activated: while a transition is collecting, ``from_version`` is
+    # still the live era, which is exactly when this lane is legitimate.
     rollout = BenchmarkRollout(
         rollout_id=uuid4(),
-        from_version=6,
-        desired_version=7,
-        status="activated",
+        from_version=_SOURCE_VERSION,
+        desired_version=_DESIRED_VERSION,
+        status="collecting",
         cohort_size=5,
         created_at=now - timedelta(hours=1),
-        activated_at=now,
     )
 
     async def cohort_complete(*args: object, **kwargs: object) -> bool:
@@ -52,7 +95,7 @@ async def test_concurrent_source_backfill_respects_atomic_fleet_cap(
         heartbeat: ValidatorHeartbeat, *, now: datetime, version: int
     ) -> bool:
         del heartbeat, now
-        return version in (6, 7)
+        return version in (_SOURCE_VERSION, _DESIRED_VERSION)
 
     monkeypatch.setattr(validator_endpoint, "rollout_cohort_complete", cohort_complete)
     monkeypatch.setattr(
@@ -84,7 +127,7 @@ async def test_concurrent_source_backfill_respects_atomic_fleet_cap(
             session.add(
                 BenchmarkDataset(
                     agent_id=agent_id,
-                    bench_version=6,
+                    bench_version=_SOURCE_VERSION,
                     seed=index + 1,
                     sha256=f"{index + 5:x}" * 64,
                     run_size="full",
@@ -122,14 +165,11 @@ async def test_concurrent_source_backfill_respects_atomic_fleet_cap(
                 heartbeat=heartbeat,
                 validator_hotkey=validator_hotkey,
                 now=now,
-                # The rollout above has activated, so v6 is retired and the lane
-                # is off unless an operator asks for it. Asking for it is what
-                # this fixture needs, and it proves the knob re-enables the lane
-                # against a real Postgres rather than a mock.
-                active_version=7,
-                carryover_settings=PrevGenCarryoverSettings(
-                    allow_retired_era_backfill=True
-                ),
+                # Equal to ``from_version``, which is what "a rollout is open"
+                # means to this lane. The shipped carryover defaults are left
+                # alone deliberately: no setting is needed to reach the lane in
+                # this state, and none exists that could reach it in any other.
+                active_version=_SOURCE_VERSION,
                 artifact_mode="screened_only",
                 validator_running_benchmark=False,
                 slot_id="slot-0",
@@ -142,7 +182,7 @@ async def test_concurrent_source_backfill_respects_atomic_fleet_cap(
             select(func.count())
             .select_from(ValidatorTicket)
             .where(
-                ValidatorTicket.bench_version == 6,
+                ValidatorTicket.bench_version == _SOURCE_VERSION,
                 ValidatorTicket.status == TicketStatus.ISSUED,
                 ValidatorTicket.deadline > now,
             )
@@ -158,7 +198,7 @@ async def test_concurrent_source_backfill_respects_atomic_fleet_cap(
         session.add(
             ValidatorTicket(
                 agent_id=source_agent,
-                bench_version=6,
+                bench_version=_SOURCE_VERSION,
                 validator_hotkey="validator-existing",
                 status=TicketStatus.ISSUED,
                 issued_at=now,
@@ -192,7 +232,7 @@ async def test_concurrent_source_backfill_respects_atomic_fleet_cap(
         session.add(
             ValidatorTicket(
                 agent_id=source_agent,
-                bench_version=6,
+                bench_version=_SOURCE_VERSION,
                 validator_hotkey="validator-0",
                 status=TicketStatus.ISSUED,
                 issued_at=now,

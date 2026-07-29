@@ -37,6 +37,7 @@ from ditto.db.queries.benchmark_admission import (
     activated_rollout_for_version,
     benchmark_admission_predicate,
 )
+from ditto.db.queries.benchmark_rollout import MIN_SCOREABLE_BENCH_VERSION
 from ditto.db.queries.lease_liveness import maybe_force_expire_lease
 from ditto.db.queries.queue_order import (
     EMISSION_CONTENDER_COUNT,
@@ -223,7 +224,7 @@ async def issue_ticket(
     validator_hotkey: str,
     now: datetime,
     ttl: timedelta,
-    bench_version: int | None = 2,
+    bench_version: int | None = MIN_SCOREABLE_BENCH_VERSION,
     artifact_mode: Literal["legacy", "prefer_screened", "screened_only"] = "legacy",
     validator_running_benchmark: bool = False,
     submitted_at_or_after: datetime | None = None,
@@ -861,7 +862,7 @@ async def get_open_ticket(
     validator_hotkey: str,
     now: datetime,
     deadline: datetime,
-    bench_version: int | None = 2,
+    bench_version: int | None = MIN_SCOREABLE_BENCH_VERSION,
     slot_id: str | None = None,
     for_update: bool = False,
 ) -> ValidatorTicket | None:
@@ -968,7 +969,7 @@ async def mark_ticket_scored(
     *,
     agent_id: UUID,
     validator_hotkey: str,
-    bench_version: int = 2,
+    bench_version: int = MIN_SCOREABLE_BENCH_VERSION,
 ) -> None:
     """Mark the validator's ticket for the agent ``scored`` (slot spent). No-op
     if there is no ticket row (e.g. a legacy score predating ticketing)."""

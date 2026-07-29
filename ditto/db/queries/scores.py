@@ -410,7 +410,12 @@ async def upsert_score(
     *,
     agent_id: UUID,
     validator_hotkey: str,
-    bench_version: int = 2,
+    # No default. This writes the score ledger, and a defaulted era is exactly
+    # the bug the floor exists to make impossible: a caller that forgot the
+    # kwarg used to silently write v2, and would now take a CheckViolation from
+    # ``scores_bench_version_floor`` at runtime instead. Required means the
+    # mistake is a TypeError at the call site.
+    bench_version: int,
     run_id: str,
     seed: int,
     composite: float,

@@ -24,6 +24,7 @@ from ditto.api_server.endpoints import admin_benchmark_rollout
 from ditto.api_server.endpoints.admin_benchmark_rollout import (
     MINIMUM_ROLLOUT_START_VALIDATORS,
 )
+from ditto.api_server.inference_routing import benchmark_model
 from ditto.api_server.middleware.error_envelope import (
     ERROR_CODE_HTTP_EXCEPTION,
     ERROR_CODE_UNHANDLED,
@@ -31,23 +32,35 @@ from ditto.api_server.middleware.error_envelope import (
 from ditto.db.models import (
     Agent,
     BenchmarkRollout,
+    InferenceProviderRoute,
+    InferenceRoutingPolicy,
     Score,
     ValidatorHeartbeat,
 )
 from ditto.db.queries.benchmark_rollout import (
+    MIN_SCOREABLE_BENCH_VERSION,
     DatasetPin,
     RolloutSnapshotMember,
     create_rollout_snapshot,
+)
+from ditto.tests.legacy_era import (
+    grandfather_active_era,
+    retired_era_writes_allowed,
 )
 
 pytestmark = pytest.mark.asyncio
 
 _TOKEN = "test-admin-token-at-least-32-characters"
 _HEADERS = {"Authorization": f"Bearer {_TOKEN}"}
-_TARGET = 4
-# The message the deployed generate-service actually returned when the v4
-# rollout was started from the operator console against a datagen release
-# that only ships v2 and v3.
+# The rollout these tests start. It has to be v7: the retired-era floor refuses
+# any rollout row whose target is below it, so v4 -- the version this scenario
+# was originally written against -- can no longer be opened at all. Nothing here
+# is about v4 specifically; it is the "some target ahead of the active version"
+# slot, and v7 is the only value that still fills it.
+_TARGET = 7
+# The message the deployed generate-service actually returned when the rollout
+# was started from the operator console against a datagen release that only
+# ships v2 and v3. Quoted verbatim, so it keeps naming the versions it named.
 _LAGGING = "bench_version query param required (supported: 2, 3)"
 
 
@@ -76,8 +89,30 @@ def instrumented_maker(
     return async_sessionmaker(engine, expire_on_commit=False), statements
 
 
+_V7_MODEL = benchmark_model(_TARGET)
+_MANIFEST = "c" * 64
+
+
 def _install(app: FastAPI, maker: async_sessionmaker[AsyncSession]) -> None:
-    app.state.config = replace(app.state.config, admin_api_token=_TOKEN)
+    """Point the app at the test database with a v7-ready inference proxy.
+
+    The proxy settings are part of the fixture now because the target is v7:
+    starting a v7 rollout is gated on an enabled proxy holding a provider key
+    and a reviewed calibration manifest, and the default test config has none
+    of the three. Leaving them unset would make every start below fail on that
+    gate instead of on the generate-service behaviour under test.
+    """
+    app.state.config = replace(
+        app.state.config,
+        admin_api_token=_TOKEN,
+        inference_proxy=replace(
+            app.state.config.inference_proxy,
+            enabled=True,
+            openrouter_api_key="test-openrouter-key",
+            routing_mode="adaptive",
+            reviewed_calibration_manifest_sha256=_MANIFEST,
+        ),
+    )
 
     async def _session() -> AsyncIterator[AsyncSession]:
         async with maker() as session:
@@ -112,6 +147,11 @@ class _StubGenerator:
 
 def _capabilities(now: datetime) -> tuple[dict[str, Any], dict[str, Any]]:
     revision = "a" * 40
+    # A v7-capable validator has to advertise more than the version number:
+    # ticket inference, signed score quorum and a calibration manifest naming
+    # the routes it can actually reach. Without them ``verified_scorer_for_version``
+    # counts this heartbeat as incapable and the start fails on the capacity
+    # gate rather than on anything these tests are about.
     capabilities = {
         "screened_images": True,
         "require_screened_image": False,
@@ -119,6 +159,8 @@ def _capabilities(now: datetime) -> tuple[dict[str, Any], dict[str, Any]]:
         "full_stack_managed": False,
         "stack_updater": False,
         "sandbox_egress_restricted": True,
+        "ticket_inference": True,
+        "signed_score_quorum": True,
         "executor_isolation": "privileged_dind",
         "scorer_benchmarks": {
             "status": "fresh_verified",
@@ -126,6 +168,16 @@ def _capabilities(now: datetime) -> tuple[dict[str, Any], dict[str, Any]]:
             "observed_at": int(now.timestamp()),
             "software_version": "1.3.0",
             "source_revision": revision,
+            "v7_calibration": {
+                "manifest_sha256": _MANIFEST,
+                "supported_routes": [
+                    {
+                        "provider": "Groq",
+                        "profile_revision": "openrouter-route-test-v1",
+                        "model": _V7_MODEL,
+                    }
+                ],
+            },
         },
     }
     stack = {
@@ -154,7 +206,13 @@ def _capabilities(now: datetime) -> tuple[dict[str, Any], dict[str, Any]]:
 def _add_cohort_agent(
     session: AsyncSession, *, position: int, composite: float, now: datetime
 ) -> RolloutSnapshotMember:
-    """Add one SCORED agent with a full v2 quorum, top-five eligible."""
+    """Add one SCORED agent with a full v2 quorum, top-five eligible.
+
+    The quorum is v2 because that is the era a rollout starts FROM here, and it
+    is below the retired-era floor. Callers must therefore seed inside
+    ``retired_era_writes_allowed``: these are the inherited rows production
+    grandfathered, and they are what the cohort is ranked out of.
+    """
     agent_id = uuid4()
     miner = f"miner-{position}"
     digest = f"{position:x}" * 64
@@ -198,12 +256,79 @@ def _add_cohort_agent(
     )
 
 
+def _add_ready_route(session: AsyncSession, now: datetime) -> None:
+    """One healthy, reviewed-calibration route for the v7 consensus model.
+
+    The second half of the v7 start gate: past the config check the handler
+    still requires a live route whose calibration manifest is the reviewed one.
+    Same shape the rollout-query tests use, pinned to the manifest ``_install``
+    configures so the two halves agree.
+    """
+    session.add(
+        InferenceRoutingPolicy(
+            model=_V7_MODEL,
+            enabled=True,
+            speed_weight=0.65,
+            cost_weight=0.25,
+            exploration_weight=0.10,
+            exploration_ticket_budget=3,
+            min_tool_accuracy=0.55,
+            min_composite=0.15,
+            min_calibration_samples=20,
+            max_error_rate=0.25,
+            max_timeout_rate=0.15,
+            cooldown_seconds=30,
+            ewma_alpha=0.20,
+            updated_at=now,
+        )
+    )
+    session.add(
+        InferenceProviderRoute(
+            model=_V7_MODEL,
+            provider="Groq",
+            profile_revision="openrouter-route-test-v1",
+            status="healthy",
+            calibration_status="eligible",
+            calibration_tool_accuracy=0.65,
+            calibration_composite=0.20,
+            calibration_sample_count=60,
+            calibration_manifest_sha256=_MANIFEST,
+            ewma_error_rate=0,
+            ewma_timeout_rate=0,
+            sample_count=60,
+            selected_ticket_count=0,
+            exploration_ticket_count=0,
+            discovered_at=now,
+            last_observed_at=now,
+            updated_at=now,
+        )
+    )
+
+
 async def _seed_start_ready(
     maker: async_sessionmaker[AsyncSession], now: datetime
 ) -> list[RolloutSnapshotMember]:
-    """Seed the five-miner cohort and just enough capable validators to start."""
+    """Seed the five-miner cohort and just enough capable validators to start.
+
+    Also records the activation that makes v2 -- the era this cohort is ranked
+    out of -- the one actually in force. ``active_bench_version`` answers from
+    durable authority decisions and, with none on record, answers the FLOOR.
+    That is the honest reply for a ledger with no activation history, but it
+    leaves an operator start with nowhere to go: ``_TARGET`` is 7 and so is the
+    floor, so ``expected_active_version`` never matches and the forward-only
+    guard would refuse 7 -> 7 even if it did.
+
+    A grandfathered pre-floor rollout row is a state the database legitimately
+    holds -- the floor is ``NOT VALID`` precisely so production keeps its
+    activation history -- and it is the shape production was in before the v7
+    transition. Re-point this at the 7 -> 8 transition once the v8 contract
+    lands (ditto-assistant/ditto-platform#513); only then is there a legal
+    forward target above the floor.
+    """
     capabilities, stack = _capabilities(now)
-    async with maker() as session, session.begin():
+    async with maker() as session, retired_era_writes_allowed(session), session.begin():
+        await grandfather_active_era(session, version=2, now=now - timedelta(days=30))
+        _add_ready_route(session, now)
         members = [
             _add_cohort_agent(
                 session, position=position, composite=0.5 + position / 100, now=now
@@ -215,7 +340,10 @@ async def _seed_start_ready(
                 ValidatorHeartbeat(
                     validator_hotkey=f"validator-{index}",
                     software_version="1.0.0",
-                    protocol_version=8,
+                    # Protocol 12 is the wire-format floor for advertising v7 at
+                    # all; a protocol-8 heartbeat is rejected before its
+                    # capabilities are even read.
+                    protocol_version=12,
                     code_digest="d" * 64,
                     state="polling",
                     first_seen_at=now,
@@ -230,9 +358,21 @@ async def _seed_start_ready(
 
 
 async def _rollout_count(maker: async_sessionmaker[AsyncSession]) -> int:
+    """How many rollouts exist for the transition under test.
+
+    Scoped to ``_TARGET`` rather than counting the whole table: the fixture also
+    seeds the grandfathered activation that puts the ledger on v2, and "did the
+    start leave a rollout behind" is a question about the v7 transition, not
+    about the history it starts from.
+    """
     async with maker() as session:
         return int(
-            await session.scalar(select(func.count(BenchmarkRollout.rollout_id))) or 0
+            await session.scalar(
+                select(func.count(BenchmarkRollout.rollout_id)).where(
+                    BenchmarkRollout.desired_version == _TARGET
+                )
+            )
+            or 0
         )
 
 
@@ -258,9 +398,18 @@ async def test_control_discovery_is_authenticated_read_only_and_dynamic(
     response = await client.get("/api/v1/admin/benchmark-rollout", headers=_HEADERS)
     assert response.status_code == 200, response.text
     body = response.json()
-    assert body["active_version"] == 2
+    # Nothing has activated in this database, so the ledger's honest answer is
+    # the floor rather than the version the subnet started on.
+    assert body["active_version"] == MIN_SCOREABLE_BENCH_VERSION
     assert body["status"] == "inactive"
-    assert body["available_target_versions"] == [3, 4, 5, 6, 7]
+    # Nothing is offered. A target must be both above the active version and at
+    # or above the floor, and with v7 shipped as the newest contract those two
+    # meet at exactly one era -- the one already in force. The console cannot
+    # suggest what ``start_rollout`` would refuse, and until the v8 contract
+    # lands (ditto-assistant/ditto-platform#513) there is nothing to suggest.
+    assert body["available_target_versions"] == []
+    # Still derived from the shipped registry, which is what "dynamic" means
+    # here: the floor filters what may be STARTED, not what exists.
     assert [contract["version"] for contract in body["contracts"]] == [2, 3, 4, 5, 6, 7]
     assert all(
         contract["capable_validator_count"] == 0 for contract in body["contracts"]
@@ -343,6 +492,24 @@ async def test_control_degrades_the_slow_section_instead_of_hanging(
     is the test's own speed knob, not a property of the endpoint.
     """
     _install(app, session_maker)
+    # There has to be a candidate target for the qualification loop to be slow
+    # ABOUT. Candidates are the shipped contracts above the active version and
+    # at or above the floor, so on an empty database -- where the ledger
+    # answers the floor -- that list is empty, the loop never runs and the stub
+    # below is never called: the test would pass while proving nothing.
+    #
+    # Putting the ledger on v6, through the grandfathered activation that put
+    # it there in production, leaves exactly one candidate (v7) to hang on.
+    async with (
+        session_maker() as session,
+        retired_era_writes_allowed(session),
+        session.begin(),
+    ):
+        await grandfather_active_era(
+            session,
+            version=_TARGET - 1,
+            now=datetime.now(UTC).replace(microsecond=0) - timedelta(days=30),
+        )
 
     async def _slow(*_args: object, **_kwargs: object) -> dict[str, object]:
         await asyncio.sleep(60)
@@ -356,8 +523,10 @@ async def test_control_degrades_the_slow_section_instead_of_hanging(
     assert response.status_code == 200, response.text
     body = response.json()
     # The durable rollout status -- the part the operator came for -- survives.
-    assert body["active_version"] == 2
-    assert body["status"] == "inactive"
+    # ``activated`` rather than ``inactive`` because the seeded authority is a
+    # real rollout row: nothing is open, and the last transition finished.
+    assert body["active_version"] == _TARGET - 1
+    assert body["status"] == "activated"
     assert [contract["version"] for contract in body["contracts"]] == [2, 3, 4, 5, 6, 7]
     # Fail closed on what could not be proven: no candidate is offered for
     # activation, and the omission is named rather than mistaken for "none".
@@ -476,7 +645,11 @@ async def test_reposting_an_existing_rollout_also_502s_on_a_lagging_generator(
     _install(app, session_maker)
     now = datetime.now(UTC).replace(microsecond=0)
     members = await _seed_start_ready(session_maker, now)
-    async with session_maker() as session, session.begin():
+    async with (
+        session_maker() as session,
+        retired_era_writes_allowed(session),
+        session.begin(),
+    ):
         await create_rollout_snapshot(
             session,
             members=members,

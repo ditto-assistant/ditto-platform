@@ -863,8 +863,15 @@ class Score(Base):
     validator_hotkey: Mapped[str] = mapped_column(Text, nullable=False)
     """SS58 hotkey of the reporting validator. PK part 2."""
 
-    bench_version: Mapped[int] = mapped_column(Integer, nullable=False, default=2)
-    """Benchmark semantics this signed score and its dataset were produced under."""
+    bench_version: Mapped[int] = mapped_column(Integer, nullable=False, default=7)
+    """Benchmark semantics this signed score and its dataset were produced under.
+
+    Defaults to the floor, not to 2. The old default predated any floor and is
+    now guaranteed to violate ``scores_bench_version_floor``, so it could only
+    ever have produced a runtime IntegrityError. Every production caller passes
+    this explicitly -- ``upsert_score`` requires it -- so the default now serves
+    only fixtures that do not care which era they are in.
+    """
 
     run_id: Mapped[str] = mapped_column(Text, nullable=False)
     """Scoring-engine run identifier (part of the value the signature is bound to)."""
@@ -939,6 +946,12 @@ class Score(Base):
         CheckConstraint("n >= 0", name="scores_n_check"),
         CheckConstraint("median_ms >= 0", name="scores_median_ms_check"),
         CheckConstraint("bench_version > 0", name="scores_bench_version_positive"),
+        # The retired-era floor. Declared NOT VALID in the migration: the
+        # historical v2-v6 rows stay readable, queryable and byte-identical,
+        # while every INSERT and UPDATE from here on must be v7 or later. This
+        # is the guarantee that no application bug can score a retired era --
+        # see MIN_SCOREABLE_BENCH_VERSION.
+        CheckConstraint("bench_version >= 7", name="scores_bench_version_floor"),
         Index("scores_agent_id_idx", "agent_id"),
         # Dashboard/ledger reads select one benchmark era before grouping or
         # ranking scores.  Keep the aggregate columns in the index so the
@@ -1036,6 +1049,12 @@ class ConfirmationScore(Base):
         ),
         CheckConstraint(
             "bench_version > 0", name="confirmation_scores_bench_version_positive"
+        ),
+        # Same retired-era floor as ``scores``, and for the same reason: this is
+        # a score ledger too. Also NOT VALID, so the existing v6 confirmation
+        # rows survive untouched.
+        CheckConstraint(
+            "bench_version >= 7", name="confirmation_scores_bench_version_floor"
         ),
         CheckConstraint("seed >= 0", name="confirmation_scores_seed_check"),
         Index("confirmation_scores_agent_version_idx", "agent_id", "bench_version"),
@@ -1348,6 +1367,15 @@ class BenchmarkRollout(Base):
         CheckConstraint(
             "desired_version > from_version", name="benchmark_rollout_forward"
         ),
+        # No new rollout may ever target a retired era. Combined with
+        # ``benchmark_rollout_forward`` above (desired > from) this also pins
+        # ``from_version`` at 6 or higher for any NEW row, so the only rollout
+        # this table can still open is one that ends at v7 or later.
+        #
+        # NOT VALID in the migration: the six historical rows -- including the
+        # v6->v7 transition whose ``from_version`` is 6 -- stay exactly as they
+        # are, because they are the audit trail of how the fleet got here.
+        CheckConstraint("desired_version >= 7", name="benchmark_rollout_desired_floor"),
         CheckConstraint(
             # Retain the historical storage bound for rollout snapshots created
             # before new transitions were narrowed to ten members.
@@ -2010,7 +2038,12 @@ class ValidatorTicket(Base):
     deadline: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False)
     """When an unscored ticket expires and its slot re-opens (UTC)."""
 
-    bench_version: Mapped[int] = mapped_column(Integer, nullable=False, default=2)
+    # Defaulted to the floor for the same reason as ``Score.bench_version``: a
+    # default of 2 is a value this table's own
+    # ``validator_tickets_bench_version_floor`` trigger refuses, so it could
+    # only ever produce a runtime error at INSERT. Every production caller
+    # passes this explicitly.
+    bench_version: Mapped[int] = mapped_column(Integer, nullable=False, default=7)
     """Benchmark version whose retry budget this ticket consumes."""
 
     seed: Mapped[int | None] = mapped_column(BigInteger, nullable=True)

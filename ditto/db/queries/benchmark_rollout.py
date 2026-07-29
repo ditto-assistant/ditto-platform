@@ -49,6 +49,21 @@ DEFAULT_BENCH_VERSION = 2
 # follow DEFAULT_BENCH_VERSION, or a future rollout-from bump would silently
 # reinterpret every legacy submission as a newer benchmark.
 LEGACY_BENCH_VERSION = 2
+# The oldest benchmark era that may still produce a score. v2-v6 are RETIRED:
+# their datasets, harness contract and model relay are gone, no quorum will ever
+# be assembled on them again, and nothing in the ledger consumes their scores.
+#
+# This is a FLOOR, not a mirror of the active version. It is raised by hand when
+# an era is retired for good, never automatically on activation -- a rollout is
+# open precisely so ``from_version`` keeps scoring while the fleet migrates, and
+# pinning this to ``active_bench_version()`` would kill that lane mid-transition.
+#
+# Enforced in the database (``scores_bench_version_floor``,
+# ``confirmation_scores_bench_version_floor``, ``benchmark_rollout_desired_floor``
+# and the ``validator_tickets_bench_version_floor`` insert trigger), so an
+# application bug cannot write beneath it. Keep this constant and the migration
+# in step: the database is the authority, this is the value the API rejects with.
+MIN_SCOREABLE_BENCH_VERSION = 7
 # Compatibility name for callers/tests that need the newest *shipped* contract.
 # This is discovery metadata only: it no longer opens or selects a rollout.
 CANARY_BENCH_VERSION = latest_benchmark_contract().version
@@ -635,7 +650,18 @@ async def persisted_active_bench_version(session: AsyncSession) -> int:
         return int(selected.desired_version)
     if activated is not None:
         return int(activated.desired_version)
-    return DEFAULT_BENCH_VERSION
+    # Nothing durable on record: a fresh deployment, or a ledger restored
+    # without its rollout history. The honest answer is the FLOOR, not
+    # ``DEFAULT_BENCH_VERSION``.
+    #
+    # That constant is a statement about the beginning of this subnet's history
+    # and it is frozen at 2 for the same reason ``LEGACY_BENCH_VERSION`` is. It
+    # stopped being a usable answer to "what era are we scoring" the moment v2
+    # was retired: ``request_job`` would take it at face value, cut a v2 lease,
+    # and the ``validator_tickets_bench_version_floor`` trigger would refuse the
+    # insert -- an unhandled IntegrityError surfacing as a 500 on the job-claim
+    # path rather than a 204.
+    return MIN_SCOREABLE_BENCH_VERSION
 
 
 async def open_rollout(
@@ -961,7 +987,11 @@ async def create_rollout_snapshot(
     members: Sequence[RolloutSnapshotMember],
     datasets: dict[UUID, DatasetPin],
     now: datetime,
-    from_version: int = DEFAULT_BENCH_VERSION,
+    # No default. A rollout's source era is never "whatever the subnet started
+    # on" -- it is the era the fleet is on right now, which the sole caller
+    # already passes. Defaulting it to 2 could only ever produce a nonsensical
+    # 2 -> target transition, and the floor gives that no useful meaning.
+    from_version: int,
     desired_version: int = CANARY_BENCH_VERSION,
     rescore_cohort_target: int = DEFAULT_RESCORE_COHORT_SIZE,
     priority_cohort_target: int = PRIORITY_COHORT_SIZE,
@@ -1669,8 +1699,16 @@ async def rollout_state(
             "desired_version": active_version,
             "status": "inactive",
             "capability_bench_version": version,
+            # The era the fleet is ACTUALLY on, not DEFAULT_BENCH_VERSION.
+            #
+            # This is the "when do weights switch?" telemetry, and with no
+            # rollout open it was counting quorum agents at v2 while the fleet
+            # scored v7 -- answering the question about an era nobody is in.
+            # The floor makes that unambiguous rather than merely stale: nothing
+            # new can ever be written at v2, so the count could only shrink
+            # toward the historical remainder.
             "ranked_quorum_agents": await count_ranked_quorum_agents(
-                session, bench_version=DEFAULT_BENCH_VERSION
+                session, bench_version=active_version
             ),
             "min_ranked_quorum_agents": MIN_DESIRED_AUTHORITY_AGENTS,
             "canary_capable_validator_count": capable_count,

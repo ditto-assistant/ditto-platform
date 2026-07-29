@@ -4383,9 +4383,26 @@ async def agent_dataset(
         raise HTTPException(
             status_code=404, detail="no revealable dataset for this agent"
         )
+    # The era this agent actually ran, not a default.
+    #
+    # `fetch_dataset` used to default `bench_version` to 2, and this call
+    # omitted it -- so the reveal served the v2 dataset for every finalized
+    # agent regardless of the benchmark it was scored under. Silent, because a
+    # v2 dataset is a perfectly well-formed artifact; it just is not this
+    # agent's. The retired-era floor made the default unreachable and the bug
+    # visible.
+    #
+    # The agent's own scores are the authority on which era finalized it, so
+    # take the newest of them. A submission reaching this endpoint is finalized
+    # and therefore has scores; fall back to the active era rather than assume.
+    dataset_bench_version = (
+        max(score.bench_version for score in row.scores)
+        if row.scores
+        else await active_bench_version(session)
+    )
     try:
         artifact, sha = await generator.fetch_dataset(
-            row.dataset_seed, row.dataset_run_size
+            row.dataset_seed, row.dataset_run_size, dataset_bench_version
         )
     except DataPipelineError as e:
         raise HTTPException(

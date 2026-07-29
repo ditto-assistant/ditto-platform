@@ -34,6 +34,8 @@ from ditto.db.models import (
     SubmissionRetirement,
     ValidatorTicket,
 )
+from ditto.db.queries.benchmark_rollout import MIN_SCOREABLE_BENCH_VERSION
+from ditto.tests.legacy_era import retired_era_writes_allowed
 
 _T0 = datetime(2026, 7, 25, 12, tzinfo=UTC)
 _ROLLOUT_START = _T0 - timedelta(days=3)
@@ -66,6 +68,48 @@ def _install(app: FastAPI, maker: async_sessionmaker[AsyncSession]) -> None:
 
 
 async def _seed(
+    maker: async_sessionmaker[AsyncSession],
+    *,
+    name: str,
+    bench_version: int,
+    score_count: int,
+    retired: bool = False,
+    created_at: datetime | None = None,
+) -> UUID:
+    """Seed one submission, lifting the bench floor for the closed generation.
+
+    Everything this module asserts is about a submission whose era has closed,
+    so the v6 scores and tickets it needs are exactly the writes the
+    bench-version floor now refuses. Production is not in that position: its v6
+    rows were written before the floor and the ``NOT VALID`` constraints leave
+    them alone. ``retired_era_writes_allowed`` reproduces that -- the retired
+    rows land and are then grandfathered -- so what these tests read back is the
+    ledger a miner with a closed generation actually has.
+    """
+    if bench_version < MIN_SCOREABLE_BENCH_VERSION:
+        async with (
+            maker() as floor_session,
+            retired_era_writes_allowed(floor_session),
+        ):
+            return await _seed_rows(
+                maker,
+                name=name,
+                bench_version=bench_version,
+                score_count=score_count,
+                retired=retired,
+                created_at=created_at,
+            )
+    return await _seed_rows(
+        maker,
+        name=name,
+        bench_version=bench_version,
+        score_count=score_count,
+        retired=retired,
+        created_at=created_at,
+    )
+
+
+async def _seed_rows(
     maker: async_sessionmaker[AsyncSession],
     *,
     name: str,

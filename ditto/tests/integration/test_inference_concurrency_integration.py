@@ -30,8 +30,15 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from ditto.api_models.agent_status import AgentStatus
 from ditto.api_models.ticket_status import TicketStatus
 from ditto.api_server.config import InferenceProxyConfig
+from ditto.api_server.inference_routing import benchmark_model
 from ditto.db import create_db_engine
-from ditto.db.models import Agent, InferenceGrant, ValidatorTicket
+from ditto.db.models import (
+    Agent,
+    InferenceGrant,
+    InferenceProviderRoute,
+    InferenceRoutingPolicy,
+    ValidatorTicket,
+)
 from ditto.db.queries.inference import (
     activate_inference_grant,
     begin_inference_request,
@@ -42,6 +49,65 @@ from ditto.db.queries.inference import (
 pytestmark = pytest.mark.integration
 
 _BARRIER_TIMEOUT = 5.0
+# The era the leases below are for. It used to be 5, chosen for no reason; the
+# ``validator_tickets`` floor trigger refuses to create a lease under
+# MIN_SCOREABLE_BENCH_VERSION now, so it is the live era -- which also means the
+# grant is minted against a real dynamic route (see ``_seed_route``).
+_BENCH_VERSION = 7
+_CHAT_MODEL = benchmark_model(_BENCH_VERSION)
+
+
+async def _seed_route(session) -> None:
+    """The calibrated route a v7 grant binds at mint time.
+
+    ``ensure_inference_grant`` refuses to mint for v7 or later without one:
+    there is no static provider any more. It is a precondition of every grant
+    here rather than anything these tests assert, and it is fleet-wide, so
+    seeding is idempotent -- each test mints two grants.
+    """
+    now = datetime.now(UTC)
+    if await session.get(InferenceRoutingPolicy, _CHAT_MODEL) is not None:
+        return
+    session.add(
+        InferenceRoutingPolicy(
+            model=_CHAT_MODEL,
+            enabled=True,
+            speed_weight=0.65,
+            cost_weight=0.25,
+            exploration_weight=0.10,
+            exploration_ticket_budget=3,
+            min_tool_accuracy=0.55,
+            min_composite=0.15,
+            min_calibration_samples=20,
+            max_error_rate=0.25,
+            max_timeout_rate=0.15,
+            cooldown_seconds=30,
+            ewma_alpha=0.20,
+            updated_at=now,
+        )
+    )
+    session.add(
+        InferenceProviderRoute(
+            model=_CHAT_MODEL,
+            provider="calibrated-provider",
+            profile_revision="openrouter-route-fixture-v1",
+            status="healthy",
+            calibration_status="eligible",
+            prompt_price_per_token=0.00000003,
+            completion_price_per_token=0.00000013,
+            ewma_tokens_per_second=150,
+            ewma_latency_ms=900,
+            ewma_error_rate=0,
+            ewma_timeout_rate=0,
+            calibration_tool_accuracy=0.65,
+            calibration_composite=0.20,
+            calibration_sample_count=60,
+            calibration_manifest_sha256="ab" * 32,
+            sample_count=20,
+            discovered_at=now,
+        )
+    )
+    await session.flush()
 
 
 def _config() -> InferenceProxyConfig:
@@ -52,7 +118,7 @@ def _config() -> InferenceProxyConfig:
         public_base_url="https://platform.example",
         openrouter_api_key="test-key",
         upstream_url="https://openrouter.ai/api/v1/chat/completions",
-        allowed_models=("qwen/qwen3-32b",),
+        allowed_models=(_CHAT_MODEL,),
         provider="nebius",
         routing_mode="adaptive",
         request_budget=1000,
@@ -104,10 +170,11 @@ async def _seed_grant(maker, *, validator_hotkey: str, config) -> tuple[UUID, st
             status=TicketStatus.ISSUED,
             issued_at=now,
             deadline=now + timedelta(minutes=20),
-            bench_version=5,
+            bench_version=_BENCH_VERSION,
             attempt_count=1,
         )
         session.add_all([agent, ticket])
+        await _seed_route(session)
         await session.flush()
         grant = await ensure_inference_grant(session, ticket=ticket, config=config)
         assert grant is not None
@@ -154,7 +221,7 @@ async def test_reservations_on_different_grants_are_not_serialized() -> None:
                     grant_id=grant_id,
                     nonce=uuid4(),
                     bearer=bearer,
-                    model="qwen/qwen3-32b",
+                    model=_CHAT_MODEL,
                     token_reservation=16,
                     now=datetime.now(UTC),
                     config=config,
@@ -197,7 +264,7 @@ async def test_reservations_on_one_grant_serialize_and_respect_the_budget() -> N
                     grant_id=grant_id,
                     nonce=uuid4(),
                     bearer=bearer,
-                    model="qwen/qwen3-32b",
+                    model=_CHAT_MODEL,
                     token_reservation=100,
                     now=datetime.now(UTC),
                     config=config,
@@ -243,7 +310,7 @@ async def test_revocation_and_reservation_on_one_grant_are_mutually_exclusive() 
                     grant_id=grant_id,
                     nonce=uuid4(),
                     bearer=bearer,
-                    model="qwen/qwen3-32b",
+                    model=_CHAT_MODEL,
                     token_reservation=16,
                     now=datetime.now(UTC),
                     config=config,
