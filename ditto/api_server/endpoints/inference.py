@@ -795,7 +795,11 @@ def _validate_request_schema(payload: dict[str, Any]) -> None:
             "system": {"role", "content"},
             "user": {"role", "content"},
             "assistant": {"role", "content", "tool_calls"},
-            "tool": {"role", "content", "tool_call_id"},
+            # ``name`` is an optional legacy/OpenAI-compatible annotation.
+            # Some otherwise valid harnesses include it redundantly alongside
+            # ``tool_call_id``. Accept it at the caller boundary, validate it
+            # below, and remove it from the locked provider payload.
+            "tool": {"role", "content", "tool_call_id", "name"},
         }.get(role)
         if allowed is None or set(message) - allowed:
             raise HTTPException(status_code=400, detail="invalid message")
@@ -813,6 +817,12 @@ def _validate_request_schema(payload: dict[str, Any]) -> None:
         )
         if content is not None and not isinstance(content, str) and not text_parts:
             raise HTTPException(status_code=400, detail="text content only")
+        if (
+            role == "tool"
+            and "name" in message
+            and (not isinstance(message["name"], str) or not message["name"])
+        ):
+            raise HTTPException(status_code=400, detail="invalid tool name")
         tool_calls = message.get("tool_calls", [])
         if not isinstance(tool_calls, list):
             raise HTTPException(status_code=400, detail="invalid tool calls")
@@ -947,6 +957,18 @@ def _locked_upstream_payload(
     ):
         upstream.pop(field, None)
     upstream["model"] = model
+    # A tool result is unambiguously correlated by ``tool_call_id``. Some
+    # OpenAI-compatible clients also send the legacy/redundant ``name`` field,
+    # while not every upstream accepts it. Keep the gateway compatible without
+    # changing model-visible content by removing only that annotation.
+    messages = upstream.get("messages")
+    if isinstance(messages, list):
+        upstream["messages"] = [
+            {key: value for key, value in message.items() if key != "name"}
+            if isinstance(message, dict) and message.get("role") == "tool"
+            else message
+            for message in messages
+        ]
     upstream["max_tokens"] = max_tokens
     upstream["n"] = 1
     upstream["stream"] = False
