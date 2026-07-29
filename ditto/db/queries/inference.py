@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import secrets
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import TYPE_CHECKING
@@ -38,6 +39,66 @@ Bumped when what gets *recorded* as a grant's token usage changes, so that a
 total is never silently compared across two different meters. See
 ``InferenceGrant.usage_accounting_version``.
 """
+
+
+@dataclass(frozen=True)
+class LeaseModelUsage:
+    """What one lease actually spent on the language model.
+
+    Read off the grant bound to a single ticket lease, which is where the
+    platform's own inference proxy books usage as it charges requests. The
+    validator never sees these numbers and cannot report them, so this is the
+    authoritative -- and unspoofable-by-the-validator -- account of whether a
+    run used the model at all.
+
+    ``chat_*`` counts the reader model. Embeddings are tracked separately by
+    the grant and deliberately excluded: a retrieval-only agent embeds
+    heavily, so folding embeddings in would erase exactly the signal this
+    exists to measure.
+    """
+
+    chat_calls: int
+    prompt_tokens: int
+    completion_tokens: int
+    accounting_version: int
+
+    @property
+    def total_tokens(self) -> int:
+        return self.prompt_tokens + self.completion_tokens
+
+
+async def get_lease_model_usage(
+    session: AsyncSession,
+    *,
+    ticket: ValidatorTicket,
+) -> LeaseModelUsage | None:
+    """Return the model spend booked against ``ticket``'s lease, if any.
+
+    Keyed on the same four columns as the ``inference_grants_ticket_lease``
+    unique constraint, so this resolves the one grant that belongs to this
+    exact lease rather than guessing by time proximity. Returns ``None`` when
+    no grant exists -- the proxy was disabled, or the lease predates it --
+    which callers must treat as *unknown*, never as *unused*.
+
+    Read-only: this takes no lock and adds no column to ``inference_grants``,
+    which is a hot table.
+    """
+    grant = await session.scalar(
+        select(InferenceGrant).where(
+            InferenceGrant.agent_id == ticket.agent_id,
+            InferenceGrant.bench_version == ticket.bench_version,
+            InferenceGrant.validator_hotkey == ticket.validator_hotkey,
+            InferenceGrant.ticket_deadline == _aware(ticket.deadline),
+        )
+    )
+    if grant is None:
+        return None
+    return LeaseModelUsage(
+        chat_calls=int(grant.request_count or 0),
+        prompt_tokens=int(grant.prompt_tokens or 0),
+        completion_tokens=int(grant.completion_tokens or 0),
+        accounting_version=int(grant.usage_accounting_version or 0),
+    )
 
 
 async def ensure_inference_grant(

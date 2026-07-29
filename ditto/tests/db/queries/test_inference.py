@@ -29,6 +29,7 @@ from ditto.db.queries.inference import (
     begin_inference_request,
     ensure_inference_grant,
     finish_inference_request,
+    get_lease_model_usage,
     revoke_ticket_inference,
 )
 
@@ -1508,3 +1509,91 @@ async def test_global_ceiling_is_reported_as_global_not_as_per_ticket(
     assert declined is InferenceDecline.AT_CAPACITY
     assert _at_capacity_count("embedding", "global") == before_global + 1
     assert _at_capacity_count("embedding", "per_ticket") == before_per_ticket
+
+
+@pytest.mark.asyncio
+async def test_lease_model_usage_reads_the_grant_bound_to_that_exact_lease(
+    session: AsyncSession,
+) -> None:
+    """Usage resolves by lease identity, not by time proximity.
+
+    The retrospective join people reach for -- newest grant for
+    (agent, validator, bench_version) -- silently attributes a *later* run's
+    spend to an earlier score. Keying on ticket_deadline as well makes the
+    lookup exact.
+    """
+    async with session.begin():
+        ticket, grant, _bearer, _now = await _live_grant(session)
+        grant.request_count = 431
+        grant.prompt_tokens = 1_160_122
+        grant.completion_tokens = 92_400
+        await session.flush()
+
+        usage = await get_lease_model_usage(session, ticket=ticket)
+
+    assert usage is not None
+    assert usage.chat_calls == 431
+    assert usage.prompt_tokens == 1_160_122
+    assert usage.completion_tokens == 92_400
+    assert usage.total_tokens == 1_252_522
+    assert usage.accounting_version == USAGE_ACCOUNTING_VERSION
+
+
+@pytest.mark.asyncio
+async def test_lease_model_usage_is_none_when_no_grant_exists(
+    session: AsyncSession,
+) -> None:
+    """No grant means *unknown*, never *unused*.
+
+    A lease that ran with the inference proxy disabled produced no grant. It
+    must not be reported as an agent that declined to call the model.
+    """
+    now = datetime.now(UTC)
+    async with session.begin():
+        agent = Agent(
+            agent_id=uuid4(),
+            miner_hotkey="miner-ungranted",
+            name="no-proxy",
+            sha256="ef" * 32,
+            status=AgentStatus.EVALUATING,
+            created_at=now,
+        )
+        ticket = ValidatorTicket(
+            agent_id=agent.agent_id,
+            validator_hotkey="validator",
+            slot_id="slot-0",
+            status=TicketStatus.ISSUED,
+            issued_at=now,
+            deadline=now + timedelta(minutes=20),
+            bench_version=7,
+            attempt_count=1,
+        )
+        session.add_all([agent, ticket])
+        await session.flush()
+
+        assert await get_lease_model_usage(session, ticket=ticket) is None
+
+
+@pytest.mark.asyncio
+async def test_lease_model_usage_excludes_embedding_spend(
+    session: AsyncSession,
+) -> None:
+    """Embeddings are retrieval, not model use.
+
+    A retrieval-only agent embeds heavily -- production shows ~200 embedding
+    calls against a single 74-token chat call. Folding embeddings into the
+    total would erase precisely the signal this measurement exists to expose.
+    """
+    async with session.begin():
+        ticket, grant, _bearer, _now = await _live_grant(session)
+        grant.request_count = 1
+        grant.prompt_tokens = 74
+        grant.completion_tokens = 1
+        grant.embedding_request_count = 204
+        grant.embedding_tokens = 812_000
+        await session.flush()
+
+        usage = await get_lease_model_usage(session, ticket=ticket)
+
+    assert usage is not None
+    assert usage.total_tokens == 75
