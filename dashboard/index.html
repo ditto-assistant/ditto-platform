@@ -6203,6 +6203,23 @@
       notice.hidden = false;
     }
 
+    // Name the row the continuation floor was cut from. "Fifth place" is not a
+    // checkable claim on its own: the floor is the fifth-highest finalized
+    // composite, while the leaderboard's rank column orders by
+    // official_composite, so the two select different agents as soon as anyone
+    // completes a continual wave. Quoting the holder lets a miner open that
+    // submission and read the same number back.
+    function scoreFloorAttribution(e) {
+      var benchKey = benchmarkVersionKey(e.active_bench_version);
+      var where = benchKey === "unknown" ? "" : " on " + benchmarkVersionLabel(benchKey);
+      var basis = "That floor is the 5th-highest finalized composite" + where;
+      if (!e.score_floor_agent_id) return basis + ".";
+      return basis + ", held by " +
+        agentLabel(e.score_floor_agent_name, e.score_floor_agent_version) +
+        ". Open that submission to read the same number back." +
+        " The leaderboard rank column orders by official_composite, so the row it shows at rank 5 can belong to a different agent.";
+    }
+
     function validationDetail(e) {
       var count = Math.max(0, Number(e.score_count) || 0);
       var quorum = Math.max(1, Number(e.quorum) || 3);
@@ -6233,8 +6250,9 @@
           return Math.max(best, Number(score.composite) || 0);
         }, 0);
         return "Two accepted scores mean even a perfect third run could not raise the median above " +
-          fx(bestPossible) + ", below the current fifth-place score of " + fx(scoreFloor) +
-          ". The third score is still queued at low priority so this benchmark record reaches 3 of 3.";
+          fx(bestPossible) + ", below the continuation floor of " + fx(scoreFloor) + ". " +
+          scoreFloorAttribution(e) +
+          " The third score is still queued at low priority so this benchmark record reaches 3 of 3.";
       }
       if (e.status === "not_queued") {
         return "This historical submission is retained for audit history but is not admitted to the active benchmark queue. It cannot consume validator capacity unless an explicit audited recovery admits it.";
@@ -6713,7 +6731,7 @@
         var note = complete
           ? "This benchmark version has reached quorum. Its aggregate is the median of these independent accepted scores."
           : deprioritized && cohort.key === benchmarkVersionKey(pipeline.active_bench_version)
-          ? "The third score remains queued at low priority because the best reachable median is below the current fifth-place score. This result remains provisional until quorum."
+          ? "The third score remains queued at low priority because the best reachable median is below the continuation floor. " + scoreFloorAttribution(pipeline) + " This result remains provisional until quorum."
           : "Scores in this benchmark version remain provisional until " + quorum + " independent scores arrive. Provisional scores may change; the final median is authoritative within this benchmark version.";
         var rows = cohort.scores.map(function (score, index) {
           return renderScore(score, index, complete);

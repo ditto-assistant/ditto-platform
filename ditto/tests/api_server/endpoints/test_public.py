@@ -4884,6 +4884,232 @@ class TestPublicActivity:
         ).json()
         assert pipeline["status"] == "waiting_validator"
 
+    async def test_score_floor_names_the_agent_whose_composite_it_is(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """A miner told "below the floor" must be able to check the floor.
+
+        The number alone is unfalsifiable: the floor is cut by ``composite``
+        while the public board's ``rank`` is cut by ``official_composite``, so
+        "fifth place" names two different agents on two surfaces. The pipeline
+        therefore attributes the number to the row it came from.
+        """
+        floor_agent_ids = []
+        for rank, marker in enumerate("ABCDE"):
+            composite = 0.80 + (4 - rank) * 0.01
+            floor_agent_ids.append(
+                UUID(
+                    await _seed_k3(
+                        session_maker,
+                        miner="5" + marker * 47,
+                        composites=[composite, composite, composite],
+                    )
+                )
+            )
+        fifth_place_agent_id = floor_agent_ids[-1]
+
+        agent_id = UUID(
+            await _seed_agent(
+                session_maker,
+                miner=_MINER_A,
+                status=AgentStatus.EVALUATING,
+                screening_policy_version=SCREENING_POLICY_VERSION,
+            )
+        )
+        async with session_maker() as session, session.begin():
+            for index, (validator, composite) in enumerate(
+                ((_VALIDATOR_C, 0.10), (_MINER_B, 0.20))
+            ):
+                await upsert_score(
+                    session,
+                    agent_id=agent_id,
+                    validator_hotkey=validator,
+                    bench_version=_ERA,
+                    run_id=f"attributed-floor-{index}",
+                    seed=42,
+                    composite=composite,
+                    tool_mean=composite,
+                    memory_mean=composite,
+                    median_ms=500,
+                    n=114,
+                    generated_at=datetime.now(UTC),
+                    signature="ab" * 64,
+                )
+        _install_db(app, session_maker)
+
+        pipeline = (
+            await client.get(f"/api/v1/public/agent/{agent_id}/pipeline")
+        ).json()
+        assert pipeline["status"] == "below_score_floor"
+        assert pipeline["score_floor"] == pytest.approx(0.80)
+        assert pipeline["score_floor_agent_id"] == str(fifth_place_agent_id)
+        assert pipeline["score_floor_agent_name"] == "agent"
+        assert pipeline["score_floor_agent_version"] is None
+
+        # The attribution is checkable: that agent's own record reports the
+        # same number the floor quotes.
+        floor_holder = (
+            await client.get(f"/api/v1/public/agent/{fifth_place_agent_id}/pipeline")
+        ).json()
+        assert floor_holder["final_composite"] == pytest.approx(pipeline["score_floor"])
+
+    async def test_score_floor_attribution_is_null_below_five_ranked_agents(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """No fifth place, no floor, and no agent credited with one."""
+        for marker in "ABCD":
+            await _seed_k3(
+                session_maker,
+                miner="5" + marker * 47,
+                composites=[0.80, 0.80, 0.80],
+            )
+        agent_id = UUID(
+            await _seed_agent(
+                session_maker,
+                miner=_MINER_A,
+                status=AgentStatus.EVALUATING,
+                screening_policy_version=SCREENING_POLICY_VERSION,
+            )
+        )
+        _install_db(app, session_maker)
+
+        pipeline = (
+            await client.get(f"/api/v1/public/agent/{agent_id}/pipeline")
+        ).json()
+        assert pipeline["score_floor"] == pytest.approx(0.0)
+        assert pipeline["score_floor_agent_id"] is None
+        assert pipeline["score_floor_agent_name"] is None
+        assert pipeline["score_floor_agent_version"] is None
+
+    async def test_score_floor_holder_is_not_the_board_row_at_rank_five(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """The support report, reproduced: "fifth place" names two agents.
+
+        The continuation floor is cut from the ledger's ``composite`` ordering.
+        The public board's ``rank`` is cut from ``official_composite`` (pinned
+        by ``test_rank_follows_official_composite_not_composite``). Both are
+        correct and both are live, so a message that says "the current
+        fifth-place score" is unfalsifiable: the miner looks up rank 5, reads a
+        different agent with a different number, and reports a stale gate.
+
+        This builds that exact divergence and asserts the pipeline reports the
+        row the floor was really cut from, not the row displayed at rank 5.
+        """
+        from ditto.db.queries.confirmation_scores import (
+            ConfirmationSeedScore,
+            append_confirmation_scores,
+        )
+
+        # Six finalized owners, descending by composite. "E" holds fifth.
+        by_marker = {}
+        for rank, marker in enumerate("ABCDEF"):
+            composite = 0.90 - rank * 0.02
+            by_marker[marker] = await _seed_k3(
+                session_maker,
+                miner="5" + marker * 47,
+                composites=[composite, composite, composite],
+                details={"bench_version": _ERA},
+                created_at=datetime(2026, 6, 1 + rank, tzinfo=UTC),
+            )
+        fifth_by_composite = by_marker["E"]  # composite 0.82
+
+        # "F" (last by composite, 0.80) completes waves at 0.95, so its
+        # official_composite becomes 0.875 and it climbs to third on the board.
+        # That pushes every row below it down one, so rank 5 becomes "D".
+        async with session_maker() as s, s.begin():
+            now = datetime.now(UTC)
+            s.add(
+                ValidatorHeartbeat(
+                    validator_hotkey=_VALIDATOR_C,
+                    software_version="0.28.0",
+                    protocol_version=14,
+                    code_digest="ab" * 32,
+                    state="idle",
+                    reported_at=now,
+                    seen_at=now,
+                    signature="cd" * 64,
+                    capabilities=_scorer_capabilities(now, versions=[_ERA]),
+                )
+            )
+            # A wave only counts once every cohort member has scored that seed,
+            # so all six retest. Everyone but "F" retests at its own composite,
+            # leaving its official_composite exactly where it was.
+            await append_confirmation_scores(
+                s,
+                rows=[
+                    ConfirmationSeedScore(
+                        UUID(agent),
+                        "5V1",
+                        seed,
+                        0.95 if marker == "F" else 0.90 - index * 0.02,
+                        f"r-{marker}-{seed}",
+                        None,
+                    )
+                    for index, (marker, agent) in enumerate(by_marker.items())
+                    for seed in (100, 200, 300)
+                ],
+                bench_version=_ERA,
+                created_at=now,
+            )
+
+        agent_id = UUID(
+            await _seed_agent(
+                session_maker,
+                miner=_MINER_A,
+                status=AgentStatus.EVALUATING,
+                screening_policy_version=SCREENING_POLICY_VERSION,
+            )
+        )
+        async with session_maker() as session, session.begin():
+            for index, (validator, composite) in enumerate(
+                ((_VALIDATOR_C, 0.10), (_MINER_B, 0.20))
+            ):
+                await upsert_score(
+                    session,
+                    agent_id=agent_id,
+                    validator_hotkey=validator,
+                    bench_version=_ERA,
+                    run_id=f"divergent-floor-{index}",
+                    seed=42,
+                    composite=composite,
+                    tool_mean=composite,
+                    memory_mean=composite,
+                    median_ms=500,
+                    n=114,
+                    generated_at=datetime.now(UTC),
+                    signature="ab" * 64,
+                    details={"bench_version": _ERA},
+                )
+        _install_db(app, session_maker)
+
+        board = (await client.get("/api/v1/public/leaderboard")).json()
+        assert board["continual_aggregate_active"] is True
+        rank_five = next(entry for entry in board["entries"] if entry["rank"] == 5)
+
+        pipeline = (
+            await client.get(f"/api/v1/public/agent/{agent_id}/pipeline")
+        ).json()
+        assert pipeline["status"] == "below_score_floor"
+
+        # The divergence is real, or this test proves nothing.
+        assert rank_five["agent_id"] != fifth_by_composite
+        assert rank_five["composite"] != pytest.approx(pipeline["score_floor"])
+
+        # The floor is attributed to the row it was actually cut from.
+        assert pipeline["score_floor"] == pytest.approx(0.82)
+        assert pipeline["score_floor_agent_id"] == fifth_by_composite
+        assert pipeline["score_floor_agent_name"] == "agent"
+
     async def test_public_progress_never_combines_benchmark_eras(
         self,
         app: FastAPI,
