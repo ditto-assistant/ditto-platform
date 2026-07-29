@@ -83,8 +83,15 @@ from ditto.db.queries.benchmark_admission import (
     benchmark_admission_predicate,
     validator_queue_admission_predicate,
 )
-from ditto.db.queries.retirement import retirement_admission_predicate
-from ditto.db.queries.scores import SCORING_QUORUM, emission_owner_key
+from ditto.db.queries.similarity_budget import (
+    live_lease_sketches,
+    load_submission_sketches,
+)
+from ditto.db.queries.similarity_grouping import (
+    SimilarityBudgetPolicy,
+    SimilarityMatch,
+    similar_submissions,
+)
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -134,6 +141,33 @@ MIN_OWNER_CONCURRENT_SUBMISSION_LIMIT = 1
 # small fleet for a full lease even under the last-resort predicate, which is
 # the monopoly the rail exists to prevent.
 MAX_OWNER_CONCURRENT_SUBMISSION_LIMIT = 3
+
+# ---------------------------------------------------------------------------
+# Similarity capacity
+# ---------------------------------------------------------------------------
+# The owner ceiling above answers "how much of the fleet may one owner hold",
+# and it is defeated by spreading one submission across many coldkeys: on every
+# signal the platform can verify, those really are different owners. In the
+# production window this was calibrated against, one submission family held 25
+# of 76 live evaluations across 15 hotkeys and 6 coldkeys while honest miners
+# waited.
+#
+# So near-identical submissions share a budget too, whoever paid for them. This
+# is queue fairness and nothing else: a grouped submission is not held,
+# rejected, quarantined or scored differently -- it waits, exactly as every
+# miner already waits behind the owner rail. It is emphatically NOT evidence
+# that anybody copied anything, and must never be cited as such.
+#
+# The default is the tighter of the two ceilings (``1``): one near-identical
+# submission running at a time, even on the last-resort pass, because the
+# monopoly this rail exists to break is precisely one family filling the fleet
+# when nothing else is leasable. Setting it to ``1`` and setting the whole rail
+# off are different things -- see ``SimilarityBudgetSettings.enabled``.
+SIMILARITY_CONCURRENT_SUBMISSION_LIMIT_DEFAULT = 1
+MIN_SIMILARITY_CONCURRENT_SUBMISSION_LIMIT = 1
+# Mirrors the owner ceiling's ceiling, for the same reason: above this one
+# family could hold every slot of a small fleet for a full lease.
+MAX_SIMILARITY_CONCURRENT_SUBMISSION_LIMIT = 3
 
 
 def preview_artifact_mode(bench_version: int) -> ArtifactMode:
@@ -221,6 +255,11 @@ def queue_candidate_predicate(
     A row the allocator would not even consider must not be ranked as though it
     were next, which is what ``QueuePreviewEntry.gate`` reports.
     """
+    # Retirement imports score queries, which in turn load the API routing
+    # package. Keep this dependency at evaluation time so queue_order remains
+    # independently importable by allocator and policy tests.
+    from ditto.db.queries.retirement import retirement_admission_predicate
+
     contract = benchmark_contract(bench_version)
     predicates: list[ColumnElement[bool]] = [
         agent.status == AgentStatus.EVALUATING,
@@ -269,6 +308,8 @@ def _top_provisional_contenders(
     contender slot. Keying this on the hotkey is exactly the divergence #435
     fixed in the preview; there is now one expression to key wrongly.
     """
+    from ditto.db.queries.scores import SCORING_QUORUM, emission_owner_key
+
     contender = aliased(Agent)
     contender_accepted_score_count = (
         select(func.count())
@@ -378,6 +419,8 @@ def queue_order_terms(
     the per-validator ``had_prior_ticket`` coverage tiebreak because no global
     answer to it exists. Every other term is fleet-wide by construction.
     """
+    from ditto.db.queries.scores import SCORING_QUORUM
+
     fifo_age = (
         case(
             (agent.created_at < fifo_start_at, fifo_start_at),
@@ -759,6 +802,9 @@ async def selected_owner_agent_id(
     owner, so failed work can still drain -- and neither does a generation that
     can no longer reach quorum, see ``owner_quorum_reachable`` below.
     """
+    from ditto.db.queries.retirement import retirement_admission_predicate
+    from ditto.db.queries.scores import SCORING_QUORUM
+
     sibling_agent = aliased(Agent)
     sibling_payment = aliased(EvaluationPayment)
     owner_progress_started_at = (
@@ -898,7 +944,12 @@ async def selected_owner_agent_id(
     )
 
 
-QueueGate = Literal["previous_generation", "owner_serialized", "not_leasable"]
+QueueGate = Literal[
+    "previous_generation",
+    "owner_serialized",
+    "similarity_serialized",
+    "not_leasable",
+]
 """Why a ranked submission cannot be leased on the next poll, if it cannot.
 
 ``previous_generation``
@@ -911,6 +962,13 @@ QueueGate = Literal["previous_generation", "owner_serialized", "not_leasable"]
     :func:`owner_capacity_gate`'s ceiling. Whether that happens depends on the
     polling validator's own eligibility set, which a global preview cannot
     represent -- so the preview reports the ordinary answer.
+``similarity_serialized``
+    A near-identical submission is already using this submission's share of
+    fleet capacity, whichever key paid for it. Exactly as temporary as
+    ``owner_serialized`` -- the budget frees when the twin's lease ends -- and
+    exactly as *un*-punitive: it says nothing about whether either submission
+    is legitimate, only that the queue will not run two copies of the same work
+    at once. See :mod:`ditto.db.queries.similarity_grouping`.
 ``not_leasable``
     The allocator's validator-independent candidate filter excludes it: no
     versioned dataset, no eligible screened image, withdrawn from the queue, or
@@ -928,8 +986,12 @@ per-validator checks a global preview cannot represent.
 _GATE_RANK: dict[QueueGate | None, int] = {
     None: 0,
     "owner_serialized": 1,
-    "not_leasable": 2,
-    "previous_generation": 3,
+    # Beside the owner rail rather than behind it: both free on their own when
+    # a lease ends, and both are ahead of ``not_leasable``, which needs an
+    # event outside the queue.
+    "similarity_serialized": 2,
+    "not_leasable": 3,
+    "previous_generation": 4,
 }
 
 
@@ -940,17 +1002,23 @@ def owner_capacity_gate(
     live_lease_agent_ids: Collection[UUID],
     concurrent_submission_limit: int = OWNER_CONCURRENT_SUBMISSION_LIMIT_DEFAULT,
     last_resort: bool = False,
+    similar_lease_agent_ids: Collection[UUID] = (),
+    similarity_concurrent_submission_limit: int = (
+        SIMILARITY_CONCURRENT_SUBMISSION_LIMIT_DEFAULT
+    ),
 ) -> QueueGate | None:
-    """Whether one owner's capacity rules hold this submission back.
+    """Whether the queue's capacity rules hold this submission back.
 
-    The single expression of both owner rails, called by ``issue_ticket`` for
-    the row it is about to lease and by :func:`preview_queue_order` for the
+    The single expression of every capacity rail, called by ``issue_ticket``
+    for the row it is about to lease and by :func:`preview_queue_order` for the
     badge it is about to show. They diverged three times before #463 put the
     ordering in one place; this puts the *reason* in one place too, so relaxing
-    the rule cannot relax it for only one of them.
+    the rule cannot relax it for only one of them. The similarity rail is added
+    here rather than beside the callers for exactly that reason -- there is no
+    second place to relax it from.
 
-    Two rails, one question
-    =======================
+    Three rails, one question
+    =========================
 
     ``live_lease_agent_ids`` is the serialization rail: an owner's submissions
     holding live leases right now. ``selected_agent_id`` is the pinning rail
@@ -958,8 +1026,28 @@ def owner_capacity_gate(
     the gaps between its leases so a validator that already scored it cannot
     open a sibling and divert the rest of the fleet mid-quorum.
 
-    They are independent and both still apply. What changes here is only *when*
-    a second submission from an owner who already holds a lease may be leased.
+    ``similar_lease_agent_ids`` is the fairness rail: the submissions already
+    holding leases that are near-identical to this one, on the evidence in
+    :mod:`ditto.db.queries.similarity_grouping`. It exists because the other
+    two are keyed on *ownership*, and one operator spreading one submission
+    across many coldkeys is, on every signal the platform can verify, many
+    owners. Passing an empty collection (the default) leaves the two owner
+    rails behaving byte for byte as they did before.
+
+    They are independent and all still apply. What changes here is only *when*
+    a second submission from an owner who already holds a lease may be leased,
+    and how many copies of one submission may run at once.
+
+    The similarity rail is not an accusation
+    ========================================
+
+    ``similarity_serialized`` is a statement about the queue, never about the
+    miner. Being grouped costs a submission nothing but simultaneity: it keeps
+    its rank, its scores, its emissions, and it is leased the moment its twin's
+    lease ends. Nothing here writes ``duplicate_of``, ``review_reason`` or any
+    status, and none of it may be cited as evidence of copying -- that question
+    has its own machinery, its own thresholds and a much higher bar, because
+    there a false positive costs a miner their submission rather than a wait.
 
     Last resort, not idle detection
     ===============================
@@ -984,6 +1072,22 @@ def owner_capacity_gate(
     sibling lease would otherwise make ``live_lease_agent_ids`` non-empty and
     lock out the very generation the pin exists to finish, re-creating the
     mid-quorum diversion through the back door.
+
+    The pin outranks the similarity rail too, and deliberately
+    ====================================================================
+
+    A pinned generation is one the owner has *already started* -- it holds
+    accepted or live progress, so fleet work has been spent on it and the
+    scores it is waiting on cannot be collected any other way. Refusing it on
+    similarity would strand that quorum permanently, which is a worse outcome
+    than the one the rail is preventing.
+
+    The exemption is bounded and the arithmetic is worth stating: a family
+    spread across ``n`` owners can hold at most ``n`` mid-quorum submissions
+    exempt this way, and the rail still refuses every *new* start behind them.
+    Against the calibration window that is at most 6, against 25 today.
+    Finishing work already in flight is not the monopoly this rail exists to
+    break; starting twenty more copies of it is.
     """
     leased = set(live_lease_agent_ids)
     if selected_agent_id == agent_id:
@@ -1001,6 +1105,13 @@ def owner_capacity_gate(
         # An owner mid-generation does not open the next one on the ordinary
         # pass, whether or not a lease is live at this instant.
         return "owner_serialized"
+    # Same arithmetic, different partition. The owner rails asked "who paid for
+    # the other live leases"; this one asks "which of them are this submission
+    # again". A caller that supplies nothing gets the pre-similarity behaviour.
+    twins_leased = set(similar_lease_agent_ids) - {agent_id}
+    similarity_limit = max(1, similarity_concurrent_submission_limit)
+    if len(twins_leased) + 1 > similarity_limit:
+        return "similarity_serialized"
     return None
 
 
@@ -1011,6 +1122,14 @@ class QueuePreviewEntry:
     agent_id: UUID
     rank: int
     gate: QueueGate | None
+    gate_detail: str | None = None
+    """The evidence behind :attr:`gate`, when the gate has any worth naming.
+
+    Only ``similarity_serialized`` populates it today, and it must: "your
+    submission is waiting" is a fact an operator can act on only if they can
+    see *which* submission it is waiting on and how alike the platform thinks
+    they are. The other gates are self-describing from the reason code alone.
+    """
 
     @property
     def leasable(self) -> bool:
@@ -1028,6 +1147,10 @@ async def preview_queue_order(
     provisional_contender_floor: float | None,
     rollout: BenchmarkRollout | None,
     previous_generation_agent_ids: Collection[UUID] = (),
+    similarity_policy: SimilarityBudgetPolicy | None = None,
+    similarity_concurrent_submission_limit: int = (
+        SIMILARITY_CONCURRENT_SUBMISSION_LIMIT_DEFAULT
+    ),
 ) -> dict[UUID, QueuePreviewEntry]:
     """Rank ``agent_ids`` the way the allocator would, and say what is gated.
 
@@ -1040,6 +1163,8 @@ async def preview_queue_order(
     Ranks are advisory. See the module docstring for the per-validator rules no
     global list can carry.
     """
+    from ditto.db.queries.scores import SCORING_QUORUM
+
     requested = list(dict.fromkeys(agent_ids))
     if not requested:
         return {}
@@ -1120,7 +1245,21 @@ async def preview_queue_order(
     capable_hotkeys = await quorum_capable_validator_hotkeys(
         session, bench_version=bench_version, now=now
     )
+    # Both similarity inputs are read once for the whole preview: the fleet's
+    # live leases are the same set for every row, and the candidates' own
+    # sketches come back in one projection rather than one query per rank.
+    twin_sketches = (
+        await live_lease_sketches(session, now=now)
+        if similarity_policy is not None
+        else ()
+    )
+    candidate_sketches = (
+        await load_submission_sketches(session, agent_ids=requested)
+        if similarity_policy is not None
+        else {}
+    )
     gates: dict[UUID, QueueGate | None] = {}
+    details: dict[UUID, str | None] = {}
     for agent_id in ordered:
         if agent_id in previous_generation:
             gates[agent_id] = "previous_generation"
@@ -1128,9 +1267,25 @@ async def preview_queue_order(
         if agent_id not in leasable:
             gates[agent_id] = "not_leasable"
             continue
+        twins: tuple[SimilarityMatch, ...] = ()
+        if similarity_policy is not None and agent_id in candidate_sketches:
+            twins = similar_submissions(
+                candidate_sketches[agent_id],
+                twin_sketches,
+                policy=similarity_policy,
+            )
         owner = linkage.get(agent_id)
         if owner is None:
-            gates[agent_id] = None
+            gates[agent_id] = owner_capacity_gate(
+                agent_id=agent_id,
+                selected_agent_id=None,
+                live_lease_agent_ids=(),
+                similar_lease_agent_ids=[twin.agent_id for twin in twins],
+                similarity_concurrent_submission_limit=(
+                    similarity_concurrent_submission_limit
+                ),
+            )
+            details[agent_id] = _similarity_detail(gates[agent_id], twins)
             continue
         owner_key = owner.advisory_lock_keys
         if owner_key not in selected_by_owner:
@@ -1158,12 +1313,43 @@ async def preview_queue_order(
             selected_agent_id=selected_by_owner[owner_key],
             live_lease_agent_ids=leased_by_owner[owner_key],
             last_resort=False,
+            similar_lease_agent_ids=[twin.agent_id for twin in twins],
+            similarity_concurrent_submission_limit=(
+                similarity_concurrent_submission_limit
+            ),
         )
+        details[agent_id] = _similarity_detail(gates[agent_id], twins)
     ranked = sorted(
         enumerate(ordered),
         key=lambda item: (_GATE_RANK[gates[item[1]]], item[0]),
     )
     return {
-        agent_id: QueuePreviewEntry(agent_id=agent_id, rank=rank, gate=gates[agent_id])
+        agent_id: QueuePreviewEntry(
+            agent_id=agent_id,
+            rank=rank,
+            gate=gates[agent_id],
+            gate_detail=details.get(agent_id),
+        )
         for rank, (_, agent_id) in enumerate(ranked, start=1)
     }
+
+
+def _similarity_detail(
+    gate: QueueGate | None, twins: Sequence[SimilarityMatch]
+) -> str | None:
+    """The operator-facing sentence behind a ``similarity_serialized`` badge.
+
+    Names the submissions the budget is shared with and the measured evidence,
+    because "waiting" alone is not actionable: an operator needs to see whether
+    the queue found a near-twin at 0.99 or scraped past the threshold at 0.90,
+    and which row to look at. Deliberately phrased as a capacity statement --
+    nothing here asserts that either submission is illegitimate.
+    """
+    if gate != "similarity_serialized" or not twins:
+        return None
+    named = ", ".join(twin.describe() for twin in twins[:3])
+    more = f" and {len(twins) - 3} more" if len(twins) > 3 else ""
+    return (
+        "shares a concurrency budget with near-identical submission(s) "
+        f"{named}{more}, which hold the fleet capacity for this budget right now"
+    )

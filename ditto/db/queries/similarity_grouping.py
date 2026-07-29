@@ -107,8 +107,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from ditto.api_server.fingerprint import content_similarity
-
 if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
     from uuid import UUID
@@ -207,7 +205,16 @@ def similarity_scores(
     Jaccard there, because the algebraic form multiplies the sampling error by
     the set sizes exactly in the asymmetric regime -- and this rule reads
     containment precisely in that regime.
+
+    The import is function-local because it has to be. ``ditto.api_server``'s
+    package ``__init__`` builds the whole FastAPI app, which imports the
+    endpoints, which reach back into ``ditto.db.queries`` -- so a module-level
+    import here closes a cycle through ``queue_order``. Importing inside the
+    call keeps the dependency pointing the direction it already points at
+    runtime, and ``sys.modules`` makes the repeat cost a dict lookup.
     """
+    from ditto.api_server.fingerprint import content_similarity
+
     return content_similarity(left.fingerprint, right.fingerprint)
 
 
