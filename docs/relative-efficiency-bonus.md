@@ -176,8 +176,9 @@ Public (`GET /api/v1/public/leaderboard`):
 * `GET /api/v1/public/efficiency/snapshots/{snapshot_id}`: the full immutable
   audit record. Lineage digests are moderation-adjacent and never exposed —
   members carry opaque `lineage_group` ordinals plus `collapsed_agent_ids`.
-* Leaderboard **ranking still follows the base composite**; the effective
-  score is display/provenance until the fold consumes it (below).
+* Leaderboard **ranking still follows `official_composite`** — never
+  `effective_composite`; the effective score is display/provenance until the
+  fold consumes it (below).
 
 Validator ledger (`GET /api/v1/scoring/scores`): `LedgerEntry` gains
 additive-optional `efficiency_bonus` and `effective_composite`, populated
