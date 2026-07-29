@@ -28,7 +28,7 @@ from ditto.db.models import (
     ValidatorTicket,
 )
 from ditto.db.queries.benchmark_rollout import active_bench_version
-from ditto.db.queries.queue_removal import is_eviction, is_in_force, removal_in_force
+from ditto.db.queries.queue_removal import is_in_force, removal_in_force
 from ditto.db.queries.scores import SCORING_QUORUM
 from ditto.db.queries.tickets import ticket_attempt_cap
 
@@ -232,7 +232,7 @@ def reinstatement_gate(
     bench_version: int,
     active_version: int,
 ) -> tuple[bool, str | None]:
-    """Allow an eviction to be undone: back in the queue, with nothing added.
+    """Allow a queue removal to be undone, with no retry budget added.
 
     :func:`eviction_gate` made eviction reachable while a submission was still
     burning validator slots, which is what made it useful — and one-way, which is
@@ -242,8 +242,11 @@ def reinstatement_gate(
     be the price of a capacity decision taken against a submission nobody has
     shown to be malicious.
 
-    Reinstatement is therefore the exact inverse of the queue effect and *nothing
-    else*. It clears the removal so ``validator_queue_admission_predicate``
+    Reinstatement is the exact inverse of the queue effect and *nothing else*.
+    This applies equally to an eviction and to an exhausted-submission
+    withdrawal: both are operator-authored removals of a paid submission, and
+    both must be reversible when later evidence justifies another bounded retry.
+    It clears the removal so ``validator_queue_admission_predicate``
     admits the agent again; it does not resurrect the revoked leases, reset
     ``attempt_count``, mint a no-fault grant, or forgive a spent operator
     recovery. That inertness is the security property: eviction already refuses
@@ -258,11 +261,6 @@ def reinstatement_gate(
     The refusals:
 
     * nothing to reverse, or it was reversed already;
-    * the removal was a **withdrawal**, not an eviction. Withdrawal is only
-      reachable once a submission has exhausted enough tickets that quorum is
-      already unreachable, so putting it back would restore eligibility it
-      cannot use; the honest remedy there is an operator retry grant, which is
-      bounded and audited on its own terms;
     * **the era moved on.** A removal is scoped to the benchmark version it was
       taken in, and no validator will ever be issued a ticket for a closed one,
       so reinstating into it would report success and change nothing. Refused
@@ -276,11 +274,6 @@ def reinstatement_gate(
         return False, "submission is not removed from this benchmark queue"
     if not is_in_force(removal):
         return False, "removal has already been reinstated"
-    if not is_eviction(removal):
-        return (
-            False,
-            "removal was a queue withdrawal, not an operator eviction",
-        )
     if bench_version != active_version:
         return (
             False,

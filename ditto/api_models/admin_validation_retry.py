@@ -112,7 +112,7 @@ class AdminReinstatementRetryBudget(BaseModel):
 class AdminValidationQueueReinstatement(BaseModel):
     reinstatement_id: UUID
     withdrawal_id: UUID
-    """The eviction row this reversed. That row is resolved, never deleted."""
+    """The removal row this reversed. That row is resolved, never deleted."""
     agent_id: UUID
     bench_version: int
     actor: str
@@ -296,7 +296,7 @@ class AdminValidationQueueEvictionResponse(BaseModel):
 
 
 class AdminValidationQueueReinstatementRequest(BaseModel):
-    """Return an evicted submission to the validator queue in its own era.
+    """Return an operator-removed submission to the queue in its own era.
 
     Carries the same three interlocks as the two removal routes — an exact
     ``expected_snapshot``, a written ``reason`` of the same 8–500 characters, and
@@ -324,7 +324,11 @@ class AdminValidationQueueReinstatementRequest(BaseModel):
 class AdminValidationQueueReinstatementResponse(BaseModel):
     reinstatement: AdminValidationQueueReinstatement
     eviction: AdminValidationQueueEviction
-    """The eviction that was reversed, preserved and now carrying a resolution."""
+    """The removal that was reversed, preserved and now carrying a resolution.
+
+    The field name is retained for API compatibility; ordinary withdrawals have
+    an empty ``evicted_validator_hotkeys`` list.
+    """
     restored_bench_version: int
     idempotent: bool
 
