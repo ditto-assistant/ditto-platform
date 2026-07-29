@@ -34,7 +34,7 @@ from ditto.db.queries.tickets import ticket_attempt_cap
 
 # Operators may hand-grant at most this many recoveries to one agent before the
 # stuck submission needs a harder look than another retry.
-MAX_OPERATOR_RECOVERIES_PER_AGENT = 3
+MAX_OPERATOR_RECOVERIES_PER_AGENT = 4
 
 
 def aware(value: datetime) -> datetime:

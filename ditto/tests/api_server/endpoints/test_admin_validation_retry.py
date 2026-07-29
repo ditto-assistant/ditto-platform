@@ -549,7 +549,7 @@ async def test_withdraw_remains_available_after_operator_retry_limit(
 ) -> None:
     agent_id = await _seed(retry_maker)
     async with retry_maker() as session, session.begin():
-        for index in range(3):
+        for index in range(4):
             session.add(
                 ValidatorRetryRecovery(
                     recovery_id=uuid4(),
@@ -1544,7 +1544,7 @@ async def test_reinstatement_cannot_launder_the_retry_budget(
         assert recorded["max_agent_infra_retry_grants"] == 12
         assert recorded["manual_retry_grants"] == before[2]
         assert recorded["operator_recoveries"] == before[3]
-        assert recorded["max_operator_recoveries"] == 3
+        assert recorded["max_operator_recoveries"] == 4
         assert await _budget() == before
         # Each cycle needs its own live lease to evict; the reinstated one is
         # expired, and re-leasing it is the validator's job, not the operator's.
