@@ -52,6 +52,14 @@ class TestBuildDictConfig:
         """``logging.config.dictConfig`` must accept the payload."""
         # Filter import is module-level; constructing the payload alone
         # is not enough - we need to confirm dictConfig wires it up.
-        logging.config.dictConfig(build_dict_config("WARNING"))
-        # Reset root so other tests are not affected.
-        logging.getLogger().setLevel(logging.NOTSET)
+        root = logging.getLogger()
+        original_handlers = root.handlers[:]
+        original_level = root.level
+        try:
+            logging.config.dictConfig(build_dict_config("WARNING"))
+        finally:
+            # dictConfig replaces the root handlers, including pytest's
+            # session-wide capture handlers. Restore the complete root state,
+            # not only its level, so later caplog assertions remain isolated.
+            root.handlers[:] = original_handlers
+            root.setLevel(original_level)
