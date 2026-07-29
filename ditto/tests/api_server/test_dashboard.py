@@ -276,6 +276,9 @@ class TestDashboard:
         assert "function pipelineBoardStage(entry)" in body
         assert "(entry.active_benchmarks || []).some(queueRelevantBenchmark)" in body
         assert ".filter(queueRelevantBenchmark)" in body
+        assert 'column.status === "evaluating"' in body
+        assert "var displayedCount" in body
+        assert "item.entry.active_benchmarks || []" in body
         assert "column.statuses.indexOf(pipelineBoardStage(entry))" in body
         assert '"Bench v" + rescore.targetVersion + " rescore"' in body
         assert "validator_queue_rank" in body

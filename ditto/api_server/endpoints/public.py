@@ -3416,6 +3416,14 @@ def _public_activity_response(
         active_by_agent.setdefault(work.agent.agent_id, []).append(
             _public_benchmark_progress(work, now)
         )
+    board_active_agent_ids = {
+        agent_id
+        for agent_id, progress_rows in active_by_agent.items()
+        if active_bench_version is None
+        or any(
+            progress.bench_version == active_bench_version for progress in progress_rows
+        )
+    }
     retry_by_agent = retry_states or {}
     statuses = _public_activity_statuses(
         rows,
@@ -3475,11 +3483,12 @@ def _public_activity_response(
             "below_score_floor",
             "evaluating",
         }
-        actionable = [item for item in projected if item[1] in board_statuses]
-        terminal = [item for item in projected if item[1] in {"scored", "live"}][
-            :terminal_history_limit
-        ]
-        page_rows = actionable + terminal
+        page_rows = _operations_activity_rows(
+            projected,
+            board_statuses=board_statuses,
+            board_active_agent_ids=board_active_agent_ids,
+            terminal_history_limit=terminal_history_limit,
+        )
         page_size = max(1, len(page_rows))
     return PublicActivityResponse(
         generated_at=now,
@@ -3571,6 +3580,28 @@ def _public_activity_response(
             for row, row_status in page_rows
         ],
     )
+
+
+def _operations_activity_rows(
+    projected: list[tuple[Any, str]],
+    *,
+    board_statuses: set[str],
+    board_active_agent_ids: set[UUID],
+    terminal_history_limit: int,
+) -> list[tuple[Any, str]]:
+    """Keep every live board row plus a bounded finalized history."""
+    actionable = [
+        item
+        for item in projected
+        if item[1] in board_statuses or item[0].agent.agent_id in board_active_agent_ids
+    ]
+    terminal = [
+        item
+        for item in projected
+        if item[1] in {"scored", "live"}
+        and item[0].agent.agent_id not in board_active_agent_ids
+    ][:terminal_history_limit]
+    return actionable + terminal
 
 
 async def _duplicate_submission_metadata(

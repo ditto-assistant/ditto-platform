@@ -7750,7 +7750,16 @@
         var authoritativeCount = column.statuses.reduce(function (total, status) {
           return total + Number(pipelineStatusCounts[status] || 0);
         }, 0);
-        count.innerHTML = esc(String(authoritativeCount)) + (stuckCount
+        // Finalized top-five agents keep their scored/live lifecycle while a
+        // continual retest is running. The cards are therefore projected into
+        // Evaluating by active slot, not lifecycle. Count the same slot rows so
+        // the headline cannot claim zero while the board renders live work.
+        var displayedCount = column.status === "evaluating"
+          ? indexed.reduce(function (total, item) {
+              return total + (item.entry.active_benchmarks || []).filter(queueRelevantBenchmark).length;
+            }, 0)
+          : authoritativeCount;
+        count.innerHTML = esc(String(displayedCount)) + (stuckCount
           ? '<button type="button" class="pipeline-stuck-count" data-pipeline-stuck-filter aria-pressed="' + (pipelineShowStuck ? "true" : "false") + '" title="' + esc((pipelineShowStuck ? "Show actionable queue. " : "Show stuck submissions. ") + stuckCount + " submission" + (stuckCount === 1 ? "" : "s") + " exhausted the validator retry budget and need an operator retry grant.") + '">' + esc(String(stuckCount)) + ' stuck</button>'
           : "");
         stage.setAttribute("data-active", indexed.length ? "true" : "false");
@@ -7808,7 +7817,7 @@
         }).join("");
         var visiblePopulation = column.status === "waiting_validator"
           ? (pipelineShowStuck ? stuckCount : Math.max(0, authoritativeCount - stuckCount))
-          : authoritativeCount;
+          : (column.status === "evaluating" ? indexed.length : authoritativeCount);
         var hiddenCount = Math.max(0, visiblePopulation - indexed.length);
         body.innerHTML = visible + (hiddenCount
           ? '<div class="pipeline-more">' + esc(hiddenCount + " older " + (hiddenCount === 1 ? "submission" : "submissions")) + ' in Activity</div>'
