@@ -215,6 +215,34 @@ class PublicTokenUsage(BaseModel):
     ttft_status: str
 
 
+class PublicModelUse(BaseModel):
+    """Whether a scored run actually used the language model, and why.
+
+    Published to every miner. Deliberately an allowlist of counts, ratios and
+    the verdict -- no prompts, no completions, no case content, no source.
+    Nothing here can be inverted toward another miner's implementation, which
+    is what makes across-the-board observability compatible with the anti-copy
+    posture in ditto-platform#375.
+
+    The thresholds ride along with the verdict on purpose: a miner must be able
+    to read the bar off the same payload that reports their standing against
+    it, so the published rule and the enforced rule can never drift.
+    """
+
+    verdict: Annotated[str, Field(pattern=r"^(unmeasured|used|not_used)$")]
+    calls: Annotated[int | None, Field(default=None, ge=0)]
+    prompt_tokens: Annotated[int | None, Field(default=None, ge=0)]
+    completion_tokens: Annotated[int | None, Field(default=None, ge=0)]
+    cases: Annotated[int | None, Field(default=None, ge=0)]
+    prompt_tokens_per_case: Annotated[float | None, Field(default=None, ge=0.0)]
+    calls_per_case: Annotated[float | None, Field(default=None, ge=0.0)]
+    prompt_tokens_per_call: Annotated[float | None, Field(default=None, ge=0.0)]
+    reason: str | None = None
+    min_prompt_tokens_per_case: Annotated[float | None, Field(default=None, ge=0.0)]
+    min_calls_per_case: Annotated[float | None, Field(default=None, ge=0.0)]
+    min_prompt_tokens_per_call: Annotated[float | None, Field(default=None, ge=0.0)]
+
+
 class PublicTokenEfficiency(BaseModel):
     """Auditable v5 relay-token waste penalty."""
 
@@ -742,6 +770,16 @@ class PublicLeaderboardEntry(BaseModel):
     token_usage: Annotated[
         PublicTokenUsage | None,
         Field(default=None, description="Validator-proxy token accounting."),
+    ] = None
+    model_use: Annotated[
+        PublicModelUse | None,
+        Field(
+            default=None,
+            description=(
+                "Whether this run actually used the language model, with the "
+                "measured ratios and the published thresholds behind the verdict."
+            ),
+        ),
     ] = None
     token_efficiency: Annotated[
         PublicTokenEfficiency | None,
@@ -1338,6 +1376,7 @@ class PublicValidatorScore(BaseModel):
         Field(default=None, ge=0.0, le=1.0, description="Pre-token composite."),
     ] = None
     token_usage: PublicTokenUsage | None = None
+    model_use: PublicModelUse | None = None
     token_efficiency: PublicTokenEfficiency | None = None
     composite_breakdown: PublicCompositeBreakdown | None = None
     median_ms: Annotated[int, Field(ge=0, description="Median per-case latency (ms).")]
@@ -1993,6 +2032,7 @@ class PublicProvisionalScore(BaseModel):
         Field(default=None, ge=0.0, le=1.0, description="Pre-efficiency v5 score."),
     ] = None
     token_usage: PublicTokenUsage | None = None
+    model_use: PublicModelUse | None = None
     token_efficiency: PublicTokenEfficiency | None = None
     composite_breakdown: PublicCompositeBreakdown | None = None
     seed: Annotated[

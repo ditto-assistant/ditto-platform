@@ -92,6 +92,7 @@ from ditto.api_models import (
     PublicLeaderboardEntry,
     PublicLeaderboardResponse,
     PublicMetricDoc,
+    PublicModelUse,
     PublicOperationsResponse,
     PublicOrphanedSlot,
     PublicProvisionalScore,
@@ -124,6 +125,7 @@ from ditto.api_models import bench_glossary as bench_glossary_data
 from ditto.api_models.agent_status import AgentStatus
 from ditto.api_models.benchmark_capacity import BenchmarkCapacity
 from ditto.api_models.benchmark_progress import BenchmarkProgressStage
+from ditto.api_models.model_use import ModelUseVerdict
 from ditto.api_models.public import (
     BenchServiceability,
     FleetAvailability,
@@ -182,6 +184,7 @@ from ditto.api_server.koth import (
     KothEntry,
     project_koth,
 )
+from ditto.api_server.model_use import model_use_factor, model_use_policy
 from ditto.api_server.storage import ObjectDownloadFailedError
 from ditto.api_server.validator_slot_settings import (
     HostResourceSample,
@@ -1492,6 +1495,22 @@ def _safe_token_usage(details: dict) -> PublicTokenUsage | None:
         return None
 
 
+def _safe_model_use(details: dict) -> PublicModelUse | None:
+    """Project the stored model-use finding onto the public surface.
+
+    Same shape as ``_safe_token_usage``: a malformed blob yields ``None``
+    rather than a 500, because a projection bug must never take the
+    leaderboard down.
+    """
+    raw = details.get("model_use")
+    if not isinstance(raw, dict):
+        return None
+    try:
+        return PublicModelUse.model_validate(raw)
+    except ValidationError:
+        return None
+
+
 def _safe_token_efficiency(details: dict) -> PublicTokenEfficiency | None:
     raw = details.get("token_efficiency")
     if not isinstance(raw, dict):
@@ -1594,6 +1613,10 @@ def _public_entry(
     """Map a ledger row to the public entry, exposing only the safe subset of
     ``details`` (never ``per_case``, which carries the answer key)."""
     details = r.details if isinstance(r.details, dict) else {}
+    public_model_use = _safe_model_use(details)
+    model_use_verdict = (
+        ModelUseVerdict(public_model_use.verdict) if public_model_use else None
+    )
     bench_version = r.bench_version
     dataset_sha256 = details.get("dataset_sha256")
     raw_tokens = details.get("tokens")
@@ -1647,8 +1670,14 @@ def _public_entry(
             else None
         ),
         efficiency_bonus=efficiency_bonus,
+        # The model-use gate composes with the efficiency bonus as another
+        # multiplier on the platform-side ranking composite -- never on the
+        # composite the validator signed. In SHADOW (the default) the factor is
+        # always 1.0, so this line is a no-op until an operator enables
+        # enforcement against a threshold that has already been published.
         effective_composite=(
             bonus_effective_composite(r.composite, efficiency_bonus)
+            * model_use_factor(model_use_verdict, mode=model_use_policy().mode)
             if efficiency_bonus is not None
             else None
         ),
@@ -1678,6 +1707,7 @@ def _public_entry(
         integrity=_safe_integrity(details),
         tokens=tokens,
         token_usage=_safe_token_usage(details),
+        model_use=public_model_use,
         token_efficiency=_safe_token_efficiency(details),
         composite_breakdown=_composite_breakdown(
             tool_mean=r.tool_mean,
@@ -3127,6 +3157,7 @@ def _public_validator_score(s) -> PublicValidatorScore:
     """Map one stored score row to its published, redacted form."""
     details = s.details if isinstance(s.details, dict) else {}
     robustness, audit_pairs = _safe_transform_robustness(details)
+    public_model_use = _safe_model_use(details)
     return PublicValidatorScore(
         validator_hotkey=s.validator_hotkey,
         composite=s.composite,
@@ -3134,6 +3165,7 @@ def _public_validator_score(s) -> PublicValidatorScore:
         memory_mean=s.memory_mean,
         raw_composite=_safe_raw_composite(details),
         token_usage=_safe_token_usage(details),
+        model_use=public_model_use,
         token_efficiency=_safe_token_efficiency(details),
         composite_breakdown=_composite_breakdown(
             tool_mean=s.tool_mean,

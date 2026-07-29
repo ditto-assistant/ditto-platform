@@ -5308,6 +5308,7 @@
       }
       if (m.harness) det += stat("Harness model", m.harness);
       if (e.tokens != null) det += stat("Scoring token spend", e.tokens.toLocaleString());
+      det += modelUseStats(e.model_use);
       // Per-category breakdown renders full width below the stat columns as a dense
       // multi-column grid, so all ~40 categories stay compact and legible. Each cell
       // carries the category purpose as a tooltip and colour-grades its mean.
@@ -5432,6 +5433,35 @@
       if (ev.shiftKey && document.activeElement === first) { ev.preventDefault(); last.focus(); }
       else if (!ev.shiftKey && document.activeElement === last) { ev.preventDefault(); first.focus(); }
     }
+    // Model-use accountability. The server decides the verdict and publishes the
+    // thresholds alongside it, so this renders what it is given and computes
+    // nothing -- a miner and the platform can never be reading different bars.
+    function modelUseStats(mu) {
+      if (!mu) return "";
+      var out = "";
+      if (mu.verdict === "unmeasured") {
+        return stat("Model use", "not measured for this run");
+      }
+      var used = mu.verdict === "used";
+      out += stat("Model use", used ? "used" : "NOT USED — scores zero once enforced");
+      if (mu.prompt_tokens_per_case != null) {
+        out += stat("Prompt tokens / case",
+          Math.round(mu.prompt_tokens_per_case).toLocaleString() +
+          (mu.min_prompt_tokens_per_case != null ? " (min " + mu.min_prompt_tokens_per_case.toLocaleString() + ")" : ""));
+      }
+      if (mu.calls_per_case != null) {
+        out += stat("Model calls / case", mu.calls_per_case.toFixed(2) +
+          (mu.min_calls_per_case != null ? " (min " + mu.min_calls_per_case + ")" : ""));
+      }
+      if (mu.prompt_tokens_per_call != null) {
+        out += stat("Prompt tokens / call",
+          Math.round(mu.prompt_tokens_per_call).toLocaleString() +
+          (mu.min_prompt_tokens_per_call != null ? " (min " + mu.min_prompt_tokens_per_call.toLocaleString() + ")" : ""));
+      }
+      if (!used && mu.reason) out += stat("Why", mu.reason);
+      return out;
+    }
+
     function stat(k, v) {
       return '<div class="stat-row"><span class="k">' + esc(k) + '</span><span class="v">' + esc(v) + '</span></div>';
     }
