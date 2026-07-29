@@ -567,6 +567,8 @@ class TestDashboard:
         assert 'class="timeline-champion-plate"' in body
         assert 'class="timeline-champion-halo"' in body
         assert "lastEmissions ? lastEmissions.champion_miner_hotkey : null" in body
+        # Its label stays in a reserved gutter instead of masking chart data.
+        assert "var plateY = top - plateH - 5;" in body
         # Contracts are banded, not spaced by wall clock.
         assert "var bandWidth = plotWidth / eras.length;" in body
         assert "Each contract gets an equal band, not equal clock time" in body

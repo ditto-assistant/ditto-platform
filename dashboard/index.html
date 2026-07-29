@@ -4087,7 +4087,10 @@
         : Math.max(340, Math.min(470, Math.round(width * 0.42)));
       var left = tight ? 32 : narrow ? 40 : 58;
       var right = narrow ? 14 : 26;
-      var top = narrow ? 22 : 30;
+      // Reserve a slim annotation gutter above the plot. The reigning champion
+      // plate lives here so a high score cannot cover the latest record line or
+      // the finalized-run cloud it is meant to explain.
+      var top = narrow ? 28 : 34;
       var bottom = narrow ? 52 : 62;
       var plotWidth = width - left - right, plotHeight = height - top - bottom;
       var bandWidth = plotWidth / eras.length;
@@ -4278,12 +4281,10 @@
         // space, plus room for the right-aligned score and the gap between.
         var plateW = Math.min(Math.max((crownName.length + 2) * 6.7 + 74, 124), Math.max(plotWidth - 8, 110));
         var plateH = 21;
-        // Prefer the side with room; on a phone the plate sits above the point.
-        var placeLeft = cx + 14 + plateW > width - right;
-        var plateX = narrow
-          ? Math.min(Math.max(cx - plateW / 2, left + 2), width - right - plateW - 2)
-          : (placeLeft ? cx - 14 - plateW : cx + 14);
-        var plateY = narrow ? Math.max(top + 2, cy - 34) : cy - plateH / 2;
+        // Keep the plate in the annotation gutter, never over the data field.
+        // Centre it on the champion where possible and clamp it at both edges.
+        var plateX = Math.min(Math.max(cx - plateW / 2, left + 2), width - right - plateW - 2);
+        var plateY = top - plateH - 5;
         svg.push('<line class="timeline-champion-drop" x1="' + cx.toFixed(2) + '" x2="' + cx.toFixed(2) + '" y1="' + (cy + 8).toFixed(2) + '" y2="' + (height - bottom) + '"></line>');
         svg.push('<circle class="timeline-champion-halo" cx="' + cx.toFixed(2) + '" cy="' + cy.toFixed(2) + '" r="' + (recordR + 13) + '"></circle>');
         svg.push('<circle class="timeline-champion-pulse" cx="' + cx.toFixed(2) + '" cy="' + cy.toFixed(2) + '" r="' + (recordR + 5) + '"></circle>');
