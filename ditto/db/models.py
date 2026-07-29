@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from decimal import Decimal
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from sqlalchemy import (
     JSON,
@@ -3577,4 +3577,144 @@ class ArtifactFetchAudit(Base):
             "fetched_at",
             "seq",
         ),
+    )
+
+
+class OwnerAttestation(Base):
+    """One cryptographically-proven owner link.
+
+    Rows live on the ``owner_attestations`` table.
+
+    Two hotkeys declared to be the same operator, with **both** endpoints
+    having signed. Each half is proved by either that hotkey itself or the
+    coldkey bound to it by payment records; the key kind is recorded per side
+    so a reviewer can grade the evidence. Signatures are retained verbatim so
+    any reviewer -- or any miner disputing a hold -- can re-verify the claim
+    offline without trusting this table.
+
+    The pair is stored in canonical (sorted) order as ``hotkey_lo`` /
+    ``hotkey_hi``. The link is **symmetric**: it says one operator holds both
+    keys, and both key holders consented. Symmetry is safe precisely because
+    both halves are signed -- an attacker cannot mint an edge naming a hotkey
+    they do not control, in either direction. ``lo``/``hi`` carry no meaning
+    beyond giving the pair exactly one representation.
+
+    This table feeds **copy screening only**. It is deliberately absent from
+    :func:`ditto.db.queries.scores.emission_owner_key`, the single authority
+    for emission-slot partitioning, so an attestation can neither create nor
+    collapse an emission position.
+    """
+
+    __tablename__ = "owner_attestations"
+
+    attestation_id: Mapped[UUID] = mapped_column(
+        SaUUID(as_uuid=True), primary_key=True, default=uuid4
+    )
+    """Surrogate key."""
+
+    netuid: Mapped[int] = mapped_column(Integer, nullable=False)
+    """Subnet the attestation was minted for. Signed, so it cannot be replayed
+    onto another subnet running this software."""
+
+    hotkey_lo: Mapped[str] = mapped_column(Text, nullable=False)
+    """Lexicographically smaller of the two linked hotkeys."""
+
+    hotkey_hi: Mapped[str] = mapped_column(Text, nullable=False)
+    """Lexicographically larger of the two linked hotkeys."""
+
+    nonce: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), nullable=False)
+    """Single-use value bound into both signed payloads. Uniquely indexed: this
+    is the replay guard, so a captured attestation cannot be submitted twice."""
+
+    issued_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False
+    )
+    """Miner-supplied mint time, signed. Bounds the mint-to-submit window."""
+
+    lo_key_kind: Mapped[str] = mapped_column(Text, nullable=False)
+    """``hotkey`` or ``coldkey`` -- which key proved the ``lo`` half."""
+
+    lo_signer: Mapped[str] = mapped_column(Text, nullable=False)
+    """SS58 that actually signed the ``lo`` half. Equals ``hotkey_lo`` for a
+    hotkey proof, or the payment-bound coldkey for a coldkey proof."""
+
+    lo_signature: Mapped[str] = mapped_column(Text, nullable=False)
+    """sr25519 signature for the ``lo`` half, lowercase hex, 128 chars."""
+
+    hi_key_kind: Mapped[str] = mapped_column(Text, nullable=False)
+    """``hotkey`` or ``coldkey`` -- which key proved the ``hi`` half."""
+
+    hi_signer: Mapped[str] = mapped_column(Text, nullable=False)
+    """SS58 that actually signed the ``hi`` half."""
+
+    hi_signature: Mapped[str] = mapped_column(Text, nullable=False)
+    """sr25519 signature for the ``hi`` half, lowercase hex, 128 chars."""
+
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+    """Row insertion time. The authoritative "link became active" instant --
+    ``issued_at`` is miner-supplied and only loosely trusted."""
+
+    revoked_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    """When the link stopped counting, or ``NULL`` while active.
+
+    Revocation is **prospective**. Submissions already screened under an active
+    link keep their decision: screening is a point-in-time adjudication, and
+    re-holding already-scored agents on a later revocation would punish
+    reliance and destabilise the ledger. The row is never deleted, so the
+    window during which the link was live stays auditable.
+    """
+
+    revoked_by: Mapped[str | None] = mapped_column(Text, nullable=True)
+    """Who revoked: an operator actor, or the endpoint that withdrew."""
+
+    revoked_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    """Free-text rationale recorded at revocation."""
+
+    __table_args__ = (
+        UniqueConstraint("nonce", name="owner_attestations_nonce_key"),
+        CheckConstraint(
+            "hotkey_lo < hotkey_hi",
+            name="owner_attestations_canonical_order",
+        ),
+        CheckConstraint(
+            "lo_key_kind IN ('hotkey', 'coldkey')",
+            name="owner_attestations_lo_key_kind_check",
+        ),
+        CheckConstraint(
+            "hi_key_kind IN ('hotkey', 'coldkey')",
+            name="owner_attestations_hi_key_kind_check",
+        ),
+        CheckConstraint(
+            "length(lo_signature) = 128",
+            name="owner_attestations_lo_signature_check",
+        ),
+        CheckConstraint(
+            "length(hi_signature) = 128",
+            name="owner_attestations_hi_signature_check",
+        ),
+        CheckConstraint(
+            "(revoked_at IS NULL) = (revoked_by IS NULL)",
+            name="owner_attestations_revocation_pair",
+        ),
+        # At most one *active* link per pair. Canonical ordering means this
+        # constrains the unordered pair, not one arrangement of it. A revoked
+        # link can be re-established with a fresh nonce.
+        Index(
+            "owner_attestations_active_pair_idx",
+            "netuid",
+            "hotkey_lo",
+            "hotkey_hi",
+            unique=True,
+            postgresql_where=text("revoked_at IS NULL"),
+        ),
+        # The screening-time resolution reads both columns; the link is
+        # symmetric so neither side is privileged.
+        Index("owner_attestations_lo_idx", "netuid", "hotkey_lo"),
+        Index("owner_attestations_hi_idx", "netuid", "hotkey_hi"),
     )

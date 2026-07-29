@@ -108,6 +108,7 @@ from ditto.api_models.validator_slot_settings import (
 )
 from ditto.api_server.anti_copy_comparison import ANTI_COPY_ALGORITHM_VERSION
 from ditto.api_server.artifact_audit import client_ip, request_detail
+from ditto.api_server.attestation import expected_netuid
 from ditto.api_server.benchmark_rollout import (
     refresh_rolling_qualification,
 )
@@ -171,6 +172,7 @@ from ditto.db.queries.artifact_fetch_audit import (
     ENDPOINT_VALIDATOR_ARTIFACT,
     record_artifact_fetch,
 )
+from ditto.db.queries.attestation import list_linked_hotkeys
 from ditto.db.queries.audit import (
     EVENT_AUDIT,
     EVENT_FINALIZED,
@@ -4658,10 +4660,24 @@ async def submit_score(
                 miner_coldkey = await get_miner_coldkey_for_agent(
                     session, agent_id=agent_id
                 )
+                # Hotkeys cryptographically proven to be this same operator. A
+                # rotated miner is not a copier of their own earlier work; the
+                # coldkey exemption above cannot see that, because rotating is
+                # exactly what broke coldkey equality. Copy screening only --
+                # this never reaches emission_owner_key.
+                linked_hotkeys = frozenset(
+                    link.hotkey
+                    for link in await list_linked_hotkeys(
+                        session,
+                        hotkey=agent.miner_hotkey,
+                        netuid=expected_netuid(),
+                    )
+                )
                 decision = evaluate_duplicate_signals(
                     agent_id=agent_id,
                     miner_hotkey=agent.miner_hotkey,
                     miner_coldkey=miner_coldkey,
+                    linked_owner_hotkeys=linked_hotkeys,
                     submitted_at=agent.created_at,
                     sha256=agent.sha256,
                     composite=median_composite,

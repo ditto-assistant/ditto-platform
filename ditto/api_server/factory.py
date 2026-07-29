@@ -32,6 +32,7 @@ from ditto.api_server.efficiency_settings import (
 from ditto.api_server.embedding import create_embedder
 from ditto.api_server.endpoints import (
     admin_artifact_release_settings_router,
+    admin_attestation_router,
     admin_benchmark_rollout_router,
     admin_continual_retest_settings_router,
     admin_copy_review_router,
@@ -49,6 +50,7 @@ from ditto.api_server.endpoints import (
     admin_submission_settings_router,
     admin_validation_retry_router,
     admin_validator_slot_settings_router,
+    attestation_router,
     health_router,
     inference_router,
     metrics_router,
@@ -323,6 +325,7 @@ def create_api_server(config: ApiServerConfig | None = None) -> FastAPI:
         # the same paths on both roles.
         app.include_router(inference_router, prefix="/api/v1")
         return app
+    app.include_router(attestation_router, prefix="/api/v1")
     app.include_router(upload_router, prefix="/api/v1")
     app.include_router(retrieval_router, prefix="/api/v1")
     app.include_router(validator_router, prefix="/api/v1")
@@ -331,6 +334,7 @@ def create_api_server(config: ApiServerConfig | None = None) -> FastAPI:
     app.include_router(scoring_router, prefix="/api/v1")
     app.include_router(public_router, prefix="/api/v1")
     app.include_router(admin_artifact_release_settings_router, prefix="/api/v1")
+    app.include_router(admin_attestation_router, prefix="/api/v1")
     app.include_router(admin_benchmark_rollout_router, prefix="/api/v1")
     app.include_router(admin_queue_policy_settings_router, prefix="/api/v1")
     app.include_router(admin_inference_concurrency_settings_router, prefix="/api/v1")

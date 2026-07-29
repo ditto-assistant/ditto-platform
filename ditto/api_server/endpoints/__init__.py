@@ -5,6 +5,9 @@ from __future__ import annotations
 from ditto.api_server.endpoints.admin_artifact_release_settings import (
     router as admin_artifact_release_settings_router,
 )
+from ditto.api_server.endpoints.admin_attestation import (
+    router as admin_attestation_router,
+)
 from ditto.api_server.endpoints.admin_benchmark_rollout import (
     router as admin_benchmark_rollout_router,
 )
@@ -56,6 +59,7 @@ from ditto.api_server.endpoints.admin_validation_retry import (
 from ditto.api_server.endpoints.admin_validator_slot_settings import (
     router as admin_validator_slot_settings_router,
 )
+from ditto.api_server.endpoints.attestation import router as attestation_router
 from ditto.api_server.endpoints.health import router as health_router
 from ditto.api_server.endpoints.inference import router as inference_router
 from ditto.api_server.endpoints.metrics import router as metrics_router
@@ -70,6 +74,7 @@ __all__ = [
     "health_router",
     "inference_router",
     "admin_artifact_release_settings_router",
+    "admin_attestation_router",
     "admin_benchmark_rollout_router",
     "admin_inference_concurrency_settings_router",
     "admin_queue_policy_settings_router",
@@ -92,6 +97,7 @@ __all__ = [
     "retrieval_router",
     "scoring_router",
     "screener_router",
+    "attestation_router",
     "upload_router",
     "validator_router",
 ]
