@@ -147,7 +147,7 @@ item is gated and snapshot-checked exactly like the single route; an item whose
 state moved is **skipped** with a reason rather than force-granted, and all grants
 commit together.
 
-Recoveries are bounded (`MAX_OPERATOR_RECOVERIES_PER_AGENT = 3`) and audited in
+Recoveries are bounded (`MAX_OPERATOR_RECOVERIES_PER_AGENT = 4`) and audited in
 `ValidatorRetryRecovery`.
 
 ## Removing a submission from the queue: withdrawal vs. eviction
