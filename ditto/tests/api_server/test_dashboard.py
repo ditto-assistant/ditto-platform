@@ -192,8 +192,8 @@ class TestDashboard:
             "function isRegistered(e) { return !!e && e.registered === true; }" in body
         )
         assert "e.emission_eligible === true" in body
-        assert ">registration unknown</span>" in body
-        assert 'class="quorum-badge"' in body
+        assert ">unconfirmed</span>" in body
+        assert 'class="quorum-badge tip-chip"' in body
         assert ">Best-scoring agent</span>" in body
         assert 'class="miner-uid" title="Current SN118 UID">UID ' in body
         assert ">Total scores</span>" in body
@@ -487,33 +487,39 @@ class TestDashboard:
     async def test_overview_shows_the_full_board_without_a_disclosure(
         self,
     ) -> None:
-        """The leaderboard is the page, not a sidebar rail beside it.
+        """Standings are never hidden behind a click, wherever the board lives.
 
-        ditto-platform#383 split the overview and moved the nine-column table,
-        the version pills, and the rollout and emissions strips into a collapsed
-        <details>, which hid the run's model, bench version, tool and memory
-        subscores, latency, first-seen, emissions role, and the whole v7 rollout
-        readout behind a click. Everything that reports a standing stays in the
-        first paint.
+        ditto-platform#383 collapsed the nine-column table behind a <details>;
+        that stays banned. The overview now runs a two-pane layout with a
+        compact board, and the full column set has a dedicated Leaderboard
+        page — compactness through a second surface, not through disclosure.
         """
         app = create_api_server(make_api_server_config(dashboard_enabled=True))
         body = (await _get(app, "/")).text
 
-        # No split, no rail, no disclosure around the board.
-        assert '<div class="overview-split">' not in body
+        # The overview pairs a context rail with a compact board, and the full
+        # board lives on its own page; nothing is wrapped in a disclosure.
+        assert '<div class="overview-split">' in body
         assert '<aside class="board-rail"' not in body
         assert '<details class="board-full">' not in body
+        # The dedicated page restores every column the compact view hides.
+        assert (
+            '.page[data-page="leaderboard"] #board .hide-md,\n'
+            '    .page[data-page="leaderboard"] #board .hide-sm '
+            "{ display: table-cell; }" in body
+        )
 
-        # The strips that report emissions and the live rollout are unwrapped.
+        # The strips that report emissions and the live rollout stay unwrapped,
+        # as closing context below the board.
         board = body.index('<div class="board" tabindex="0"')
         for marker in (
             '<div class="emissions-strip" id="emissions-strip"',
             '<div class="rollout-strip" id="rollout-strip"',
-            'id="leaderboard-version-pills"',
             'id="leaderboard-notice"',
         ):
             assert marker in body
-            assert body.index(marker) < board
+            assert body.index(marker) > board
+        assert 'id="leaderboard-version-pills"' in body
 
         # The columns the rail dropped are still column headers.
         for sort_key in (
@@ -1334,16 +1340,22 @@ class TestDashboard:
 
     async def test_sidebar_shell_routes_every_section(self) -> None:
         # The dashboard is a sidebar shell with hash-routed pages; the theme
-        # switcher moved into the sidebar and the leaderboard is consolidated
-        # onto the Overview page (no separate Leaderboard tab).
+        # switcher lives in the sidebar and the leaderboard has a dedicated
+        # page alongside its compact home in the overview.
         app = create_api_server(make_api_server_config(dashboard_enabled=True))
         body = (await _get(app, "/")).text
         assert '<aside class="sidebar"' in body
-        for page in ("overview", "operations", "submissions", "benchmark"):
+        for page in (
+            "overview",
+            "leaderboard",
+            "operations",
+            "submissions",
+            "benchmark",
+        ):
             assert f'href="#/{page}"' in body
             assert f'data-page="{page}"' in body
-        assert 'href="#/leaderboard"' not in body
-        assert 'id="leaderboard-title">Leaderboard</h2>' in body  # folded into Overview
+        assert 'id="leaderboard-title">Leaderboard</h2>' in body
+        assert 'id="leaderboard-page-host"' in body  # the page's portal target
         assert 'data-theme-choice="system"' in body  # switcher still wired
 
     async def test_advertises_public_source_repositories(self) -> None:
