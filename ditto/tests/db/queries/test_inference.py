@@ -3,6 +3,7 @@ from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
+from prometheus_client import REGISTRY
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ditto.api_models.inference_concurrency_settings import (
@@ -1346,3 +1347,164 @@ async def test_new_grants_record_which_meter_booked_them(
         _ticket, grant, _bearer, _now = await _live_grant(session)
         assert grant.usage_accounting_version == USAGE_ACCOUNTING_VERSION
         assert USAGE_ACCOUNTING_VERSION == 2
+
+
+def _at_capacity_count(lane: str, scope: str) -> float:
+    """Current value of the admission backpressure counter for one gate.
+
+    Counters are process-global and every test in the session shares them, so
+    callers must diff around the action under test rather than assert absolute
+    values.
+    """
+    return (
+        REGISTRY.get_sample_value(
+            "ditto_inference_admission_at_capacity_total",
+            {"lane": lane, "scope": scope},
+        )
+        or 0.0
+    )
+
+
+@pytest.mark.asyncio
+async def test_emergency_brake_records_which_gate_declined(
+    session: AsyncSession,
+) -> None:
+    """Lowering the per-ticket ceiling must be *visible*, not just effective.
+
+    The brake already worked; nothing exported the fact that it had engaged.
+    That is how the embedding ceiling spent months suspected of throttling v7
+    runs while never once binding -- the only way to check was to reconstruct
+    in-flight intervals from ``inference_requests`` after the fact. An operator
+    applying the brake should be able to watch it take hold on a scrape, and an
+    operator wondering whether a ceiling is the problem should be able to see a
+    flat zero and stop wondering.
+    """
+    config = replace(_config(), embedding_per_ticket_concurrency=1)
+    before = _at_capacity_count("embedding", "per_ticket")
+    async with session.begin():
+        _ticket, grant, bearer, now = await _live_v7_embedding_grant(session, config)
+        admitted = await begin_inference_request(
+            session,
+            grant_id=grant.grant_id,
+            nonce=uuid4(),
+            bearer=bearer,
+            model=config.embedding_model,
+            token_reservation=10,
+            now=now,
+            config=config,
+            request_kind="embedding",
+        )
+        assert isinstance(admitted, tuple)
+
+        declined = await begin_inference_request(
+            session,
+            grant_id=grant.grant_id,
+            nonce=uuid4(),
+            bearer=bearer,
+            model=config.embedding_model,
+            token_reservation=10,
+            now=now,
+            config=config,
+            request_kind="embedding",
+        )
+
+    # The wire contract is unchanged: still one undifferentiated AT_CAPACITY,
+    # because a broker's correct response to every gate is identical.
+    assert declined is InferenceDecline.AT_CAPACITY
+    # The operator's view is the one that gained resolution.
+    assert _at_capacity_count("embedding", "per_ticket") == before + 1
+
+
+@pytest.mark.asyncio
+async def test_capacity_metric_separates_the_two_lanes(
+    session: AsyncSession,
+) -> None:
+    """A chat decline must never be counted against the embedding ceiling.
+
+    Both lanes share one admission function and one decline value, so without
+    the ``lane`` label the counter would answer "is the embedding ceiling
+    binding?" with chat's backpressure -- which is exactly the conflation that
+    made the original diagnosis wrong.
+    """
+    config = replace(_config(), per_ticket_concurrency=1)
+    before_chat = _at_capacity_count("chat", "per_ticket")
+    before_embedding = _at_capacity_count("embedding", "per_ticket")
+    async with session.begin():
+        _ticket, grant, bearer, now = await _live_grant(session, config)
+        admitted = await begin_inference_request(
+            session,
+            grant_id=grant.grant_id,
+            nonce=uuid4(),
+            bearer=bearer,
+            model=_CHAT_MODEL,
+            token_reservation=1,
+            now=now,
+            config=config,
+        )
+        assert isinstance(admitted, tuple)
+        declined = await begin_inference_request(
+            session,
+            grant_id=grant.grant_id,
+            nonce=uuid4(),
+            bearer=bearer,
+            model=_CHAT_MODEL,
+            token_reservation=1,
+            now=now,
+            config=config,
+        )
+
+    assert declined is InferenceDecline.AT_CAPACITY
+    assert _at_capacity_count("chat", "per_ticket") == before_chat + 1
+    assert _at_capacity_count("embedding", "per_ticket") == before_embedding
+
+
+@pytest.mark.asyncio
+async def test_global_ceiling_is_reported_as_global_not_as_per_ticket(
+    session: AsyncSession,
+) -> None:
+    """The five wide gates used to share one anonymous ``or``.
+
+    "The lane is full" and "the FLEET ceiling is full" are the same event to a
+    validator and completely different events to the operator deciding which
+    number to move. With a per-ticket allowance well above the global one, the
+    global gate is the only one that can trip, and it has to say so.
+    """
+    config = replace(
+        _config(),
+        embedding_per_ticket_concurrency=8,
+        embedding_per_validator_concurrency=8,
+        embedding_global_concurrency=2,
+    )
+    before_global = _at_capacity_count("embedding", "global")
+    before_per_ticket = _at_capacity_count("embedding", "per_ticket")
+    async with session.begin():
+        _ticket, grant, bearer, now = await _live_v7_embedding_grant(session, config)
+        for _ in range(2):
+            admitted = await begin_inference_request(
+                session,
+                grant_id=grant.grant_id,
+                nonce=uuid4(),
+                bearer=bearer,
+                model=config.embedding_model,
+                token_reservation=10,
+                now=now,
+                config=config,
+                request_kind="embedding",
+            )
+            assert isinstance(admitted, tuple)
+
+        declined = await begin_inference_request(
+            session,
+            grant_id=grant.grant_id,
+            nonce=uuid4(),
+            bearer=bearer,
+            model=config.embedding_model,
+            token_reservation=10,
+            now=now,
+            config=config,
+            request_kind="embedding",
+        )
+
+    assert declined is InferenceDecline.AT_CAPACITY
+    assert _at_capacity_count("embedding", "global") == before_global + 1
+    assert _at_capacity_count("embedding", "per_ticket") == before_per_ticket
