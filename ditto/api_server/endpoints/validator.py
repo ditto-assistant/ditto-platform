@@ -116,7 +116,7 @@ from ditto.api_server.continual_retest_settings import (
     ContinualRetestSettingsResolver,
     rollout_standdown_reason,
 )
-from ditto.api_server.crn import champion_anchored_seeds
+from ditto.api_server.crn import champion_anchored_seeds, fold_seed_bound
 from ditto.api_server.datapipeline import DatasetGenerator
 from ditto.api_server.dependencies import (
     get_chain_client,
@@ -149,8 +149,10 @@ from ditto.api_server.validator_slot_settings import (
     DEFAULT_SETTINGS as SLOT_SETTINGS_DEFAULT,
 )
 from ditto.api_server.validator_slot_settings import (
+    DISK_RESTRICTED_SLOTS,
     ValidatorSlotSettingsResolver,
     allowed_slot_count,
+    disk_ceiling_tripped,
 )
 from ditto.chain import ChainError
 from ditto.db.models import (
@@ -245,7 +247,11 @@ from ditto.db.queries.validator_auth import (
     ValidatorRequestReplayError,
     consume_validator_nonce,
 )
-from ditto.metrics import VALIDATOR_HEARTBEAT_PAYLOAD_DEGRADED
+from ditto.metrics import (
+    VALIDATOR_DISPATCH_DECLINED,
+    VALIDATOR_HEARTBEAT_PAYLOAD_DEGRADED,
+    DispatchDeclineReason,
+)
 
 if TYPE_CHECKING:
     from ditto.api_server.config import InferenceProxyConfig
@@ -494,6 +500,66 @@ def _slot_cap_declines(
     if _slot_ordinal(slot_id) >= HARD_SLOT_CEILING:
         return True
     return len({held for held in held_slots if held != slot_id}) >= allowed_slots
+
+
+def _slot_cap_decline_reason(
+    *,
+    slot_id: str,
+    settings: ValidatorSlotSettings,
+    advertised_slots: int,
+    disk_percent: int | None,
+) -> DispatchDeclineReason:
+    """Name the lever behind a :func:`_slot_cap_declines` refusal.
+
+    Observability only -- read *after* the decision, never as part of it, so
+    that a wrong label can never cost a validator a lease.
+
+    :func:`allowed_slot_count` folds three separate operator levers into one
+    integer, and an operator staring at an idle validator cannot tell which one
+    is holding it back. The three answers want different actions: a
+    ``slot_ceiling`` id is a validator sending something outside the
+    ``^slot-[0-7]$`` wire contract (a bug on their side, not a policy), a
+    ``disk_breaker`` clears itself once the host frees disk, and a ``slot_cap``
+    is a backroom setting somebody has to raise.
+
+    The breaker is only named when it actually *narrowed* the allowance: with a
+    ``max_concurrent_slots`` already at or below :data:`DISK_RESTRICTED_SLOTS`,
+    the operator cap alone would have declined this poll, and blaming the disk
+    would send whoever is reading the dashboard to clear space for nothing.
+    """
+    if _slot_ordinal(slot_id) >= HARD_SLOT_CEILING:
+        return "slot_ceiling"
+    if disk_ceiling_tripped(settings, disk_percent=disk_percent) and (
+        allowed_slot_count(
+            settings, advertised_slots=advertised_slots, disk_percent=None
+        )
+        > DISK_RESTRICTED_SLOTS
+    ):
+        return "disk_breaker"
+    return "slot_cap"
+
+
+def _record_dispatch_decline(
+    reason: DispatchDeclineReason, *, validator_hotkey: str, slot_id: str
+) -> None:
+    """Count and log a validator job poll that is about to be answered 204.
+
+    Every ``return Response(status_code=204)`` on the dispatch path pairs with a
+    call to this, so the counter's reasons partition the declines rather than
+    sampling them: a 204 that no reason explains is a missing call site, and the
+    sum across reasons is the total decline rate.
+
+    The hotkey and slot stay off the counter (per-validator series would make
+    it unusable at fleet size) and go on the log line, which is where an
+    operator lands once the metric has told them *which* gate to go read about.
+    """
+    VALIDATOR_DISPATCH_DECLINED.labels(reason=reason).inc()
+    logger.info(
+        "declined job reason=%s validator=%s slot=%s",
+        reason,
+        validator_hotkey,
+        slot_id,
+    )
 
 
 async def _idle_retest_slot(
@@ -2020,6 +2086,17 @@ async def request_job(
                 capacity.admission != "accepting"
                 or slot_id not in capacity.healthy_slots
             ):
+                # Two distinct operator stories share one gate: the whole
+                # validator has closed admission (a drain, an upgrade), or the
+                # validator is up but is not offering *this* slot. Split them on
+                # the way out so an idle fleet reads as one or the other.
+                _record_dispatch_decline(
+                    "not_accepting"
+                    if capacity.admission != "accepting"
+                    else "slot_not_healthy",
+                    validator_hotkey=payload.validator_hotkey,
+                    slot_id=slot_id,
+                )
                 return Response(status_code=204)
             # Operator slot cap. Validators advertise the capacity their host
             # can offer; how much of it the fleet actually uses is an operator
@@ -2038,10 +2115,11 @@ async def request_job(
             # The exemption cannot be forged -- heartbeat ingest drops any
             # active slot with no matching open ticket -- so ``capacity.active``
             # only ever names slots the platform itself leased.
+            disk_percent = _heartbeat_disk_percent(heartbeat)
             allowed_slots = allowed_slot_count(
                 slot_settings,
                 advertised_slots=capacity.configured_slots,
-                disk_percent=_heartbeat_disk_percent(heartbeat),
+                disk_percent=disk_percent,
             )
             if _slot_cap_declines(
                 slot_id=slot_id,
@@ -2053,6 +2131,18 @@ async def request_job(
                     now=now,
                 ),
             ):
+                # Same disk sample the decision used, so the label can never
+                # describe a different heartbeat than the refusal did.
+                _record_dispatch_decline(
+                    _slot_cap_decline_reason(
+                        slot_id=slot_id,
+                        settings=slot_settings,
+                        advertised_slots=capacity.configured_slots,
+                        disk_percent=disk_percent,
+                    ),
+                    validator_hotkey=payload.validator_hotkey,
+                    slot_id=slot_id,
+                )
                 return Response(status_code=204)
         if rollout is not None:
             fresh_lane_due = (
@@ -2136,17 +2226,7 @@ async def request_job(
                     ),
                 )
         else:
-            ticket = await activate_next_score_retest(
-                session,
-                validator_hotkey=payload.validator_hotkey,
-                now=now,
-                supports_version=lambda version: (
-                    heartbeat is not None
-                    and heartbeat_supports_version(heartbeat, now=now, version=version)
-                ),
-                validator_running_benchmark=slot_running_benchmark,
-                slot_id=slot_id,
-            )
+            ticket = None
         if ticket is None:
             # During an open rollout, a source-version validator may resume a
             # source-version lease. Once activation completes, only the active
@@ -2219,6 +2299,11 @@ async def request_job(
                         # The signed heartbeat says this exact worker is still
                         # occupied, or another authorization lane owns the
                         # lease; leave it untouched and issue nothing else.
+                        _record_dispatch_decline(
+                            "slot_occupied",
+                            validator_hotkey=payload.validator_hotkey,
+                            slot_id=slot_id,
+                        )
                         return Response(status_code=204)
                     stale_ticket.status = TicketStatus.EXPIRED
                     stale_ticket.deadline = now
@@ -2256,6 +2341,22 @@ async def request_job(
                         ),
                     )
                 )
+            if ticket is None and rollout is None:
+                # Operator score re-tests are idle-capacity backfill. Ordinary
+                # quorum scoring owns the slot whenever it has a candidate.
+                ticket = await activate_next_score_retest(
+                    session,
+                    validator_hotkey=payload.validator_hotkey,
+                    now=now,
+                    supports_version=lambda version: (
+                        heartbeat is not None
+                        and heartbeat_supports_version(
+                            heartbeat, now=now, version=version
+                        )
+                    ),
+                    validator_running_benchmark=slot_running_benchmark,
+                    slot_id=slot_id,
+                )
             if ticket is None and source_backfill_rollout is not None:
                 # Once the inherited top ten is fully established on the new
                 # benchmark, an otherwise-idle compatible slot may help settle
@@ -2285,6 +2386,14 @@ async def request_job(
                     ),
                 )
             if ticket is None and rollout is not None:
+                # Every issuing lane an open rollout offers has been walked and
+                # none had an eligible row: dispatch was willing, the queue was
+                # empty for this validator.
+                _record_dispatch_decline(
+                    "no_candidate",
+                    validator_hotkey=payload.validator_hotkey,
+                    slot_id=slot_id,
+                )
                 return Response(status_code=204)
         if ticket is not None:
             agent = await get_agent_by_id(session, agent_id=ticket.agent_id)
@@ -2400,6 +2509,13 @@ async def request_job(
                 ),
             )
     if job is None:
+        # Reached only once every issuing lane has been walked, so this is the
+        # candidate walk coming back empty -- not a gate refusing to issue.
+        _record_dispatch_decline(
+            "no_candidate",
+            validator_hotkey=payload.validator_hotkey,
+            slot_id=slot_id,
+        )
         # Only a fully authenticated, compatible, replay-checked idle poll can
         # trigger bounded convergence. The next poll sees any newly queued work.
         await _refresh_qualification_if_due(
@@ -2481,10 +2597,12 @@ async def _current_koth_entries(
         },
         mode=wave_membership,
         anchored_seeds=(
-            champion_anchored_seeds(
-                raw_members[0].agent_id,
-                version=canonical_version,
-                max_seeds=TOP5_MAX_CONFIRMATION_SEEDS,
+            fold_seed_bound(
+                champion_agent_id=raw_members[0].agent_id,
+                anchor_version=canonical_version,
+                seeds_by_agent={
+                    agent_id: values.keys() for agent_id, values in history.items()
+                },
             )
             if raw_members
             else None

@@ -3,20 +3,30 @@
 
 Two modes:
 
-``check_migration_order.py [base_ref]``
-    The CI mode. Validates the PR's migrations against ``base_ref``
-    (default ``origin/main``): nothing removed, nothing edited, dated
-    forward, and resolving to exactly one head.
+``check_migration_order.py [base_ref] [head_ref]``
+    The CI mode. Validates *head_ref* -- the working tree by default --
+    against ``base_ref`` (default ``origin/main``): nothing removed,
+    nothing edited, dated forward, and the **merge result** resolving to
+    exactly one head.
+
+    That last one is the whole point, and it is deliberately asserted
+    against ``base_ref + head_ref`` rather than against the branch alone.
+    A branch cut before a second migration landed on ``main`` is perfectly
+    linear on its own; the divergence exists only in the merge, which is
+    the thing that gets deployed. Passing ``head_ref`` explicitly lets the
+    check be re-run for an open PR from any checkout -- notably from
+    ``main`` after it moves, which is when a green PR silently goes stale.
 
 ``check_migration_order.py --head``
     The deploy mode. Resolves the *working tree's* migrations to a single
     head and prints it, using only the standard library -- no venv, no
     alembic import, no database. ``scripts/update.sh`` runs this before it
-    touches the host, because the CI mode cannot catch the case that
-    matters at deploy time: two PRs that each extended the single head of
-    ``main`` independently, passed their own checks, and produced two
-    heads only once both had merged. ``alembic upgrade head`` then refuses
-    to run with ``Multiple head revisions are present``.
+    touches the host: a last line of defence for anything that reached
+    ``main`` without passing the merge-result check above (a bypass, a
+    direct push, a check that was never required).
+
+Both failure paths name every head, the file each lives in, and the two
+ways to reconcile them. Alembic's own error carries none of that.
 """
 
 from __future__ import annotations
@@ -181,12 +191,135 @@ def _head_migrations() -> list[Migration]:
     return [parse_migration(str(path), path.read_text()) for path in paths]
 
 
-def check(base_ref: str) -> tuple[int, str, str]:
-    """Validate HEAD against the immutable migration history on *base_ref*."""
-    base_paths = set(_paths_at(base_ref))
-    head_paths = {str(path) for path in MIGRATIONS_DIR.glob("*.py")}
+def _merge_base(base_ref: str, head_ref: str) -> str:
+    return _git("merge-base", base_ref, head_ref).strip()
 
-    removed = sorted(base_paths - head_paths)
+
+def _paths_for(ref: str | None) -> set[str]:
+    """Migration paths at *ref*, or in the working tree when it is ``None``."""
+    if ref is None:
+        return {str(path) for path in MIGRATIONS_DIR.glob("*.py")}
+    return set(_paths_at(ref))
+
+
+def _migrations_for(ref: str | None) -> list[Migration]:
+    return _head_migrations() if ref is None else _migrations_at(ref)
+
+
+def merge_result(base: list[Migration], head: list[Migration]) -> list[Migration]:
+    """The ``alembic/versions`` content that merging *head* into *base* yields.
+
+    Migrations are immutable and none may be deleted -- :func:`check` asserts
+    both against the merge base first -- so the merge is exactly the union of
+    the two file sets. That means the merge result can be resolved without
+    performing the merge, from any checkout, which is what lets this run
+    against a PR branch that was never rebased.
+    """
+    by_path = {migration.path: migration for migration in head}
+    by_path.update({migration.path: migration for migration in base})
+    return [by_path[path] for path in sorted(by_path)]
+
+
+def _head_table(
+    heads: list[str],
+    by_revision: dict[str, Migration],
+    base_heads: frozenset[str] | set[str] | None = None,
+    base_ref: str | None = None,
+) -> str:
+    """One line per head: the revision, the file it lives in, and its origin."""
+    rows = []
+    for revision in heads:
+        migration = by_revision.get(revision)
+        row = f"    {revision}  {migration.path if migration else '<unknown file>'}"
+        if base_heads is not None:
+            row += (
+                f"  (already a head on {base_ref})"
+                if revision in base_heads
+                else "  (added by this branch)"
+            )
+        rows.append(row)
+    return "\n".join(rows)
+
+
+def _remedy(
+    heads: list[str], base_ref: str = "origin/main", base_head: str | None = None
+) -> str:
+    """Why two heads break everything, and the two ways to reconcile them."""
+    rebase = (
+        f"  * rebase onto current {base_ref} and repoint down_revision at its "
+        f"head {base_head}"
+        if base_head is not None
+        else f"  * rebase onto current {base_ref} and repoint down_revision at its head"
+    )
+    return "\n".join(
+        [
+            "Alembic linears by down_revision, not by merge date, so two "
+            "branches that each extend the same parent stay divergent however "
+            "git merges them. `alembic upgrade head` then refuses to run with "
+            "\"Multiple head revisions are present for given argument 'head'\", "
+            "which fails every migration -- the deploy and the whole DB test "
+            "tier with it.",
+            "Reconcile on this branch, before merging, either way:",
+            f"{rebase} (renumbering the YYYY_MM_DD_ filename too if it now "
+            "precedes the newest migration there), or",
+            f'  * uv run alembic merge -m "merge heads" {" ".join(heads)}',
+            "Review both branches for conflicting changes to the same table "
+            "before assuming an empty merge revision is correct.",
+        ]
+    )
+
+
+def require_single_merged_head(
+    merged: list[Migration], base_ref: str, base_heads: set[str]
+) -> str:
+    """Return the merge result's sole head, or explain the divergence.
+
+    This is the assertion the 2026-07-28 outage needed. Validating a branch on
+    its own passes a PR that was cut before a second migration landed on
+    *base_ref*: both PRs are individually linear and the second head exists
+    only in the merge -- which is the thing that actually gets deployed.
+    """
+    heads = sorted(_history_heads(merged, f"{base_ref} + this branch"))
+    if len(heads) == 1:
+        return heads[0]
+
+    by_revision = {migration.revision: migration for migration in merged}
+    message = [
+        f"merging this branch into {base_ref} would leave {len(heads)} "
+        "Alembic heads, not one:",
+        _head_table(heads, by_revision, base_heads=base_heads, base_ref=base_ref),
+    ]
+    if all(revision in base_heads for revision in heads):
+        message.append(
+            f"Every head above is already on {base_ref}, so this branch did "
+            "not cause the divergence -- but it does not reconcile it either, "
+            f"and {base_ref} stays undeployable until something does."
+        )
+    message.append(
+        _remedy(
+            heads,
+            base_ref=base_ref,
+            base_head=next(iter(base_heads)) if len(base_heads) == 1 else None,
+        )
+    )
+    raise MigrationError("\n".join(message))
+
+
+def check(base_ref: str, head_ref: str | None = None) -> tuple[int, str, str]:
+    """Validate *head_ref* -- the working tree by default -- against *base_ref*.
+
+    Nothing removed, nothing edited, dated forward, and -- the assertion that
+    matters -- the *merge result* resolves to exactly one head.
+    """
+    label = head_ref or "HEAD"
+    base_paths = set(_paths_at(base_ref))
+    head_paths = _paths_for(head_ref)
+
+    # Against the merge base, not the base tip: a migration that landed on
+    # `base_ref` after this branch was cut is missing from the branch without
+    # the branch having removed anything.
+    ancestor_paths = set(_paths_at(_merge_base(base_ref, label)))
+    removed = sorted(ancestor_paths - head_paths)
     if removed:
         raise MigrationError("existing migrations were removed: " + ", ".join(removed))
 
@@ -194,7 +327,7 @@ def check(base_ref: str) -> tuple[int, str, str]:
         "diff",
         "--name-only",
         "--diff-filter=M",
-        f"{base_ref}...HEAD",
+        f"{base_ref}...{label}",
         "--",
         str(MIGRATIONS_DIR),
     ).splitlines()
@@ -202,9 +335,11 @@ def check(base_ref: str) -> tuple[int, str, str]:
         raise MigrationError("existing migrations are immutable: " + ", ".join(changed))
 
     base_migrations = _migrations_at(base_ref)
-    head_migrations = _head_migrations()
+    head_migrations = _migrations_for(head_ref)
     base_heads = _history_heads(base_migrations, base_ref)
-    head_revision = validate_linear_history(head_migrations, "HEAD")
+    merged_head = require_single_merged_head(
+        merge_result(base_migrations, head_migrations), base_ref, base_heads
+    )
 
     new_paths = sorted(head_paths - base_paths)
     base_dates = [MIGRATION_NAME.match(Path(path).name) for path in base_paths]
@@ -228,10 +363,10 @@ def check(base_ref: str) -> tuple[int, str, str]:
                 f"{latest_base_date}"
             )
 
-    if new_paths and head_revision in base_heads:
-        raise MigrationError("new migrations do not extend the base migration head")
-
-    return len(new_paths), ", ".join(sorted(base_heads)), head_revision
+    # "new migrations extend the base head" needs no separate assertion: a new
+    # migration that chains off anything else is a second head, and
+    # require_single_merged_head has already rejected it by name.
+    return len(new_paths), ", ".join(sorted(base_heads)), merged_head
 
 
 def resolve_working_tree_head() -> str:
@@ -244,15 +379,12 @@ def resolve_working_tree_head() -> str:
     heads = sorted(_history_heads(migrations, "working tree"))
     if len(heads) == 1:
         return heads[0]
-    joined = " ".join(heads)
+    by_revision = {migration.revision: migration for migration in migrations}
     raise MigrationError(
         f"{len(heads)} head revisions are present: {', '.join(heads)}.\n"
-        "`alembic upgrade head` cannot choose between them and will refuse to "
-        "run. Two migrations were merged that each extended the same parent, "
-        "so a human has to say how they combine. Reconcile on a branch with:\n"
-        f'    uv run alembic merge -m "merge heads" {joined}\n'
-        "Review the merged branches for conflicting changes to the same table "
-        "before assuming an empty merge revision is correct."
+        + _head_table(heads, by_revision)
+        + "\n"
+        + _remedy(heads)
     )
 
 
@@ -271,14 +403,15 @@ def main() -> int:
     if len(sys.argv) > 1 and sys.argv[1] == "--head":
         return head_mode()
     base_ref = sys.argv[1] if len(sys.argv) > 1 else "origin/main"
+    head_ref = sys.argv[2] if len(sys.argv) > 2 else None
     try:
-        count, base_head, head = check(base_ref)
+        count, base_head, head = check(base_ref, head_ref)
     except (MigrationError, subprocess.CalledProcessError) as exc:
         print(f"migration-order: {exc}", file=sys.stderr)
         return 1
     print(
         f"migration-order: ok ({count} new migration(s); "
-        f"{base_ref} head {base_head}; HEAD head {head})"
+        f"{base_ref} head {base_head}; merged head {head})"
     )
     return 0
 

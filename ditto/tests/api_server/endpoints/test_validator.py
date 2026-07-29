@@ -106,6 +106,7 @@ from ditto.db.queries.artifact_fetch_audit import (
     AUDIT_WRITE_FAILED,
     record_artifact_fetch,
 )
+from ditto.db.queries.audit import EVENT_SCORE_RETEST_QUEUED, append_audit_entry
 from ditto.db.queries.confirmation_scores import (
     ConfirmationSeedScore,
     append_confirmation_scores,
@@ -4685,6 +4686,96 @@ class TestRequestJob:
         assert before + timedelta(minutes=90) <= deadline
         assert deadline <= after + timedelta(minutes=90)
 
+    async def test_canonical_candidate_preempts_runnable_score_retest(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """A saturated re-test lane is backfill, never queue precedence."""
+        now = datetime.now(UTC)
+        retest_agent = await _seed_agent(
+            session_maker,
+            status=AgentStatus.SCORED,
+            name="queued-retest",
+        )
+        canonical_agent = await _seed_agent(
+            session_maker,
+            status=AgentStatus.EVALUATING,
+            name="waiting-canonical",
+            miner_hotkey="5WaitingCanonical",
+            sha256="cd" * 32,
+        )
+        async with session_maker() as session, session.begin():
+            session.add(
+                ValidatorTicket(
+                    agent_id=retest_agent,
+                    bench_version=2,
+                    validator_hotkey=_VALIDATOR_HOTKEY,
+                    status=TicketStatus.SCORED,
+                    issued_at=now - timedelta(hours=2),
+                    deadline=now - timedelta(minutes=30),
+                    purpose=TicketPurpose.CANONICAL_QUORUM,
+                    purpose_revision=1,
+                )
+            )
+            session.add(
+                Score(
+                    agent_id=retest_agent,
+                    bench_version=2,
+                    validator_hotkey=_VALIDATOR_HOTKEY,
+                    run_id="queued-retest-run",
+                    seed=1,
+                    composite=0.8,
+                    tool_mean=0.8,
+                    memory_mean=0.8,
+                    median_ms=100,
+                    n=114,
+                    details={"bench_version": 2},
+                    generated_at=now - timedelta(hours=1),
+                )
+            )
+            await append_audit_entry(
+                session,
+                agent_id=retest_agent,
+                validator_hotkey=_VALIDATOR_HOTKEY,
+                event=EVENT_SCORE_RETEST_QUEUED,
+                payload={
+                    "request_id": str(uuid4()),
+                    "bench_version": 2,
+                    "run_id": "queued-retest-run",
+                },
+                recorded_at=now,
+            )
+        capabilities = {
+            **_V7_CAPABILITIES,
+            "scorer_benchmarks": {
+                **_V9_SCORER,
+                "observed_at": int(now.timestamp()),
+            },
+        }
+        await _seed_validator_heartbeat(
+            session_maker,
+            protocol_version=9,
+            capabilities=capabilities,
+            stack=_V7_STACK,
+        )
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        response = await client.post(
+            "/api/v1/validator/job", headers=_AUTH_HEADER, json=_job_payload()
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["agent_id"] == str(canonical_agent)
+        async with session_maker() as session:
+            retest_ticket = await session.get(
+                ValidatorTicket, (retest_agent, 2, _VALIDATOR_HOTKEY)
+            )
+            assert retest_ticket is not None
+            assert retest_ticket.status == TicketStatus.SCORED
+
     async def test_no_work_returns_204(
         self,
         app: FastAPI,
@@ -4697,6 +4788,39 @@ class TestRequestJob:
             "/api/v1/validator/job", headers=_AUTH_HEADER, json=_job_payload()
         )
         assert resp.status_code == 204
+
+    async def test_no_work_is_counted_as_an_empty_queue_not_a_refusal(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """An idle fleet has to be readable off the metric, not off raw SQL.
+
+        This poll clears every gate and finds nothing to hand out, which is the
+        one decline an operator must be able to tell apart from dispatch
+        refusing to issue -- the reasons look identical over the wire.
+        """
+        from prometheus_client import REGISTRY
+
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        def counted(reason: str) -> float:
+            return (
+                REGISTRY.get_sample_value(
+                    "ditto_validator_dispatch_declined_total", {"reason": reason}
+                )
+                or 0.0
+            )
+
+        before = counted("no_candidate")
+        resp = await client.post(
+            "/api/v1/validator/job", headers=_AUTH_HEADER, json=_job_payload()
+        )
+
+        assert resp.status_code == 204
+        assert counted("no_candidate") == before + 1
 
     async def test_caps_at_quorum_across_validators(
         self,

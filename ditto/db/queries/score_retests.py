@@ -122,7 +122,35 @@ async def activate_next_score_retest(
     never mutate the accepted score. An unrelated live assignment keeps all
     queued requests waiting.
     """
+    # Look before locking. A validator with no re-test lifecycle at all cannot
+    # reach any mutating branch below -- `issued` needs a REQUESTED entry and
+    # `queued` needs a QUEUED one, so an empty history returns None down every
+    # path -- and this is the overwhelmingly common case: re-tests are an
+    # operator action, and on prod exactly one hotkey has ever had one.
+    #
+    # It is not a free no-op, though, and that is the point. Taking the locks
+    # first meant every score submission ended by widening its lock footprint
+    # from "my one ticket" to a validator-wide `SELECT ... FOR UPDATE` over
+    # every issued ticket that hotkey holds, acquired LAST -- after the
+    # transaction already held the agent row and its own ticket row. The
+    # issuance path guards a *narrower* key (`validator:slot`, not `validator`),
+    # so the two do not exclude each other and the orders invert. Postgres broke
+    # the resulting cycle the only way it can: by aborting one side, which on
+    # this path is a 500 that throws away a finished 90-minute run and bills the
+    # miner a `scoring_error` for it.
+    #
+    # This read is unlocked, so a re-test queued concurrently may be missed.
+    # That is safe by construction: the queueing transaction runs its own
+    # activation under the lock, and any later job request or score submission
+    # picks it up. Losing a lock a caller cannot use is not a lost re-test.
+    if not await latest_retest_events_for_validator(
+        session, validator_hotkey=validator_hotkey
+    ):
+        return None
+
     await lock_validator(session, validator_hotkey)
+    # Re-read under the lock; the unlocked probe above decides only whether
+    # there is anything worth locking for, never what to do with it.
     latest = await latest_retest_events_for_validator(
         session, validator_hotkey=validator_hotkey
     )
