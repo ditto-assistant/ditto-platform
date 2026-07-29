@@ -170,7 +170,7 @@ class TestSlotCapDeclineReason:
                 slot_id="slot-1",
                 settings=settings,
                 advertised_slots=4,
-                disk_percent=99,
+                disk_percent=92,
             )
             == "slot_cap"
         )
@@ -186,7 +186,7 @@ class TestSlotCapDeclineReason:
                 slot_id="slot-0",
                 settings=settings,
                 advertised_slots=1,
-                disk_percent=99,
+                disk_percent=92,
             )
             == "slot_cap"
         )

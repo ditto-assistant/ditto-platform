@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING, Literal
 from pydantic import ValidationError
 
 from ditto.api_models.validator_slot_settings import (
+    CEILING_DISABLED,
     EffectiveValidatorSlotSettings,
     ValidatorSlotSettings,
 )
@@ -45,7 +46,8 @@ logger = logging.getLogger(__name__)
 DEFAULT_SETTINGS = ValidatorSlotSettings()
 """The policy in force when no revision has ever been written -- and the
 fallback for every failure path. ``max_concurrent_slots=2``,
-``disk_percent_ceiling=90``."""
+``disk_percent_ceiling=90``, ``memory_percent_ceiling=90``,
+``cpu_percent_ceiling=0`` (off), ``resource_block_percent_ceiling=95``."""
 
 DEFAULT_SETTINGS_TTL_SECONDS = 5.0
 """Upper bound on how long a backroom change takes to reach the dispatch path
@@ -54,7 +56,11 @@ write). Small so a kill-switch flip is observable within seconds; nonzero so a
 busy dispatch loop does not issue a settings read on literally every ticket."""
 
 DISK_RESTRICTED_SLOTS = 1
-"""Slots a validator is held to once the disk ceiling is tripped."""
+"""Slots a validator is held to once any per-resource ceiling is tripped.
+
+Named for disk because disk was the only breaker when it landed, and the name
+is on the wire in ``EffectiveValidatorSlotSettings.disk_restricted_slots``.
+It now governs the memory and CPU ceilings too."""
 
 
 def settings_from_row(
@@ -78,40 +84,92 @@ def settings_from_row(
         return DEFAULT_SETTINGS
 
 
-def disk_ceiling_tripped(
-    settings: ValidatorSlotSettings, *, disk_percent: int | None
-) -> bool:
-    """Whether this validator's most recent disk sample is at or above the
-    circuit-breaker ceiling.
+HostResource = Literal["cpu", "memory", "disk"]
 
-    A missing sample (``None`` -- pre-v3 heartbeat, or no heartbeat telemetry at
-    all) is NOT treated as tripped: absence of evidence is not evidence of a full
-    disk, and the ordinary ``max_concurrent_slots`` cap still applies.
+
+@dataclass(frozen=True)
+class HostResourceSample:
+    """The host utilisation a validator's most recent heartbeat reported.
+
+    Each field is ``None`` when that reading is unavailable -- a pre-v3
+    heartbeat, no telemetry at all, or a malformed metrics blob. Absence of
+    evidence is never evidence of pressure: an unknown reading is treated as
+    within every ceiling, exactly as the disk-only breaker always did.
     """
-    if disk_percent is None:
-        return False
-    return disk_percent >= settings.disk_percent_ceiling
+
+    cpu_percent: int | None = None
+    memory_percent: int | None = None
+    disk_percent: int | None = None
+
+
+def _ceilings(
+    settings: ValidatorSlotSettings, sample: HostResourceSample
+) -> tuple[tuple[HostResource, int | None, int], ...]:
+    """Pair each resource's reading with its configured throttle ceiling."""
+    return (
+        ("disk", sample.disk_percent, settings.disk_percent_ceiling),
+        ("memory", sample.memory_percent, settings.memory_percent_ceiling),
+        ("cpu", sample.cpu_percent, settings.cpu_percent_ceiling),
+    )
+
+
+def throttled_resources(
+    settings: ValidatorSlotSettings, sample: HostResourceSample
+) -> tuple[HostResource, ...]:
+    """Resources at or above their own ceiling: hold this validator to one slot."""
+    return tuple(
+        resource
+        for resource, observed, ceiling in _ceilings(settings, sample)
+        if ceiling != CEILING_DISABLED and observed is not None and observed >= ceiling
+    )
+
+
+def blocked_resources(
+    settings: ValidatorSlotSettings, sample: HostResourceSample
+) -> tuple[HostResource, ...]:
+    """Resources past the shared hard stop: issue this validator nothing.
+
+    Only resources that have a per-resource ceiling configured are consulted, so
+    disabling a resource disables it for both tiers. That is what keeps a pinned
+    CPU -- the ordinary state of a working benchmark host -- from blocking a
+    validator on a fleet that never asked for CPU gating.
+    """
+    hard_stop = settings.resource_block_percent_ceiling
+    if hard_stop == CEILING_DISABLED:
+        return ()
+    return tuple(
+        resource
+        for resource, observed, ceiling in _ceilings(settings, sample)
+        if ceiling != CEILING_DISABLED
+        and observed is not None
+        and observed >= hard_stop
+    )
 
 
 def allowed_slot_count(
     settings: ValidatorSlotSettings,
     *,
     advertised_slots: int,
-    disk_percent: int | None,
+    sample: HostResourceSample,
 ) -> int:
     """How many slots this validator may hold live tickets for right now.
 
     The operator cap only ever narrows what the validator advertises -- it can
-    never grant a slot the validator did not offer. When the disk ceiling is
-    tripped the result is clamped to :data:`DISK_RESTRICTED_SLOTS`.
+    never grant a slot the validator did not offer. Above a per-resource ceiling
+    the result is clamped to :data:`DISK_RESTRICTED_SLOTS`; above the shared
+    hard stop it is ``0``, which is the difference between "one at a time" and
+    "not until you have calmed down".
 
     Evaluate this at ticket ISSUE time only. It describes how many leases may
     exist, so applying it to already-live leases would revoke work in flight;
     the caller compares the result against the validator's current live-lease
-    count instead.
+    count instead. A validator that crosses a ceiling mid-benchmark therefore
+    still finishes and reports the work it already holds.
     """
+    if blocked_resources(settings, sample):
+        return 0
     allowed = min(max(advertised_slots, 0), settings.max_concurrent_slots)
-    if disk_ceiling_tripped(settings, disk_percent=disk_percent):
+    if throttled_resources(settings, sample):
         return min(allowed, DISK_RESTRICTED_SLOTS)
     return allowed
 

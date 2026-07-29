@@ -15,6 +15,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from ditto.api_models.benchmark_capacity import BenchmarkAdmission
 from ditto.api_models.benchmark_progress import BenchmarkProgressStage
 from ditto.api_models.retry_state import RetryState
 from ditto.api_models.screener import ScreenerProgressStage, ScreenerRuntimeState
@@ -2541,7 +2542,7 @@ class PublicValidatorHeartbeat(BaseModel):
     active_benchmark: PublicBenchmarkProgress | None = None
     configured_slots: Annotated[int, Field(ge=1, le=8)] = 1
     healthy_slots: list[str] = Field(default_factory=lambda: ["slot-0"])
-    admission: Literal["accepting", "draining", "paused"] = "accepting"
+    admission: BenchmarkAdmission = "accepting"
     active_benchmarks: list[PublicBenchmarkProgress] = Field(default_factory=list)
     assigned_benchmarks: list[PublicBenchmarkProgress] = Field(default_factory=list)
     orphaned_slots: Annotated[
