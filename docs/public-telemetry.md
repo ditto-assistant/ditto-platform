@@ -327,6 +327,16 @@ rate-limited, `Cache-Control: public, max-age=30`. Read-only, aggregate-only.
   heartbeat-capable software; this endpoint does not pretend to enumerate every
   on-chain permit holder.
 
+  Slot capacity is published as two distinct numbers, because they answer two
+  different questions. `configured_slots` (with `healthy_slots`) is what the
+  validator *advertises*; `allowed_slots` is what the platform will actually
+  fund on it right now — the operator's `max_concurrent_slots` cap narrowing the
+  advertisement, clamped to one while that validator's disk ceiling is tripped.
+  The response-level `slot_policy` carries the fleet-wide cap and disk ceiling
+  so the difference is explainable without re-deriving the policy. Advertised
+  capacity above `allowed_slots` never receives a ticket, and presenting it as
+  available capacity overstates the fleet.
+
   Heartbeat protocol v7 signs a closed `capabilities` object and a fixed
   six-component `stack` identity (`ditto_subnet`, `dittobench_api`,
   `sandbox_docker`, `model_relay`, `pylon`, and `ollama`). One length-prefixed,

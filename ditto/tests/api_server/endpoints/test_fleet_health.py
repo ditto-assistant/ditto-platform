@@ -14,6 +14,9 @@ from ditto.api_server.endpoints.public import (
     _public_system_metrics,
     _validator_heartbeats_response,
 )
+from ditto.api_server.validator_slot_settings import (
+    DEFAULT_SETTINGS as SLOT_SETTINGS_DEFAULT,
+)
 from ditto.db.queries.orphaned_leases import OrphanedLease
 
 # Real hotkeys from the 2026-07-27 eviction incident: the wire model pins
@@ -211,6 +214,7 @@ class TestOrphanedSlotSerialization:
             orphaned_leases=[self._orphan("still_running")],
             now=datetime.now(UTC),
             active_bench_version=7,
+            slot_settings=SLOT_SETTINGS_DEFAULT,
         )
 
         [entry] = response.validators
@@ -235,6 +239,7 @@ class TestOrphanedSlotSerialization:
             orphaned_leases=[self._orphan("indeterminate")],
             now=datetime.now(UTC),
             active_bench_version=7,
+            slot_settings=SLOT_SETTINGS_DEFAULT,
         )
 
         [entry] = response.validators
@@ -250,6 +255,7 @@ class TestOrphanedSlotSerialization:
             orphaned_leases=[self._orphan("released")],
             now=datetime.now(UTC),
             active_bench_version=7,
+            slot_settings=SLOT_SETTINGS_DEFAULT,
         )
 
         [entry] = response.validators
@@ -263,6 +269,7 @@ class TestOrphanedSlotSerialization:
             orphaned_leases=[self._orphan("still_running")],
             now=datetime.now(UTC),
             active_bench_version=7,
+            slot_settings=SLOT_SETTINGS_DEFAULT,
         )
 
         by_hotkey = {entry.validator_hotkey: entry for entry in response.validators}

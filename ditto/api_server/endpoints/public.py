@@ -117,6 +117,7 @@ from ditto.api_models import (
     PublicValidatorName,
     PublicValidatorNamesResponse,
     PublicValidatorScore,
+    PublicValidatorSlotPolicy,
     PublicValidatorWeightVector,
 )
 from ditto.api_models import bench_glossary as bench_glossary_data
@@ -145,6 +146,7 @@ from ditto.api_models.validator_capabilities import (
     ValidatorCapabilities,
     ValidatorStackIdentity,
 )
+from ditto.api_models.validator_slot_settings import ValidatorSlotSettings
 from ditto.api_server.artifact_audit import client_ip, request_detail
 from ditto.api_server.bench import CURRENT_BENCH_VERSION, is_bench_version_retired
 from ditto.api_server.benchmark_rollout import rolling_qualification_blockers
@@ -182,6 +184,11 @@ from ditto.api_server.koth import (
     project_koth,
 )
 from ditto.api_server.storage import ObjectDownloadFailedError
+from ditto.api_server.validator_slot_settings import (
+    HostResourceSample,
+    allowed_slot_count,
+    resolve_slot_settings,
+)
 from ditto.chain import ChainError
 from ditto.db.models import (
     Agent,
@@ -2653,6 +2660,7 @@ def _validator_heartbeats_response(
     orphaned_leases: list[OrphanedLease],
     now: datetime,
     active_bench_version: int,
+    slot_settings: ValidatorSlotSettings,
 ) -> PublicValidatorHeartbeatsResponse:
     """Reconcile platform leases and signed heartbeat claims without conflating them.
 
@@ -2664,6 +2672,11 @@ def _validator_heartbeats_response(
     is exactly the false headroom this argument exists to stop reporting.
     Required rather than defaulted so no future call site can silently reproduce
     it.
+
+    ``slot_settings`` is required rather than defaulted: this view's whole job is
+    to describe the fleet as dispatch sees it, and a caller that forgets the
+    policy would silently publish advertised capacity as available capacity --
+    the exact conflation the per-entry ``allowed_slots`` exists to end.
     """
     orphans_by_hotkey: dict[str, list[PublicOrphanedSlot]] = {}
     for orphan in orphaned_leases:
@@ -2825,6 +2838,23 @@ def _validator_heartbeats_response(
                 ),
                 active_benchmark=active_benchmark,
                 configured_slots=(capacity.configured_slots if capacity else 1),
+                # Resolved with the very function ticket issue calls, so the
+                # fleet view cannot drift from dispatch as the policy changes.
+                allowed_slots=allowed_slot_count(
+                    slot_settings,
+                    advertised_slots=(capacity.configured_slots if capacity else 1),
+                    sample=HostResourceSample(
+                        cpu_percent=(
+                            metrics.cpu_percent if metrics is not None else None
+                        ),
+                        memory_percent=(
+                            metrics.memory_percent if metrics is not None else None
+                        ),
+                        disk_percent=(
+                            metrics.disk_percent if metrics is not None else None
+                        ),
+                    ),
+                ),
                 healthy_slots=(capacity.healthy_slots if capacity else ["slot-0"]),
                 admission=(capacity.admission if capacity else "accepting"),
                 active_benchmarks=active_benchmarks,
@@ -2883,6 +2913,10 @@ def _validator_heartbeats_response(
         online_window_seconds=int(_VALIDATOR_ONLINE_WINDOW.total_seconds()),
         stale_window_seconds=int(_VALIDATOR_STALE_WINDOW.total_seconds()),
         active_bench_version=active_bench_version,
+        slot_policy=PublicValidatorSlotPolicy(
+            max_concurrent_slots=slot_settings.max_concurrent_slots,
+            disk_percent_ceiling=slot_settings.disk_percent_ceiling,
+        ),
         reported_count=len(entries),
         online_count=sum(entry.online for entry in entries),
         validators=entries,
@@ -2891,6 +2925,7 @@ def _validator_heartbeats_response(
 
 @router.get("/validators", response_model=PublicValidatorHeartbeatsResponse)
 async def validators(
+    request: Request,
     response: Response,
     session: SessionDep,
 ) -> PublicValidatorHeartbeatsResponse:
@@ -2909,6 +2944,7 @@ async def validators(
         ),
         now=now,
         active_bench_version=await active_bench_version(session),
+        slot_settings=await resolve_slot_settings(request.app.state),
     )
 
 
@@ -3674,6 +3710,7 @@ async def activity(
 
 @router.get("/operations", response_model=PublicOperationsResponse)
 async def operations(
+    request: Request,
     response: Response,
     session: SessionDep,
 ) -> PublicOperationsResponse:
@@ -3762,6 +3799,7 @@ async def operations(
         ),
         now=now,
         active_bench_version=active_version,
+        slot_settings=await resolve_slot_settings(request.app.state),
     )
     return PublicOperationsResponse(
         generated_at=now,
