@@ -6203,21 +6203,20 @@
       notice.hidden = false;
     }
 
-    // Name the row the continuation floor was cut from. "Fifth place" is not a
-    // checkable claim on its own: the floor is the fifth-highest finalized
-    // composite, while the leaderboard's rank column orders by
-    // official_composite, so the two select different agents as soon as anyone
-    // completes a continual wave. Quoting the holder lets a miner open that
-    // submission and read the same number back.
+    // Name the row the continuation floor was cut from. The floor and the
+    // leaderboard now share one ordering (server-side, ditto/score_order.py):
+    // both cut on official_composite, so the floor IS the score of the finalized
+    // row the board ranks fifth. Naming the holder keeps the claim checkable --
+    // a miner opens that submission and reads the same number back.
     function scoreFloorAttribution(e) {
       var benchKey = benchmarkVersionKey(e.active_bench_version);
       var where = benchKey === "unknown" ? "" : " on " + benchmarkVersionLabel(benchKey);
-      var basis = "That floor is the 5th-highest finalized composite" + where;
+      var basis = "That floor is the 5th-highest finalized official_composite" + where +
+        " — the same score and the same ordering the leaderboard ranks by";
       if (!e.score_floor_agent_id) return basis + ".";
       return basis + ", held by " +
         agentLabel(e.score_floor_agent_name, e.score_floor_agent_version) +
-        ". Open that submission to read the same number back." +
-        " The leaderboard rank column orders by official_composite, so the row it shows at rank 5 can belong to a different agent.";
+        ". Open that submission to read the same number back.";
     }
 
     function validationDetail(e) {

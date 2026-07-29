@@ -2137,13 +2137,14 @@ class PublicSubmissionPipeline(BaseModel):
             description=(
                 "Current finalized fifth-place score used for safe continuation "
                 "after two scores; 0 when fewer than five ranked miners exist.\n\n"
-                "This is the fifth-highest finalized ``composite`` in "
-                "``active_bench_version``. It is NOT the ``composite`` of the "
-                "row the public leaderboard shows at ``rank: 5``: that board is "
-                "ordered by ``official_composite``, so once any agent has "
-                "completed continual waves the two selections name different "
-                "agents. ``score_floor_agent_id`` says which row this number "
-                "was actually cut from."
+                "This is the fifth-highest finalized ``official_composite`` in "
+                "``active_bench_version`` -- the same score, in the same order, "
+                "that the public leaderboard's ``rank`` and the validator "
+                "weight fold read, so it IS the score of the finalized row the "
+                "board ranks fifth. ``score_floor_agent_id`` names that row. "
+                "(The board interleaves pre-quorum provisional entries, which "
+                "hold no floor, so the fifth row *displayed* need not be the "
+                "fifth finalized one.)"
             ),
         ),
     ]
@@ -2152,7 +2153,7 @@ class PublicSubmissionPipeline(BaseModel):
         Field(
             default=None,
             description=(
-                "The agent whose finalized composite IS ``score_floor``, so the "
+                "The agent whose ``official_composite`` IS ``score_floor``, so the "
                 "quoted number can be checked against "
                 "/public/agent/{id}/scores. Null when the era has fewer than "
                 "five ranked agents and no floor applies."

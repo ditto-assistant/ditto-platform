@@ -733,12 +733,16 @@ class TestDashboard:
         """The low-priority explanation has to be falsifiable from public data.
 
         It used to say "below the current fifth-place score of 0.886", which a
-        miner cannot check: the floor is the fifth-highest ``composite`` while
-        the leaderboard's rank column orders by ``official_composite``, so the
-        row displayed at rank 5 is routinely a different agent with a different
-        number. Both readings are live and they disagree, which is what
-        generated the support report. The message must therefore name the agent
-        the floor belongs to and say which ordering produced it.
+        miner could not check: the floor was the fifth-highest ``composite``
+        while the leaderboard's rank column orders by ``official_composite``, so
+        the row displayed at rank 5 was routinely a different agent with a
+        different number. Both readings were live and they disagreed, which is
+        what generated the support report.
+
+        Both surfaces now cut with the one canonical ordering
+        (:mod:`ditto.score_order`) on ``official_composite``, so the copy must
+        say so and must still name the holder -- the number is only checkable if
+        the miner knows whose submission to open.
         """
         app = create_api_server(make_api_server_config(dashboard_enabled=True))
         body = (await _get(app, "/")).text
@@ -748,16 +752,19 @@ class TestDashboard:
         assert "the current fifth-place score" not in body
 
         assert "function scoreFloorAttribution(e) {" in body
-        assert '"That floor is the 5th-highest finalized composite" + where' in body
+        assert (
+            '"That floor is the 5th-highest finalized official_composite" + where'
+            in body
+        )
+        assert "the same score and the same ordering the leaderboard ranks by" in body
         assert 'if (!e.score_floor_agent_id) return basis + ".";' in body
         assert (
             "agentLabel(e.score_floor_agent_name, e.score_floor_agent_version)" in body
         )
         assert "Open that submission to read the same number back." in body
-        assert (
-            "The leaderboard rank column orders by official_composite, so the row "
-            "it shows at rank 5 can belong to a different agent." in body
-        )
+        # The retired claim -- true only while the two surfaces used different
+        # orderings -- must not survive the unification that made it false.
+        assert "can belong to a different agent" not in body
 
         # Both surfaces that quote the floor go through the same attribution.
         assert (

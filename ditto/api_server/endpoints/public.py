@@ -180,7 +180,6 @@ from ditto.api_server.koth import (
     KOTH_RANK_SHARES,
     KOTH_TAIL_SIZE,
     KothEntry,
-    effective_composite,
     project_koth,
 )
 from ditto.api_server.storage import ObjectDownloadFailedError
@@ -258,6 +257,11 @@ from ditto.db.queries.retry_state import (
     classify_agent_retry_states,
     resolve_bench_version,
 )
+from ditto.db.queries.score_ranking import (
+    completed_wave_data,
+    official_composites,
+    rank_submissions,
+)
 from ditto.db.queries.scores import (
     SCORING_QUORUM,
     LedgerRow,
@@ -283,6 +287,7 @@ from ditto.db.queries.tickets import (
     get_score_continuation_floor_row,
     get_score_priority_floors,
 )
+from ditto.score_order import score_order_key
 
 logger = logging.getLogger(__name__)
 
@@ -1703,11 +1708,9 @@ def _completed_wave_data(
     """
     by_seed = confirmation_by_seed or {}
     depths = confirmation_depth or {}
-    candidates: list[LedgerRow] = []
-    for row in rows:
-        if row.eligible and row.composite > 0.0:
-            candidates.append(row)
-    candidates.sort(key=lambda row: (-row.composite, row.first_seen, row.agent_id))
+    candidates = rank_submissions(
+        row for row in rows if row.eligible and row.composite > 0.0
+    )
 
     raw_projection = project_koth(
         [
@@ -1789,7 +1792,7 @@ def _public_koth_emissions(
 ) -> PublicKothEmissions | None:
     """Project the finalized score pool through the validator's pure fold."""
     quorum_values = quorum_by_agent or {}
-    candidates, by_seed, depths = _completed_wave_data(
+    candidates, by_seed, depths = completed_wave_data(
         rows,
         stderrs=stderrs,
         confirmation_by_seed=confirmation_by_seed,
@@ -2140,7 +2143,7 @@ async def leaderboard(
     else:
         confirmation_by_seed = {}
         confirmation_depth = {}
-    _, completed_by_seed, completed_depth = _completed_wave_data(
+    _, completed_by_seed, completed_depth = completed_wave_data(
         finalized_rows,
         stderrs=fold_stderrs,
         confirmation_by_seed=confirmation_by_seed,
@@ -2148,35 +2151,13 @@ async def leaderboard(
         wave_membership=continual_settings.wave_membership,
         anchor_version=active_version,
     )
-    official_composites = {
-        row.agent_id: effective_composite(
-            KothEntry(
-                miner_hotkey=row.miner_hotkey,
-                agent_id=row.agent_id,
-                composite=row.composite,
-                first_seen=row.first_seen,
-                raw_rank=0,
-                bench_version=row.bench_version,
-                quorum_composites=tuple(quorum.get(row.agent_id, ())),
-                completed_wave_composites=tuple(
-                    value
-                    for _seed, value in sorted(
-                        completed_by_seed.get(row.agent_id, {}).items()
-                    )
-                ),
-            )
-        )
-        for row in finalized_rows
-    }
-    if not continual_mean_active:
-        official_composites = {row.agent_id: row.composite for row in finalized_rows}
-    finalized_rows.sort(
-        key=lambda row: (
-            -official_composites.get(row.agent_id, row.composite),
-            row.first_seen,
-            row.agent_id,
-        )
+    board_official_composites = official_composites(
+        finalized_rows,
+        quorum=quorum,
+        completed_waves=completed_by_seed,
+        continual_mean_active=continual_mean_active,
     )
+    finalized_rows = rank_submissions(finalized_rows, scores=board_official_composites)
     # The finalized board is already one row per owner (``list_eligible_ledger``
     # partitions on ``emission_owner``), so the provisional overlay has to
     # suppress and dedupe on that same owner. Keyed on the hotkey it showed an
@@ -2191,14 +2172,9 @@ async def leaderboard(
         for row in ledger_rows
         if score_counts.get(row.agent_id, 0) < SCORING_QUORUM
     ] + list(await list_provisional_ledger(session, bench_version=bench_version))
-    provisional_candidates.sort(
-        key=lambda candidate: (
-            not candidate[0].eligible,
-            -candidate[0].composite,
-            candidate[0].first_seen,
-            str(candidate[0].agent_id),
-        )
-    )
+    # Pre-quorum rows have no continual mean, so the canonical comparator reads
+    # their raw composite -- the same call ``list_provisional_ledger`` makes.
+    provisional_candidates.sort(key=lambda candidate: score_order_key(candidate[0]))
     provisional_by_owner: dict[str, tuple[LedgerRow, int]] = {}
     for candidate in provisional_candidates:
         owner = emission_owner(
@@ -2304,7 +2280,9 @@ async def leaderboard(
                 ),
                 fold_stderr=fold_stderrs.get(row.agent_id),
                 artifact_release=artifact_releases[row.agent_id],
-                official_composite=official_composites.get(row.agent_id, row.composite),
+                official_composite=board_official_composites.get(
+                    row.agent_id, row.composite
+                ),
                 completed_wave_count=completed_depth.get(row.agent_id, 0),
                 initial_quorum_composites=tuple(quorum.get(row.agent_id, ())),
                 completed_wave_composites=tuple(
@@ -2314,7 +2292,7 @@ async def leaderboard(
                     )
                 ),
                 # The raw, unfiltered append-only trail, alongside the
-                # fold-eligible subset above. ``_completed_wave_data`` keeps
+                # fold-eligible subset above. ``completed_wave_data`` keeps
                 # only seeds shared by *every current* emission-set member, so a
                 # new entrant with no retests yet empties that intersection and
                 # ``completed_wave_*`` collapses to zero board-wide even though
@@ -4042,15 +4020,13 @@ async def agent_pipeline(
     )
     # One read, so the quoted floor and the agent credited with it cannot come
     # from two different snapshots of a ledger that moves between calls.
-    score_floor_row = await get_score_continuation_floor_row(
+    score_floor = await get_score_continuation_floor_row(
         session, bench_version=canonical_version
     )
-    score_continuation_floor = (
-        score_floor_row.composite if score_floor_row is not None else None
-    )
+    score_continuation_floor = score_floor.score if score_floor is not None else None
     score_floor_agent = (
-        await session.get(Agent, score_floor_row.agent_id)
-        if score_floor_row is not None
+        await session.get(Agent, score_floor.row.agent_id)
+        if score_floor is not None
         else None
     )
     benchmark_admitted = await agent_is_admitted(
@@ -4100,7 +4076,7 @@ async def agent_pipeline(
         quorum=SCORING_QUORUM,
         score_floor=score_continuation_floor or 0.0,
         score_floor_agent_id=(
-            score_floor_row.agent_id if score_floor_row is not None else None
+            score_floor.row.agent_id if score_floor is not None else None
         ),
         score_floor_agent_name=(
             score_floor_agent.name if score_floor_agent is not None else None

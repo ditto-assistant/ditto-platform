@@ -4987,23 +4987,24 @@ class TestPublicActivity:
         assert pipeline["score_floor_agent_name"] is None
         assert pipeline["score_floor_agent_version"] is None
 
-    async def test_score_floor_holder_is_not_the_board_row_at_rank_five(
+    async def test_score_floor_holder_is_the_board_row_at_rank_five(
         self,
         app: FastAPI,
         client: httpx.AsyncClient,
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
-        """The support report, reproduced: "fifth place" names two agents.
+        """The support report, resolved: "fifth place" names ONE agent.
 
-        The continuation floor is cut from the ledger's ``composite`` ordering.
-        The public board's ``rank`` is cut from ``official_composite`` (pinned
-        by ``test_rank_follows_official_composite_not_composite``). Both are
-        correct and both are live, so a message that says "the current
-        fifth-place score" is unfalsifiable: the miner looks up rank 5, reads a
-        different agent with a different number, and reports a stale gate.
+        This is the same board the divergence was reproduced on -- deliberately
+        built so the ``composite`` order and the ``official_composite`` order
+        invert -- but both surfaces now cut it with the one canonical ordering
+        (:mod:`ditto.score_order`) on the one canonical score. So the floor a
+        miner is told he is below is the score of the row the board ranks
+        fifth, held by the agent the board shows there, and looking it up
+        confirms the gate instead of contradicting it.
 
-        This builds that exact divergence and asserts the pipeline reports the
-        row the floor was really cut from, not the row displayed at rank 5.
+        The old behaviour is asserted absent, not merely different: cutting the
+        floor on the raw ``composite`` would have picked "E" at 0.82.
         """
         from ditto.db.queries.confirmation_scores import (
             ConfirmationSeedScore,
@@ -5094,21 +5095,30 @@ class TestPublicActivity:
 
         board = (await client.get("/api/v1/public/leaderboard")).json()
         assert board["continual_aggregate_active"] is True
-        rank_five = next(entry for entry in board["entries"] if entry["rank"] == 5)
+        entries = board["entries"]
+        rank_five = next(entry for entry in entries if entry["rank"] == 5)
 
         pipeline = (
             await client.get(f"/api/v1/public/agent/{agent_id}/pipeline")
         ).json()
         assert pipeline["status"] == "below_score_floor"
 
-        # The divergence is real, or this test proves nothing.
-        assert rank_five["agent_id"] != fifth_by_composite
-        assert rank_five["composite"] != pytest.approx(pipeline["score_floor"])
+        # The two keys genuinely invert on this board, or the test proves
+        # nothing: "F" is last by composite and third by official_composite.
+        finalized = [entry for entry in entries if entry["rank"] is not None]
+        assert [entry["agent_id"] for entry in finalized] != [
+            entry["agent_id"]
+            for entry in sorted(finalized, key=lambda entry: -entry["composite"])
+        ]
 
-        # The floor is attributed to the row it was actually cut from.
-        assert pipeline["score_floor"] == pytest.approx(0.82)
-        assert pipeline["score_floor_agent_id"] == fifth_by_composite
+        # THE INVARIANT: one ordering, one score, one fifth place.
+        assert pipeline["score_floor_agent_id"] == rank_five["agent_id"]
+        assert pipeline["score_floor"] == pytest.approx(rank_five["official_composite"])
         assert pipeline["score_floor_agent_name"] == "agent"
+
+        # And it is not the row the retired raw-composite cut would have named.
+        assert pipeline["score_floor_agent_id"] != fifth_by_composite
+        assert pipeline["score_floor"] == pytest.approx(0.84)
 
     async def test_public_progress_never_combines_benchmark_eras(
         self,
