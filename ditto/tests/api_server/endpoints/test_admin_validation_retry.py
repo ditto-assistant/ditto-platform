@@ -1403,17 +1403,17 @@ async def test_reinstatement_replays_idempotently_and_refuses_a_second_reversal(
     assert len(reinstatements) == 1
 
 
-async def test_reinstatement_refuses_a_withdrawal_and_a_closed_benchmark_era(
+async def test_reinstatement_allows_a_withdrawal_but_refuses_a_closed_era(
     app: FastAPI,
     client: httpx.AsyncClient,
     retry_maker: async_sessionmaker[AsyncSession],
 ) -> None:
-    """The two states where putting a submission back would change nothing.
+    """A withdrawal is reversible, but a closed-era removal remains inert.
 
-    A withdrawal is only reachable once quorum is already unreachable, so
-    restoring eligibility restores nothing usable; and no validator is ever
-    issued a ticket for a closed era. Both are refused by name rather than
-    accepted as a silent no-op.
+    Reinstating a withdrawal restores eligibility without attempt budget; the
+    ordinary retry route remains the separately audited way to make its
+    exhausted ticket leaseable. No validator is ever issued a ticket for a
+    closed era, so that case is still refused rather than accepted as a no-op.
     """
     withdrawn = await _seed(retry_maker)
     _install(app, retry_maker)
@@ -1430,13 +1430,24 @@ async def test_reinstatement_refuses_a_withdrawal_and_a_closed_benchmark_era(
     )
     assert removed.status_code == 200, removed.text
     body = await _detail(client, withdrawn)
-    assert body["reinstatement_allowed"] is False
-    assert body["reinstatement_blocking_reason"] == (
-        "removal was a queue withdrawal, not an operator eviction"
+    assert body["reinstatement_allowed"] is True
+    assert body["reinstatement_blocking_reason"] is None
+    restored = await _reinstate(client, withdrawn)
+    assert restored.status_code == 200, restored.text
+    assert restored.json()["eviction"]["evicted_validator_hotkeys"] == []
+    body = await _detail(client, withdrawn)
+    assert body["withdrawal"]["reinstated_at"] is not None
+    assert body["recovery_allowed"] is True
+    retried = await client.post(
+        f"/api/v1/admin/validation-retries/{withdrawn}/retry",
+        headers=_HEADERS,
+        json={
+            "request_id": str(uuid4()),
+            "expected_snapshot": body["snapshot"],
+            "reason": "Verified validator infrastructure failure after withdrawal",
+        },
     )
-    refused = await _reinstate(client, withdrawn)
-    assert refused.status_code == 409
-    assert "not an operator eviction" in refused.text
+    assert retried.status_code == 200, retried.text
 
     # An eviction taken in a superseded era: the queue has moved on, so there is
     # nothing to come back to.

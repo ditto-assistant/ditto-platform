@@ -420,7 +420,7 @@ async def _load_withdrawal(
 ) -> ValidatorQueueWithdrawal | None:
     """The removal currently keeping this submission out of the era's queue.
 
-    In-force only: a reinstated eviction is not a removal any more, so every gate
+    In-force only: a reinstated row is not a removal any more, so every gate
     that reads this treats a reinstated submission exactly like one that was
     never evicted.
     """
@@ -967,14 +967,14 @@ async def _retry_budget_snapshot(
     "/validation-retries/{agent_id}/reinstate",
     response_model=AdminValidationQueueReinstatementResponse,
 )
-async def reinstate_evicted_submission_to_validator_queue(
+async def reinstate_removed_submission_to_validator_queue(
     agent_id: UUID,
     payload: AdminValidationQueueReinstatementRequest,
     _admin: AdminDep,
     session: SessionDep,
     x_admin_actor: Annotated[str | None, Header()] = None,
 ) -> AdminValidationQueueReinstatementResponse:
-    """Undo an operator eviction: back in the queue, with nothing added.
+    """Undo an operator queue removal, with no retry budget added.
 
     Eviction (#515) shipped one-way, and that is the only reason it went unused
     against the submissions it was built for. An evicted miner has paid an
@@ -984,6 +984,10 @@ async def reinstate_evicted_submission_to_validator_queue(
     miner deserved one. The ``mnemo*`` family that prompted #515 was expensive,
     not shown to be malicious: a source review found self-imposed per-case
     deadlines, no hang primitives, and a version history of pure latency work.
+
+    Ordinary exhausted-submission withdrawals use the same reversal. Restoring
+    one does not make an exhausted ticket leaseable by itself; it only removes
+    the queue block so a separately bounded, audited operator retry can proceed.
 
     What this restores is exactly the queue effect and nothing else. The removal
     row is resolved (``reinstated_at``), so

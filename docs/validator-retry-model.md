@@ -260,12 +260,13 @@ plus a short grace has passed — the validator's own run timeout has fired by
 then. A `still_running` orphan is never dropped on a timer: that is a stuck
 container, and hiding it is the bug.
 
-### Reversing an eviction
+### Reversing a queue removal
 
 `POST .../reinstate` (confirmation `REINSTATE TO VALIDATOR QUEUE`) puts an
-evicted submission back in the queue in the era it was evicted from. Eviction
-shipped one-way, and that is the only reason it went unused: an evicted miner has
-already paid an evaluation fee for an era an operator ended, so without a way
+operator-removed submission back in the queue in the era it was removed from.
+This covers both live-lease eviction and exhausted-submission withdrawal.
+Eviction shipped one-way, and that is the only reason it went unused: an evicted
+miner has already paid an evaluation fee for an era an operator ended, so without a way
 back a capacity decision doubles as a fine, and taking it means being sure the
 miner earned one. The `mnemo*` family that prompted the route was expensive, not
 shown to be malicious — a source review found self-imposed per-case deadlines, no
@@ -293,14 +294,15 @@ many times it runs; the counts as they stood are recorded on the reinstatement
 row. Handing back attempts is still `POST .../retry`, bounded and audited per
 grant.
 
-It refuses, by name, the cases where re-admission would change nothing: the
-removal was a withdrawal rather than an eviction (withdrawal is only reachable
-once quorum is already unreachable), the removal was already reversed, the
-submission is no longer evaluating or has reached quorum or has fallen behind the
-screening policy, or **the era moved on** — no validator is ever issued a ticket
-for a closed benchmark version, so reinstating into one would report success and
-do nothing. `reinstatement_allowed` / `reinstatement_blocking_reason` on the
-detail route say which, before the operator acts.
+An exhausted withdrawal still needs a separate operator retry grant after
+reinstatement; reversal itself never adds attempt budget. It refuses, by name,
+the cases where re-admission would change nothing: the removal was already
+reversed, the submission is no longer evaluating or has reached quorum or has
+fallen behind the screening policy, or **the era moved on** — no validator is
+ever issued a ticket for a closed benchmark version, so reinstating into one
+would report success and change nothing. `reinstatement_allowed` /
+`reinstatement_blocking_reason` on the detail route say which, before the
+operator acts.
 
 ### Spotting one before it costs a day
 
