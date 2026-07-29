@@ -10,6 +10,14 @@ from ditto.api_models.agent_status import AgentStatus
 from ditto.db.models import Agent, Score
 from ditto.db.queries.scores import list_memory_leader_timeline
 
+# Two eras, because the timeline is a per-version running high and the first
+# test proves the high does not carry across a version boundary. Which two is
+# arbitrary -- they used to be 2 and 3 -- but ``scores_bench_version_floor``
+# refuses anything under MIN_SCOREABLE_BENCH_VERSION, so they start at the live
+# era and count up.
+_BENCH_VERSION = 7
+_NEXT_BENCH_VERSION = 8
+
 
 async def _add_scored_agent(
     session: AsyncSession,
@@ -61,42 +69,42 @@ async def test_memory_timeline_keeps_only_finalized_running_highs(
     base = datetime(2026, 7, 8, tzinfo=UTC)
     await _add_scored_agent(
         session,
-        bench_version=2,
+        bench_version=_BENCH_VERSION,
         memory_scores=[0.3, 0.4, 0.5],
         at=base,
         name="alpha",
     )
     await _add_scored_agent(
         session,
-        bench_version=2,
+        bench_version=_BENCH_VERSION,
         memory_scores=[0.6, 0.7, 0.8],
         at=base + timedelta(days=1),
         name="bravo",
     )
     await _add_scored_agent(
         session,
-        bench_version=2,
+        bench_version=_BENCH_VERSION,
         memory_scores=[0.5, 0.6, 0.7],
         at=base + timedelta(days=2),
         name="charlie",
     )
     await _add_scored_agent(
         session,
-        bench_version=3,
+        bench_version=_NEXT_BENCH_VERSION,
         memory_scores=[0.4, 0.5, 0.6],
         at=base + timedelta(days=11),
         name="delta",
     )
     await _add_scored_agent(
         session,
-        bench_version=3,
+        bench_version=_NEXT_BENCH_VERSION,
         memory_scores=[0.98, 0.99],
         at=base + timedelta(days=12),
         name="echo",
     )
     await _add_scored_agent(
         session,
-        bench_version=3,
+        bench_version=_NEXT_BENCH_VERSION,
         memory_scores=[0.98, 0.99, 1.0],
         at=base + timedelta(days=13),
         name="foxtrot",
@@ -104,12 +112,14 @@ async def test_memory_timeline_keeps_only_finalized_running_highs(
     )
     await session.commit()
 
-    points = await list_memory_leader_timeline(session, bench_versions=[2, 3])
+    points = await list_memory_leader_timeline(
+        session, bench_versions=[_BENCH_VERSION, _NEXT_BENCH_VERSION]
+    )
 
     assert [(point.bench_version, point.agent_name) for point in points] == [
-        (2, "alpha"),
-        (2, "bravo"),
-        (3, "delta"),
+        (_BENCH_VERSION, "alpha"),
+        (_BENCH_VERSION, "bravo"),
+        (_NEXT_BENCH_VERSION, "delta"),
     ]
     assert [point.memory_mean for point in points] == [0.4, 0.7, 0.5]
     assert all(point.score_count == 3 for point in points)
@@ -121,14 +131,14 @@ async def test_memory_timeline_places_replaced_scores_at_acceptance_time(
     base = datetime(2026, 7, 8, tzinfo=UTC)
     await _add_scored_agent(
         session,
-        bench_version=2,
+        bench_version=_BENCH_VERSION,
         memory_scores=[0.3, 0.4, 0.5],
         at=base,
         name="alpha",
     )
     await _add_scored_agent(
         session,
-        bench_version=2,
+        bench_version=_BENCH_VERSION,
         memory_scores=[0.5, 0.6, 0.7],
         at=base + timedelta(days=1),
         name="bravo",
@@ -143,7 +153,7 @@ async def test_memory_timeline_places_replaced_scores_at_acceptance_time(
         score.updated_at = base + timedelta(days=2)
     await session.commit()
 
-    points = await list_memory_leader_timeline(session, bench_versions=[2])
+    points = await list_memory_leader_timeline(session, bench_versions=[_BENCH_VERSION])
 
     assert [point.agent_name for point in points] == ["bravo", "alpha"]
     assert [point.recorded_at for point in points] == [
@@ -158,14 +168,14 @@ async def test_memory_timeline_reduces_running_highs_after_release_cutoff(
     base = datetime(2026, 7, 8, tzinfo=UTC)
     await _add_scored_agent(
         session,
-        bench_version=2,
+        bench_version=_BENCH_VERSION,
         memory_scores=[0.8, 0.9, 1.0],
         at=base,
         name="alpha",
     )
     await _add_scored_agent(
         session,
-        bench_version=2,
+        bench_version=_BENCH_VERSION,
         memory_scores=[0.5, 0.6, 0.7],
         at=base + timedelta(days=2),
         name="bravo",
@@ -174,8 +184,8 @@ async def test_memory_timeline_reduces_running_highs_after_release_cutoff(
 
     points = await list_memory_leader_timeline(
         session,
-        bench_versions=[2],
-        not_before_by_version={2: base + timedelta(days=1)},
+        bench_versions=[_BENCH_VERSION],
+        not_before_by_version={_BENCH_VERSION: base + timedelta(days=1)},
     )
 
     assert [point.agent_name for point in points] == ["bravo"]

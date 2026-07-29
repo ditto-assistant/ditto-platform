@@ -10,11 +10,13 @@ byte-for-byte aligned with the subnet implementation.
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal
 from uuid import UUID
+
+from ditto.score_order import rank_submissions
 
 # Frozen consensus constants from ditto-subnet/ditto/validator/config.py.
 KOTH_MARGIN = 0.007
@@ -194,17 +196,13 @@ def retest_cohort(
     if projection is None:
         return ()
     champion = projection.champion
-    ranked = sorted(
+    ranked = rank_submissions(
         (
             entry
             for entry in entries
             if entry.composite > 0.0 and entry.miner_hotkey != champion.miner_hotkey
         ),
-        key=lambda entry: (
-            -effective_composite(entry),
-            entry.first_seen,
-            entry.agent_id,
-        ),
+        scores=_official_scores(entries),
     )
     base_size = max(1, size)
     ceiling = base_size if max_size is None else max(base_size, max_size)
@@ -280,6 +278,17 @@ def top5_round_is_due(
     return scheduled == reign_tempo
 
 
+def _official_scores(entries: Iterable[KothEntry]) -> dict[UUID, float]:
+    """Every entry's official composite, keyed for :func:`rank_submissions`.
+
+    The fold ranks on :func:`effective_composite`, never on the raw ``composite``
+    the entry was built from -- that is the same rule the public board's ``rank``
+    and the queue's score floors follow, spelled once in
+    :mod:`ditto.score_order`.
+    """
+    return {entry.agent_id: effective_composite(entry) for entry in entries}
+
+
 def project_koth(entries: Sequence[KothEntry]) -> KothProjection | None:
     """Return the champion and participation tail for an eligible score pool."""
     scored = [entry for entry in entries if entry.composite > 0.0]
@@ -292,24 +301,14 @@ def project_koth(entries: Sequence[KothEntry]) -> KothProjection | None:
         if _dethrone_decision(challenger, champion).dethrones:
             champion = challenger
 
+    official = _official_scores(scored)
     tail = tuple(
-        sorted(
+        rank_submissions(
             (entry for entry in scored if entry.miner_hotkey != champion.miner_hotkey),
-            key=lambda entry: (
-                -effective_composite(entry),
-                entry.first_seen,
-                entry.agent_id,
-            ),
+            scores=official,
         )[:KOTH_TAIL_SIZE]
     )
-    raw_leader = sorted(
-        scored,
-        key=lambda entry: (
-            -effective_composite(entry),
-            entry.first_seen,
-            entry.agent_id,
-        ),
-    )[0]
+    raw_leader = rank_submissions(scored, scores=official)[0]
     decision = (
         None
         if raw_leader.agent_id == champion.agent_id

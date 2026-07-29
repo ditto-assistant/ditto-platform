@@ -143,9 +143,11 @@ enforces all four; Python checks run on 3.11 and 3.12.
 - The upload flow is ordered cheap-before-expensive and stores to S3 *before* the
   DB transaction (orphan blobs are cheap; orphan rows break the state machine).
 - Some `/upload/*` validations are intentionally deferred (tar manifest, import
-  allowlist, schema diff, banned-hotkey) pending the harness interface + the
-  `banned_hotkeys` table. What miners submit and what is / isn't enforced today
-  is written up in `docs/submission-contract.md`.
+  allowlist, schema diff) pending the harness interface spec. Banned-hotkey
+  rejection is **no longer deferred** — the `banned_hotkeys` table exists and is
+  enforced (hard 403 in `/upload/agent`, reported by `/upload/check`, surfaced by
+  `/retrieval/agent-by-hotkey`). What miners submit and what is / isn't enforced
+  today is written up in `docs/submission-contract.md`.
 
 ## Branching
 

@@ -28,7 +28,7 @@ from ditto.api_models.agent_status import AgentStatus
 from ditto.api_server.dependencies import get_chain_client, get_session
 from ditto.api_server.middleware.error_envelope import ERROR_CODE_VALIDATOR_AUTH
 from ditto.chain.models import NeuronInfo
-from ditto.db.models import Agent, ValidatorHeartbeat
+from ditto.db.models import Agent, BenchmarkRollout, ValidatorHeartbeat
 from ditto.db.queries.confirmation_scores import (
     ConfirmationSeedScore,
     append_confirmation_scores,
@@ -40,6 +40,38 @@ _VALIDATOR_HOTKEY = _KEYPAIR.ss58_address
 _MINER = "5DhaT8U7LVwnnJNUU8VL1XEipicatoaDVVq7cHo227gogVZm"
 _MINER_B = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
 _AUTH_HEADER = {"X-Validator-Hotkey": _VALIDATOR_HOTKEY}
+# The era the ledger serves. It used to be left implicit: the fixtures took
+# ``upsert_score``'s old default of 2 and an empty database resolves its active
+# version to the same number, so the two agreed by accident. Neither is true
+# now -- the floor refuses a v2 score outright -- so the era is written down,
+# and the activated rollout that makes it the answer to "which version is
+# authoritative" is planted below.
+_BENCH_VERSION = 7
+
+
+@pytest.fixture(autouse=True)
+async def _live_era_has_activated(
+    session_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """Make the ledger read resolve to the era these tests write.
+
+    ``active_bench_version`` falls back to ``DEFAULT_BENCH_VERSION`` (2) when no
+    rollout has ever activated, which is a state production left long ago and
+    can never return to. Without the activated v6 -> v7 row the endpoint would
+    select a version the floor forbids writing, and every ledger assertion here
+    would be made against an empty result.
+    """
+    async with session_maker() as session, session.begin():
+        session.add(
+            BenchmarkRollout(
+                rollout_id=uuid4(),
+                from_version=_BENCH_VERSION - 1,
+                desired_version=_BENCH_VERSION,
+                status="activated",
+                cohort_size=5,
+                activated_at=datetime(2026, 6, 1, tzinfo=UTC),
+            )
+        )
 
 
 def _scorer_capabilities(now: datetime, *, versions: list[int]) -> dict:
@@ -131,6 +163,7 @@ async def _seed_scored(
             s,
             agent_id=agent.agent_id,
             validator_hotkey=_VALIDATOR_HOTKEY,
+            bench_version=_BENCH_VERSION,
             run_id="run_1",
             seed=42,
             composite=composite,
@@ -174,7 +207,7 @@ class TestScoringLedger:
         assert [e["miner_hotkey"] for e in body["entries"]] == [_MINER_B, _MINER]
         assert body["entries"][0]["composite"] == pytest.approx(0.9)
         assert body["entries"][0]["signature"] == "ab" * 64
-        assert body["entries"][0]["bench_version"] == 2
+        assert body["entries"][0]["bench_version"] == _BENCH_VERSION
         # No fleet capability evidence means the additive contract fails closed.
         assert body["entries"][0]["continual_aggregate_method"] is None
         assert body["entries"][0]["score_proofs"] == [
@@ -183,7 +216,7 @@ class TestScoringLedger:
                 "run_id": "run_1",
                 "composite": 0.9,
                 "seed": 42,
-                "bench_version": 2,
+                "bench_version": _BENCH_VERSION,
                 "ticket_deadline": "2026-06-08T13:00:00Z",
                 "transcript_sha256": "cd" * 32,
                 "signature": "ab" * 64,
@@ -215,7 +248,9 @@ class TestScoringLedger:
                         reported_at=now,
                         seen_at=now,
                         signature="cd" * 64,
-                        capabilities=_scorer_capabilities(now, versions=[2]),
+                        capabilities=_scorer_capabilities(
+                            now, versions=[_BENCH_VERSION]
+                        ),
                     ),
                     ValidatorHeartbeat(
                         validator_hotkey=_MINER_B,
@@ -226,7 +261,9 @@ class TestScoringLedger:
                         reported_at=now,
                         seen_at=now,
                         signature="12" * 64,
-                        capabilities=_scorer_capabilities(now, versions=[2]),
+                        capabilities=_scorer_capabilities(
+                            now, versions=[_BENCH_VERSION]
+                        ),
                     ),
                 ]
             )
@@ -599,7 +636,7 @@ class TestScoringLedgerConfirmationHistory:
                     reported_at=now,
                     seen_at=now,
                     signature="cd" * 64,
-                    capabilities=_scorer_capabilities(now, versions=[2]),
+                    capabilities=_scorer_capabilities(now, versions=[_BENCH_VERSION]),
                 )
             )
             s.add(
@@ -618,6 +655,7 @@ class TestScoringLedgerConfirmationHistory:
                 s,
                 agent_id=aid,
                 validator_hotkey=_VALIDATOR_HOTKEY,
+                bench_version=_BENCH_VERSION,
                 run_id="run_1",
                 seed=42,
                 composite=0.9,
@@ -628,7 +666,7 @@ class TestScoringLedgerConfirmationHistory:
                 generated_at=datetime(2026, 6, 8, tzinfo=UTC),
                 signature="ab" * 64,
             )
-            # Two validators on seed 100, one on seed 200 (bench_version 2 = active).
+            # Two validators on seed 100, one on seed 200, all on the active era.
             await append_confirmation_scores(
                 s,
                 rows=[
@@ -636,7 +674,7 @@ class TestScoringLedgerConfirmationHistory:
                     ConfirmationSeedScore(aid, "5V2", 100, 0.84, "r2", "cd" * 64),
                     ConfirmationSeedScore(aid, "5V1", 200, 0.70, "r3", None),
                 ],
-                bench_version=2,
+                bench_version=_BENCH_VERSION,
                 created_at=datetime.now(UTC),
             )
         _install_db(app, session_maker)
@@ -653,4 +691,4 @@ class TestScoringLedgerConfirmationHistory:
             (100, "5V2"),
             (200, "5V1"),
         }
-        assert {h["bench_version"] for h in history} == {2}
+        assert {h["bench_version"] for h in history} == {_BENCH_VERSION}

@@ -92,6 +92,7 @@ from ditto.api_models import (
     PublicLeaderboardEntry,
     PublicLeaderboardResponse,
     PublicMetricDoc,
+    PublicModelUse,
     PublicOperationsResponse,
     PublicOrphanedSlot,
     PublicProvisionalScore,
@@ -117,12 +118,14 @@ from ditto.api_models import (
     PublicValidatorName,
     PublicValidatorNamesResponse,
     PublicValidatorScore,
+    PublicValidatorSlotPolicy,
     PublicValidatorWeightVector,
 )
 from ditto.api_models import bench_glossary as bench_glossary_data
 from ditto.api_models.agent_status import AgentStatus
 from ditto.api_models.benchmark_capacity import BenchmarkCapacity
 from ditto.api_models.benchmark_progress import BenchmarkProgressStage
+from ditto.api_models.model_use import ModelUseVerdict
 from ditto.api_models.public import (
     BenchServiceability,
     FleetAvailability,
@@ -145,6 +148,7 @@ from ditto.api_models.validator_capabilities import (
     ValidatorCapabilities,
     ValidatorStackIdentity,
 )
+from ditto.api_models.validator_slot_settings import ValidatorSlotSettings
 from ditto.api_server.artifact_audit import client_ip, request_detail
 from ditto.api_server.bench import CURRENT_BENCH_VERSION, is_bench_version_retired
 from ditto.api_server.benchmark_rollout import rolling_qualification_blockers
@@ -178,10 +182,15 @@ from ditto.api_server.koth import (
     KOTH_RANK_SHARES,
     KOTH_TAIL_SIZE,
     KothEntry,
-    effective_composite,
     project_koth,
 )
+from ditto.api_server.model_use import model_use_factor, model_use_policy
 from ditto.api_server.storage import ObjectDownloadFailedError
+from ditto.api_server.validator_slot_settings import (
+    HostResourceSample,
+    allowed_slot_count,
+    resolve_slot_settings,
+)
 from ditto.chain import ChainError
 from ditto.db.models import (
     Agent,
@@ -251,6 +260,11 @@ from ditto.db.queries.retry_state import (
     classify_agent_retry_states,
     resolve_bench_version,
 )
+from ditto.db.queries.score_ranking import (
+    completed_wave_data,
+    official_composites,
+    rank_submissions,
+)
 from ditto.db.queries.scores import (
     SCORING_QUORUM,
     LedgerRow,
@@ -273,9 +287,10 @@ from ditto.db.queries.screening import (
     list_screening_attempts,
 )
 from ditto.db.queries.tickets import (
-    get_score_continuation_floor,
+    get_score_continuation_floor_row,
     get_score_priority_floors,
 )
+from ditto.score_order import score_order_key
 
 logger = logging.getLogger(__name__)
 
@@ -1480,6 +1495,22 @@ def _safe_token_usage(details: dict) -> PublicTokenUsage | None:
         return None
 
 
+def _safe_model_use(details: dict) -> PublicModelUse | None:
+    """Project the stored model-use finding onto the public surface.
+
+    Same shape as ``_safe_token_usage``: a malformed blob yields ``None``
+    rather than a 500, because a projection bug must never take the
+    leaderboard down.
+    """
+    raw = details.get("model_use")
+    if not isinstance(raw, dict):
+        return None
+    try:
+        return PublicModelUse.model_validate(raw)
+    except ValidationError:
+        return None
+
+
 def _safe_token_efficiency(details: dict) -> PublicTokenEfficiency | None:
     raw = details.get("token_efficiency")
     if not isinstance(raw, dict):
@@ -1582,6 +1613,10 @@ def _public_entry(
     """Map a ledger row to the public entry, exposing only the safe subset of
     ``details`` (never ``per_case``, which carries the answer key)."""
     details = r.details if isinstance(r.details, dict) else {}
+    public_model_use = _safe_model_use(details)
+    model_use_verdict = (
+        ModelUseVerdict(public_model_use.verdict) if public_model_use else None
+    )
     bench_version = r.bench_version
     dataset_sha256 = details.get("dataset_sha256")
     raw_tokens = details.get("tokens")
@@ -1635,8 +1670,14 @@ def _public_entry(
             else None
         ),
         efficiency_bonus=efficiency_bonus,
+        # The model-use gate composes with the efficiency bonus as another
+        # multiplier on the platform-side ranking composite -- never on the
+        # composite the validator signed. In SHADOW (the default) the factor is
+        # always 1.0, so this line is a no-op until an operator enables
+        # enforcement against a threshold that has already been published.
         effective_composite=(
             bonus_effective_composite(r.composite, efficiency_bonus)
+            * model_use_factor(model_use_verdict, mode=model_use_policy().mode)
             if efficiency_bonus is not None
             else None
         ),
@@ -1666,6 +1707,7 @@ def _public_entry(
         integrity=_safe_integrity(details),
         tokens=tokens,
         token_usage=_safe_token_usage(details),
+        model_use=public_model_use,
         token_efficiency=_safe_token_efficiency(details),
         composite_breakdown=_composite_breakdown(
             tool_mean=r.tool_mean,
@@ -1696,11 +1738,9 @@ def _completed_wave_data(
     """
     by_seed = confirmation_by_seed or {}
     depths = confirmation_depth or {}
-    candidates: list[LedgerRow] = []
-    for row in rows:
-        if row.eligible and row.composite > 0.0:
-            candidates.append(row)
-    candidates.sort(key=lambda row: (-row.composite, row.first_seen, row.agent_id))
+    candidates = rank_submissions(
+        row for row in rows if row.eligible and row.composite > 0.0
+    )
 
     raw_projection = project_koth(
         [
@@ -1782,7 +1822,7 @@ def _public_koth_emissions(
 ) -> PublicKothEmissions | None:
     """Project the finalized score pool through the validator's pure fold."""
     quorum_values = quorum_by_agent or {}
-    candidates, by_seed, depths = _completed_wave_data(
+    candidates, by_seed, depths = completed_wave_data(
         rows,
         stderrs=stderrs,
         confirmation_by_seed=confirmation_by_seed,
@@ -2133,7 +2173,7 @@ async def leaderboard(
     else:
         confirmation_by_seed = {}
         confirmation_depth = {}
-    _, completed_by_seed, completed_depth = _completed_wave_data(
+    _, completed_by_seed, completed_depth = completed_wave_data(
         finalized_rows,
         stderrs=fold_stderrs,
         confirmation_by_seed=confirmation_by_seed,
@@ -2141,35 +2181,13 @@ async def leaderboard(
         wave_membership=continual_settings.wave_membership,
         anchor_version=active_version,
     )
-    official_composites = {
-        row.agent_id: effective_composite(
-            KothEntry(
-                miner_hotkey=row.miner_hotkey,
-                agent_id=row.agent_id,
-                composite=row.composite,
-                first_seen=row.first_seen,
-                raw_rank=0,
-                bench_version=row.bench_version,
-                quorum_composites=tuple(quorum.get(row.agent_id, ())),
-                completed_wave_composites=tuple(
-                    value
-                    for _seed, value in sorted(
-                        completed_by_seed.get(row.agent_id, {}).items()
-                    )
-                ),
-            )
-        )
-        for row in finalized_rows
-    }
-    if not continual_mean_active:
-        official_composites = {row.agent_id: row.composite for row in finalized_rows}
-    finalized_rows.sort(
-        key=lambda row: (
-            -official_composites.get(row.agent_id, row.composite),
-            row.first_seen,
-            row.agent_id,
-        )
+    board_official_composites = official_composites(
+        finalized_rows,
+        quorum=quorum,
+        completed_waves=completed_by_seed,
+        continual_mean_active=continual_mean_active,
     )
+    finalized_rows = rank_submissions(finalized_rows, scores=board_official_composites)
     # The finalized board is already one row per owner (``list_eligible_ledger``
     # partitions on ``emission_owner``), so the provisional overlay has to
     # suppress and dedupe on that same owner. Keyed on the hotkey it showed an
@@ -2184,14 +2202,9 @@ async def leaderboard(
         for row in ledger_rows
         if score_counts.get(row.agent_id, 0) < SCORING_QUORUM
     ] + list(await list_provisional_ledger(session, bench_version=bench_version))
-    provisional_candidates.sort(
-        key=lambda candidate: (
-            not candidate[0].eligible,
-            -candidate[0].composite,
-            candidate[0].first_seen,
-            str(candidate[0].agent_id),
-        )
-    )
+    # Pre-quorum rows have no continual mean, so the canonical comparator reads
+    # their raw composite -- the same call ``list_provisional_ledger`` makes.
+    provisional_candidates.sort(key=lambda candidate: score_order_key(candidate[0]))
     provisional_by_owner: dict[str, tuple[LedgerRow, int]] = {}
     for candidate in provisional_candidates:
         owner = emission_owner(
@@ -2297,7 +2310,9 @@ async def leaderboard(
                 ),
                 fold_stderr=fold_stderrs.get(row.agent_id),
                 artifact_release=artifact_releases[row.agent_id],
-                official_composite=official_composites.get(row.agent_id, row.composite),
+                official_composite=board_official_composites.get(
+                    row.agent_id, row.composite
+                ),
                 completed_wave_count=completed_depth.get(row.agent_id, 0),
                 initial_quorum_composites=tuple(quorum.get(row.agent_id, ())),
                 completed_wave_composites=tuple(
@@ -2307,7 +2322,7 @@ async def leaderboard(
                     )
                 ),
                 # The raw, unfiltered append-only trail, alongside the
-                # fold-eligible subset above. ``_completed_wave_data`` keeps
+                # fold-eligible subset above. ``completed_wave_data`` keeps
                 # only seeds shared by *every current* emission-set member, so a
                 # new entrant with no retests yet empties that intersection and
                 # ``completed_wave_*`` collapses to zero board-wide even though
@@ -2653,6 +2668,7 @@ def _validator_heartbeats_response(
     orphaned_leases: list[OrphanedLease],
     now: datetime,
     active_bench_version: int,
+    slot_settings: ValidatorSlotSettings,
 ) -> PublicValidatorHeartbeatsResponse:
     """Reconcile platform leases and signed heartbeat claims without conflating them.
 
@@ -2664,6 +2680,11 @@ def _validator_heartbeats_response(
     is exactly the false headroom this argument exists to stop reporting.
     Required rather than defaulted so no future call site can silently reproduce
     it.
+
+    ``slot_settings`` is required rather than defaulted: this view's whole job is
+    to describe the fleet as dispatch sees it, and a caller that forgets the
+    policy would silently publish advertised capacity as available capacity --
+    the exact conflation the per-entry ``allowed_slots`` exists to end.
     """
     orphans_by_hotkey: dict[str, list[PublicOrphanedSlot]] = {}
     for orphan in orphaned_leases:
@@ -2825,6 +2846,23 @@ def _validator_heartbeats_response(
                 ),
                 active_benchmark=active_benchmark,
                 configured_slots=(capacity.configured_slots if capacity else 1),
+                # Resolved with the very function ticket issue calls, so the
+                # fleet view cannot drift from dispatch as the policy changes.
+                allowed_slots=allowed_slot_count(
+                    slot_settings,
+                    advertised_slots=(capacity.configured_slots if capacity else 1),
+                    sample=HostResourceSample(
+                        cpu_percent=(
+                            metrics.cpu_percent if metrics is not None else None
+                        ),
+                        memory_percent=(
+                            metrics.memory_percent if metrics is not None else None
+                        ),
+                        disk_percent=(
+                            metrics.disk_percent if metrics is not None else None
+                        ),
+                    ),
+                ),
                 healthy_slots=(capacity.healthy_slots if capacity else ["slot-0"]),
                 admission=(capacity.admission if capacity else "accepting"),
                 active_benchmarks=active_benchmarks,
@@ -2883,6 +2921,10 @@ def _validator_heartbeats_response(
         online_window_seconds=int(_VALIDATOR_ONLINE_WINDOW.total_seconds()),
         stale_window_seconds=int(_VALIDATOR_STALE_WINDOW.total_seconds()),
         active_bench_version=active_bench_version,
+        slot_policy=PublicValidatorSlotPolicy(
+            max_concurrent_slots=slot_settings.max_concurrent_slots,
+            disk_percent_ceiling=slot_settings.disk_percent_ceiling,
+        ),
         reported_count=len(entries),
         online_count=sum(entry.online for entry in entries),
         validators=entries,
@@ -2891,6 +2933,7 @@ def _validator_heartbeats_response(
 
 @router.get("/validators", response_model=PublicValidatorHeartbeatsResponse)
 async def validators(
+    request: Request,
     response: Response,
     session: SessionDep,
 ) -> PublicValidatorHeartbeatsResponse:
@@ -2909,6 +2952,7 @@ async def validators(
         ),
         now=now,
         active_bench_version=await active_bench_version(session),
+        slot_settings=await resolve_slot_settings(request.app.state),
     )
 
 
@@ -3113,6 +3157,7 @@ def _public_validator_score(s) -> PublicValidatorScore:
     """Map one stored score row to its published, redacted form."""
     details = s.details if isinstance(s.details, dict) else {}
     robustness, audit_pairs = _safe_transform_robustness(details)
+    public_model_use = _safe_model_use(details)
     return PublicValidatorScore(
         validator_hotkey=s.validator_hotkey,
         composite=s.composite,
@@ -3120,6 +3165,7 @@ def _public_validator_score(s) -> PublicValidatorScore:
         memory_mean=s.memory_mean,
         raw_composite=_safe_raw_composite(details),
         token_usage=_safe_token_usage(details),
+        model_use=public_model_use,
         token_efficiency=_safe_token_efficiency(details),
         composite_breakdown=_composite_breakdown(
             tool_mean=s.tool_mean,
@@ -3283,6 +3329,20 @@ def _queue_gate(
     """What holds this submission behind its rank, if anything does."""
     entry = preview.get(agent_id)
     return None if entry is None else entry.gate
+
+
+def _queue_gate_detail(
+    preview: dict[UUID, QueuePreviewEntry], agent_id: UUID
+) -> str | None:
+    """The evidence behind the gate, when the gate has any worth naming.
+
+    Read off the same preview entry as :func:`_queue_gate` rather than
+    recomputed, so the badge and its explanation cannot describe different
+    rows -- which is the entire reason the gate and its reason live in one
+    expression upstream.
+    """
+    entry = preview.get(agent_id)
+    return None if entry is None else entry.gate_detail
 
 
 def _public_activity_statuses(
@@ -3458,6 +3518,9 @@ def _public_activity_response(
                 provisional_composite=row.provisional_composite,
                 validator_queue_rank=_queue_rank(queue_preview, row.agent.agent_id),
                 validator_queue_gate=_queue_gate(queue_preview, row.agent.agent_id),
+                validator_queue_gate_detail=_queue_gate_detail(
+                    queue_preview, row.agent.agent_id
+                ),
                 # #458's flag, now read off the shared preview rather than
                 # recomputed here: it is exactly the ``previous_generation``
                 # case of ``validator_queue_gate``. Kept as its own boolean
@@ -3674,6 +3737,7 @@ async def activity(
 
 @router.get("/operations", response_model=PublicOperationsResponse)
 async def operations(
+    request: Request,
     response: Response,
     session: SessionDep,
 ) -> PublicOperationsResponse:
@@ -3762,6 +3826,7 @@ async def operations(
         ),
         now=now,
         active_bench_version=active_version,
+        slot_settings=await resolve_slot_settings(request.app.state),
     )
     return PublicOperationsResponse(
         generated_at=now,
@@ -4002,8 +4067,16 @@ async def agent_pipeline(
     running_attempt = next(
         (attempt for attempt in attempts if attempt.status == "running"), None
     )
-    score_continuation_floor = await get_score_continuation_floor(
+    # One read, so the quoted floor and the agent credited with it cannot come
+    # from two different snapshots of a ledger that moves between calls.
+    score_floor = await get_score_continuation_floor_row(
         session, bench_version=canonical_version
+    )
+    score_continuation_floor = score_floor.score if score_floor is not None else None
+    score_floor_agent = (
+        await session.get(Agent, score_floor.row.agent_id)
+        if score_floor is not None
+        else None
     )
     benchmark_admitted = await agent_is_admitted(
         session, bench_version=canonical_version, agent_id=agent_id
@@ -4051,6 +4124,15 @@ async def agent_pipeline(
         score_count=len(era_scores),
         quorum=SCORING_QUORUM,
         score_floor=score_continuation_floor or 0.0,
+        score_floor_agent_id=(
+            score_floor.row.agent_id if score_floor is not None else None
+        ),
+        score_floor_agent_name=(
+            score_floor_agent.name if score_floor_agent is not None else None
+        ),
+        score_floor_agent_version=(
+            score_floor_agent.version if score_floor_agent is not None else None
+        ),
         provisional_scores=[
             PublicProvisionalScore(
                 composite=score.composite,
@@ -4383,9 +4465,26 @@ async def agent_dataset(
         raise HTTPException(
             status_code=404, detail="no revealable dataset for this agent"
         )
+    # The era this agent actually ran, not a default.
+    #
+    # `fetch_dataset` used to default `bench_version` to 2, and this call
+    # omitted it -- so the reveal served the v2 dataset for every finalized
+    # agent regardless of the benchmark it was scored under. Silent, because a
+    # v2 dataset is a perfectly well-formed artifact; it just is not this
+    # agent's. The retired-era floor made the default unreachable and the bug
+    # visible.
+    #
+    # The agent's own scores are the authority on which era finalized it, so
+    # take the newest of them. A submission reaching this endpoint is finalized
+    # and therefore has scores; fall back to the active era rather than assume.
+    dataset_bench_version = (
+        max(score.bench_version for score in row.scores)
+        if row.scores
+        else await active_bench_version(session)
+    )
     try:
         artifact, sha = await generator.fetch_dataset(
-            row.dataset_seed, row.dataset_run_size
+            row.dataset_seed, row.dataset_run_size, dataset_bench_version
         )
     except DataPipelineError as e:
         raise HTTPException(

@@ -202,6 +202,7 @@ def evaluate_duplicate_signals(
     structural_fingerprint: dict | None = None,
     prompt_fingerprint: dict | None = None,
     miner_coldkey: str | None = None,
+    linked_owner_hotkeys: frozenset[str] = frozenset(),
     score_tol: float = _DEFAULT_SCORE_TOL,
     size_tol: int = _DEFAULT_SIZE_TOL,
     jaccard_tol: float = _DEFAULT_JACCARD_TOL,
@@ -215,6 +216,26 @@ def evaluate_duplicate_signals(
     own submissions and other agents paid for by the same coldkey (an owner
     iterating through different names or hotkeys is not a copier). Legacy rows
     without payment provenance still fall back to same-hotkey exclusion.
+
+    ``linked_owner_hotkeys`` extends that same principle to an owner who
+    rotated keys, which coldkey equality cannot see. Each entry is a hotkey
+    cryptographically proven to be the same operator as this miner: both
+    endpoints signed the link, each with its own hotkey or the coldkey bound to
+    it (see :mod:`ditto.api_server.attestation`). The exemption is **narrower**
+    than the coldkey one on purpose, and applies to the derivative rules only:
+
+    - rules **2** and **3** — the near-duplicate signals that punish a miner for
+      iterating on their own prior work — skip attested predecessors;
+    - rules **1** and **1b** — byte-identical ``sha256`` and identical
+      canonicalized source — do **not**. Re-submitting the same artifact under a
+      new key is precisely the shape of emission-slot farming, and it is the one
+      case where a single operator glance is worth more than an automatic pass.
+      A stronger proof of *who* does not make an identical re-upload more
+      meritorious, so this scope is unchanged by the strength of the evidence
+      behind the link. The existing same-coldkey exemption is unbounded in
+      exactly this way; this one deliberately is not, and must not be widened
+      to match it.
+
     Originality attribution also follows upload chronology,
     not score-finalization order: normalized-source and near-duplicate rules compare
     only with another miner's strictly earlier submission. Equal timestamps use the
@@ -284,6 +305,14 @@ def evaluate_duplicate_signals(
         ),
         key=lambda e: (_utc(e.first_seen), e.agent_id.int),
     )
+    # Rules 2 and 3 additionally drop hotkeys proven to be the same operator.
+    # Rules 1 and 1b keep the full list -- see the docstring for why an identity
+    # match is not covered by an owner-link attestation.
+    earlier_unattested = (
+        earlier_others
+        if not linked_owner_hotkeys
+        else [e for e in earlier_others if e.miner_hotkey not in linked_owner_hotkeys]
+    )
 
     # 1. Exact byte-identical copy of another miner's eligible artifact.
     # This is a defense-in-depth mirror of the separate admission-time exact-byte
@@ -323,7 +352,7 @@ def evaluate_duplicate_signals(
     #    comparison precisely when the copy got the luckiest re-roll. See
     #    ``_DEFAULT_SCORE_TOL``. The composite delta is still reported in the
     #    audit reason as context for the reviewer.
-    for e in earlier_others:
+    for e in earlier_unattested:
         # A refreshed starter-kit corpus changes what is subtracted from the
         # sketch.  During the bounded metadata backfill, old and new corpus IDs
         # coexist.  That pair is incomparable, but incomparability is not copy
@@ -377,7 +406,7 @@ def evaluate_duplicate_signals(
     #    affirmative evidence that reference subtraction found too little custom
     #    surface; cross-version sketches likewise must fail open during backfill.
     if size_bytes is not None:
-        for e in earlier_others:
+        for e in earlier_unattested:
             if (
                 e.size_bytes is not None
                 and abs(composite - e.composite) <= score_tol

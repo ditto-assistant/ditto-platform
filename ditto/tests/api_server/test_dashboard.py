@@ -573,6 +573,8 @@ class TestDashboard:
         assert 'class="timeline-champion-plate"' in body
         assert 'class="timeline-champion-halo"' in body
         assert "lastEmissions ? lastEmissions.champion_miner_hotkey : null" in body
+        # Its label stays in a reserved gutter instead of masking chart data.
+        assert "var plateY = top - plateH - 5;" in body
         # Contracts are banded, not spaced by wall clock.
         assert "var bandWidth = plotWidth / eras.length;" in body
         assert "Each contract gets an equal band, not equal clock time" in body
@@ -732,6 +734,58 @@ class TestDashboard:
         assert "activityPage = 1;" in body
         assert "No submissions match these filters." in body
         assert "Could not load submissions. Try again." in body
+
+    async def test_score_floor_message_attributes_the_number_it_quotes(
+        self,
+    ) -> None:
+        """The low-priority explanation has to be falsifiable from public data.
+
+        It used to say "below the current fifth-place score of 0.886", which a
+        miner could not check: the floor was the fifth-highest ``composite``
+        while the leaderboard's rank column orders by ``official_composite``, so
+        the row displayed at rank 5 was routinely a different agent with a
+        different number. Both readings were live and they disagreed, which is
+        what generated the support report.
+
+        Both surfaces now cut with the one canonical ordering
+        (:mod:`ditto.score_order`) on ``official_composite``, so the copy must
+        say so and must still name the holder -- the number is only checkable if
+        the miner knows whose submission to open.
+        """
+        app = create_api_server(make_api_server_config(dashboard_enabled=True))
+        body = (await _get(app, "/")).text
+
+        # The unfalsifiable phrasing must not come back.
+        assert "fifth-place score of" not in body
+        assert "the current fifth-place score" not in body
+
+        assert "function scoreFloorAttribution(e) {" in body
+        assert (
+            '"That floor is the 5th-highest finalized official_composite" + where'
+            in body
+        )
+        assert "the same score and the same ordering the leaderboard ranks by" in body
+        assert 'if (!e.score_floor_agent_id) return basis + ".";' in body
+        assert (
+            "agentLabel(e.score_floor_agent_name, e.score_floor_agent_version)" in body
+        )
+        assert "Open that submission to read the same number back." in body
+        # The retired claim -- true only while the two surfaces used different
+        # orderings -- must not survive the unification that made it false.
+        assert "can belong to a different agent" not in body
+
+        # Both surfaces that quote the floor go through the same attribution.
+        assert (
+            'fx(bestPossible) + ", below the continuation floor of " '
+            '+ fx(scoreFloor) + ". " +' in body
+        )
+        assert "          scoreFloorAttribution(e) +" in body
+        assert (
+            'the best reachable median is below the continuation floor. " '
+            '+ scoreFloorAttribution(pipeline) + " This result remains provisional'
+            in body
+        )
+        assert "The third score is still queued at low priority" in body
 
     async def test_submission_filters_and_page_restore_and_sanitize_the_url(
         self,

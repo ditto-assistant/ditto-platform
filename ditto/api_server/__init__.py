@@ -19,6 +19,8 @@ Usage:
 
 from __future__ import annotations
 
+from fastapi import FastAPI
+
 from ditto.api_server.config import (
     ApiServerConfig,
     EfficiencyBonusConfig,
@@ -31,8 +33,22 @@ from ditto.api_server.errors import (
     ApiServerError,
     ApiServerLifespanError,
 )
-from ditto.api_server.factory import create_api_server
 from ditto.api_server.validator_names import ValidatorNamesConfig
+
+
+def create_api_server(config: ApiServerConfig | None = None) -> FastAPI:
+    """Build the API lazily, keeping submodule imports independent.
+
+    Database query modules import small API helpers such as ``crn`` and
+    ``inference_routing``. Importing the endpoint factory as a package side
+    effect makes those helpers recursively import the entire query graph and
+    creates order-dependent cycles. The public constructor remains identical;
+    only its heavy dependency is deferred until it is actually called.
+    """
+    from ditto.api_server.factory import create_api_server as build_api_server
+
+    return build_api_server(config)
+
 
 __all__ = [
     # Main components

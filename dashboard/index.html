@@ -655,6 +655,9 @@
     .stage.good { color: var(--good); border-color: color-mix(in oklab, var(--good) 38%, transparent); background: color-mix(in oklab, var(--good) 10%, transparent); }
     .stage.warn { color: var(--warn); border-color: color-mix(in oklab, var(--warn) 40%, transparent); background: color-mix(in oklab, var(--warn) 10%, transparent); }
     .stage.bad { color: var(--danger); border-color: color-mix(in oklab, var(--danger) 40%, transparent); background: color-mix(in oklab, var(--danger) 10%, transparent); }
+    /* A capped slot is a deliberate operator setting, not a fault: dimmer than
+       idle so it reads as "switched off", never as an alert. */
+    .stage.capped { border-style: dashed; opacity: .7; }
     .stage-cell { min-width: 230px; }
     .stage-note { display: block; margin-top: 6px; max-width: 54ch; color: var(--text-dim); font-size: 11.5px; line-height: 1.45; overflow-wrap: anywhere; }
     .stage-note b { color: var(--text); font-weight: 650; }
@@ -4286,7 +4289,10 @@
         : Math.max(272, Math.min(376, Math.round(width * 0.34)));
       var left = tight ? 32 : narrow ? 40 : 58;
       var right = narrow ? 14 : 26;
-      var top = narrow ? 22 : 30;
+      // Reserve a slim annotation gutter above the plot. The reigning champion
+      // plate lives here so a high score cannot cover the latest record line or
+      // the finalized-run cloud it is meant to explain.
+      var top = narrow ? 28 : 34;
       var bottom = narrow ? 52 : 62;
       var plotWidth = width - left - right, plotHeight = height - top - bottom;
       var bandWidth = plotWidth / eras.length;
@@ -4477,12 +4483,10 @@
         // space, plus room for the right-aligned score and the gap between.
         var plateW = Math.min(Math.max((crownName.length + 2) * 6.7 + 74, 124), Math.max(plotWidth - 8, 110));
         var plateH = 21;
-        // Prefer the side with room; on a phone the plate sits above the point.
-        var placeLeft = cx + 14 + plateW > width - right;
-        var plateX = narrow
-          ? Math.min(Math.max(cx - plateW / 2, left + 2), width - right - plateW - 2)
-          : (placeLeft ? cx - 14 - plateW : cx + 14);
-        var plateY = narrow ? Math.max(top + 2, cy - 34) : cy - plateH / 2;
+        // Keep the plate in the annotation gutter, never over the data field.
+        // Centre it on the champion where possible and clamp it at both edges.
+        var plateX = Math.min(Math.max(cx - plateW / 2, left + 2), width - right - plateW - 2);
+        var plateY = top - plateH - 5;
         svg.push('<line class="timeline-champion-drop" x1="' + cx.toFixed(2) + '" x2="' + cx.toFixed(2) + '" y1="' + (cy + 8).toFixed(2) + '" y2="' + (height - bottom) + '"></line>');
         svg.push('<circle class="timeline-champion-halo" cx="' + cx.toFixed(2) + '" cy="' + cy.toFixed(2) + '" r="' + (recordR + 13) + '"></circle>');
         svg.push('<circle class="timeline-champion-pulse" cx="' + cx.toFixed(2) + '" cy="' + cy.toFixed(2) + '" r="' + (recordR + 5) + '"></circle>');
@@ -5654,6 +5658,7 @@
       }
       if (m.harness) det += stat("Harness model", m.harness);
       if (e.tokens != null) det += stat("Scoring token spend", e.tokens.toLocaleString());
+      det += modelUseStats(e.model_use);
       // Per-category breakdown renders full width below the stat columns as a dense
       // multi-column grid, so all ~40 categories stay compact and legible. Each cell
       // carries the category purpose as a tooltip and colour-grades its mean.
@@ -5778,6 +5783,35 @@
       if (ev.shiftKey && document.activeElement === first) { ev.preventDefault(); last.focus(); }
       else if (!ev.shiftKey && document.activeElement === last) { ev.preventDefault(); first.focus(); }
     }
+    // Model-use accountability. The server decides the verdict and publishes the
+    // thresholds alongside it, so this renders what it is given and computes
+    // nothing -- a miner and the platform can never be reading different bars.
+    function modelUseStats(mu) {
+      if (!mu) return "";
+      var out = "";
+      if (mu.verdict === "unmeasured") {
+        return stat("Model use", "not measured for this run");
+      }
+      var used = mu.verdict === "used";
+      out += stat("Model use", used ? "used" : "NOT USED — scores zero once enforced");
+      if (mu.prompt_tokens_per_case != null) {
+        out += stat("Prompt tokens / case",
+          Math.round(mu.prompt_tokens_per_case).toLocaleString() +
+          (mu.min_prompt_tokens_per_case != null ? " (min " + mu.min_prompt_tokens_per_case.toLocaleString() + ")" : ""));
+      }
+      if (mu.calls_per_case != null) {
+        out += stat("Model calls / case", mu.calls_per_case.toFixed(2) +
+          (mu.min_calls_per_case != null ? " (min " + mu.min_calls_per_case + ")" : ""));
+      }
+      if (mu.prompt_tokens_per_call != null) {
+        out += stat("Prompt tokens / call",
+          Math.round(mu.prompt_tokens_per_call).toLocaleString() +
+          (mu.min_prompt_tokens_per_call != null ? " (min " + mu.min_prompt_tokens_per_call.toLocaleString() + ")" : ""));
+      }
+      if (!used && mu.reason) out += stat("Why", mu.reason);
+      return out;
+    }
+
     function stat(k, v) {
       return '<div class="stat-row"><span class="k">' + esc(k) + '</span><span class="v">' + esc(v) + '</span></div>';
     }
@@ -6552,6 +6586,22 @@
       notice.hidden = false;
     }
 
+    // Name the row the continuation floor was cut from. The floor and the
+    // leaderboard now share one ordering (server-side, ditto/score_order.py):
+    // both cut on official_composite, so the floor IS the score of the finalized
+    // row the board ranks fifth. Naming the holder keeps the claim checkable --
+    // a miner opens that submission and reads the same number back.
+    function scoreFloorAttribution(e) {
+      var benchKey = benchmarkVersionKey(e.active_bench_version);
+      var where = benchKey === "unknown" ? "" : " on " + benchmarkVersionLabel(benchKey);
+      var basis = "That floor is the 5th-highest finalized official_composite" + where +
+        " — the same score and the same ordering the leaderboard ranks by";
+      if (!e.score_floor_agent_id) return basis + ".";
+      return basis + ", held by " +
+        agentLabel(e.score_floor_agent_name, e.score_floor_agent_version) +
+        ". Open that submission to read the same number back.";
+    }
+
     function validationDetail(e) {
       var count = Math.max(0, Number(e.score_count) || 0);
       var quorum = Math.max(1, Number(e.quorum) || 3);
@@ -6582,8 +6632,9 @@
           return Math.max(best, Number(score.composite) || 0);
         }, 0);
         return "Two accepted scores mean even a perfect third run could not raise the median above " +
-          fx(bestPossible) + ", below the current fifth-place score of " + fx(scoreFloor) +
-          ". The third score is still queued at low priority so this benchmark record reaches 3 of 3.";
+          fx(bestPossible) + ", below the continuation floor of " + fx(scoreFloor) + ". " +
+          scoreFloorAttribution(e) +
+          " The third score is still queued at low priority so this benchmark record reaches 3 of 3.";
       }
       if (e.status === "not_queued") {
         return "This historical submission is retained for audit history but is not admitted to the active benchmark queue. It cannot consume validator capacity unless an explicit audited recovery admits it.";
@@ -7062,7 +7113,7 @@
         var note = complete
           ? "This benchmark version has reached quorum. Its aggregate is the median of these independent accepted scores."
           : deprioritized && cohort.key === benchmarkVersionKey(pipeline.active_bench_version)
-          ? "The third score remains queued at low priority because the best reachable median is below the current fifth-place score. This result remains provisional until quorum."
+          ? "The third score remains queued at low priority because the best reachable median is below the continuation floor. " + scoreFloorAttribution(pipeline) + " This result remains provisional until quorum."
           : "Scores in this benchmark version remain provisional until " + quorum + " independent scores arrive. Provisional scores may change; the final median is authoritative within this benchmark version.";
         var rows = cohort.scores.map(function (score, index) {
           return renderScore(score, index, complete);
@@ -8114,6 +8165,70 @@
         entityAnchor("agent", orphan.agent_id, agent) + '</span>';
     }
 
+    // Slots the operator cap will not hand a ticket to, keyed by slot id.
+    //
+    // A validator advertises its own capacity; `allowed_slots` is how much of it
+    // the platform funds. Rendering the difference as "Idle" claimed capacity no
+    // ticket would ever reach — a validator advertising eight under a cap of six
+    // read as six idle slots plus two more going spare.
+    //
+    // The cap counts concurrent LEASES, not slot ordinals, so this charges the
+    // running slots first and marks the leftover idle ones from the highest
+    // ordinal down. Live work is never marked: lowering the cap costs the fleet
+    // new leases only, never one already in flight. An unhealthy slot is left
+    // alone as well — it has its own state, and it is not the cap that is
+    // keeping work off it.
+    function cappedSlotIds(entry) {
+      var allowed = Number(entry.allowed_slots);
+      // A payload without the field predates it; saying nothing beats guessing.
+      if (!isFinite(allowed)) return {};
+      var busy = {};
+      [entry.active_benchmarks || [], entry.assigned_benchmarks || []].forEach(function (list) {
+        list.forEach(function (benchmark) {
+          if (benchmark && benchmark.slot_id) busy[benchmark.slot_id] = true;
+        });
+      });
+      var healthy = {};
+      (entry.healthy_slots || []).forEach(function (slotId) {
+        if (slotId) healthy[slotId] = true;
+      });
+      var budget = Math.max(0, allowed - Object.keys(busy).length);
+      var capped = {};
+      validatorSlotIds(entry).forEach(function (slotId) {
+        if (busy[slotId] || !healthy[slotId]) return;
+        if (budget > 0) {
+          budget -= 1;
+          return;
+        }
+        capped[slotId] = true;
+      });
+      return capped;
+    }
+
+    // Slots that can take work right now: the operator cap and the validator's
+    // own health, whichever binds first. Shown as the numerator so the fleet
+    // table stops reporting advertised capacity as if it were available.
+    function fundedSlotCount(entry) {
+      var healthy = (entry.healthy_slots || []).length;
+      var allowed = Number(entry.allowed_slots);
+      return isFinite(allowed) ? Math.min(allowed, healthy) : healthy;
+    }
+
+    // Why the numerator is what it is, spelled out for the cell's tooltip.
+    function slotCapacityTitle(entry, slotPolicy) {
+      var parts = [
+        String(entry.configured_slots || 1) + " advertised",
+        String((entry.healthy_slots || []).length) + " healthy"
+      ];
+      if (isFinite(Number(entry.allowed_slots))) {
+        parts.push(String(entry.allowed_slots) + " funded by the operator cap");
+      }
+      if (slotPolicy && isFinite(Number(slotPolicy.max_concurrent_slots))) {
+        parts.push("fleet cap " + String(slotPolicy.max_concurrent_slots) + " per validator");
+      }
+      return parts.join(" · ");
+    }
+
     // True when any slot is reporting a stage, not just the lowest one. Keying
     // this off a single slot hid live progress whenever slot zero was idle.
     function anyBenchmarkStage(entry) {
@@ -8305,9 +8420,15 @@
       report += vstat("Platform received", isoTimeHtml(entry.seen_at));
       var assignment = renderValidatorAssignment(entry);
       if (assignment) report += vstat("Assignment", assignment);
+      // Advertised, healthy and funded are three different numbers, and the one
+      // that decides whether a slot gets work is the last of them.
+      var slotSummary = String((entry.healthy_slots || []).length) + " healthy of " +
+        String(entry.configured_slots || 1);
+      if (isFinite(Number(entry.allowed_slots))) {
+        slotSummary += " · " + String(entry.allowed_slots) + " funded by the operator cap";
+      }
       report += vstat("Slots", esc(
-        String((entry.healthy_slots || []).length) + " healthy of " +
-        String(entry.configured_slots || 1) + " · " + String(entry.admission || "accepting")));
+        slotSummary + " · " + String(entry.admission || "accepting")));
       // Above the running slots deliberately: an operator opening this modal is
       // usually asking "does this host have room", and the answer is no while
       // any of these are listed.
@@ -8568,6 +8689,9 @@
       document.getElementById("fleet-retired-title").textContent = showScreeners
         ? "Recently offline"
         : "Inoperative validators";
+      // Fleet-wide policy, carried on the snapshot rather than per row: it is
+      // what turns "this slot is idle" into "this slot is capped".
+      var slotPolicy = singular === "validator" ? data.slot_policy : null;
       var benchVersion = activeBenchVersion();
       document.getElementById("fleet-retired-note").textContent = showScreeners
         ? "Heartbeat history remains visible for 24 hours, then expires automatically."
@@ -8631,6 +8755,10 @@
             if (orphan && orphan.slot_id) orphanBySlot[orphan.slot_id] = orphan;
           });
           var healthySlots = entry.healthy_slots || [];
+          var cappedSlots = cappedSlotIds(entry);
+          var cappedTitle = slotPolicy && isFinite(Number(slotPolicy.max_concurrent_slots))
+            ? "Operator cap: " + String(slotPolicy.max_concurrent_slots) + " concurrent slots per validator. No ticket is issued here."
+            : "Held back by the operator slot cap. No ticket is issued here.";
           var slotRows = validatorSlotIds(entry).map(function (slotId) {
             var benchmark = activeBySlot[slotId] || assignedBySlot[slotId];
             var orphan = orphanBySlot[slotId];
@@ -8644,9 +8772,11 @@
                 ? orphanedSlotLabel(orphan)
                 : (entry.admission !== "accepting"
                 ? '<span class="stage warn">' + esc(entry.admission) + '</span>'
-                : (healthySlots.indexOf(slotId) >= 0
-                  ? '<span class="stage success">Idle</span>'
-                  : '<span class="stage warn">Unavailable</span>')));
+                : (healthySlots.indexOf(slotId) < 0
+                  ? '<span class="stage warn">Unavailable</span>'
+                  : (cappedSlots[slotId]
+                    ? '<span class="stage capped" title="' + esc(cappedTitle) + '">Capped</span>'
+                    : '<span class="stage success">Idle</span>'))));
             return '<div class="fleet-slot" title="' + esc(slotId) + '"><span class="fleet-protocol">' + esc(slotId) + '</span> ' + slotState + '</div>';
           });
           slotWork = slotRows.join("");
@@ -8661,12 +8791,18 @@
         var workStatus = hasGranularProgress
           ? ""
           : '<span class="stage ' + work[1] + '">' + esc(work[0]) + '</span>';
+        // Slots read "funded of advertised", not "healthy of advertised": the
+        // operator cap is the number that decides whether a slot can be given
+        // work, and the tooltip carries the full breakdown behind it.
         var protocol = singular === "screener"
           ? "Protocol " + entry.protocol_version + " · Policy " + entry.policy_version
           : "Protocol " + entry.protocol_version + " · " +
-            String((entry.healthy_slots || []).length) + "/" +
+            String(fundedSlotCount(entry)) + " of " +
             String(entry.configured_slots || 1) + " slots · " +
             String(entry.admission || "accepting");
+        var protocolTitle = singular === "validator"
+          ? slotCapacityTitle(entry, slotPolicy)
+          : "";
         // Validators are keyed by a distinct hotkey; the screener fleet shares
         // one hotkey, so each worker is distinguished by its instance_id.
         var displayName = singular === "validator" ? validatorNames[hotkey] : (entry.instance_id || "");
@@ -8680,7 +8816,7 @@
           '<td><span class="fleet-time" title="' + esc(entry.first_seen_at || "") + '">' + esc(firstSeen) + '</span></td>' +
           '<td><span class="fleet-time" title="' + esc(reportedAt) + '">' + relTime(reportedAt) + '</span></td>' +
           '<td class="fleet-work-col">' + workStatus + currentWork + '</td>' +
-          '<td><span class="fleet-version">' + esc(version) + '</span><span class="fleet-protocol">' + esc(protocol) + '</span></td>' +
+          '<td><span class="fleet-version">' + esc(version) + '</span><span class="fleet-protocol" title="' + esc(protocolTitle) + '">' + esc(protocol) + '</span></td>' +
           renderFleetMetricCells(entry.system_metrics) +
           '</tr>';
       }).join("");

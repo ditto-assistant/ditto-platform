@@ -12,6 +12,8 @@ change is safe to merge:
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock
 from uuid import UUID, uuid4
@@ -40,12 +42,33 @@ from ditto.db.queries.benchmark_carryover import EVENT_CARRYOVER_ADOPTED
 from ditto.db.queries.queue_policy_settings import (
     insert_queue_policy_settings_revision,
 )
+from ditto.tests.legacy_era import retired_era_writes_allowed
 
 _ROLLOUT_START = datetime(2026, 7, 20, 12, 0, 0, tzinfo=UTC)
 _NOW = _ROLLOUT_START + timedelta(days=2)
+# Not arbitrary, and not renumberable. Carryover only runs during a rollout,
+# v7 is the newest shipped contract, and a rollout moves forward -- so the only
+# transition this pass can ride is 6 -> 7, and the backlog it adopts is stranded
+# on a RETIRED era by definition. The ``scores`` rows below are therefore rows
+# the floor refuses to write today; production still holds its own because the
+# constraint is NOT VALID. ``_seeding_the_retired_era`` reproduces that state.
 _FROM_VERSION = 6
 _DESIRED_VERSION = 7
 _COHORT = 5
+
+
+@asynccontextmanager
+async def _seeding_the_retired_era(session: AsyncSession) -> AsyncIterator[None]:
+    """Open the seeding transaction with the retired-era floor lifted.
+
+    The backlog this pass exists to adopt is v6 work that never reached quorum.
+    Writing it is exactly what ``scores_bench_version_floor`` stops now, so the
+    floor comes off for the seed and goes straight back on -- NOT VALID, as the
+    migration declares it -- before the pass under test runs. Everything
+    ``refresh_rolling_qualification`` writes still meets the live floor.
+    """
+    async with retired_era_writes_allowed(session), session.begin():
+        yield
 
 
 def _generator() -> AsyncMock:
@@ -166,7 +189,7 @@ class TestDisabledIsATotalNoOp:
     async def test_shipped_default_selects_renders_and_admits_nothing(
         self, session: AsyncSession
     ) -> None:
-        async with session.begin():
+        async with _seeding_the_retired_era(session):
             rollout = await _seed_open_rollout(session)
             stranded = await _seed_agent(
                 session,
@@ -207,7 +230,7 @@ class TestEnabledMovesAllThreeLegsTogether:
     async def test_row_and_dataset_are_created_in_one_pass(
         self, session: AsyncSession
     ) -> None:
-        async with session.begin():
+        async with _seeding_the_retired_era(session):
             rollout = await _seed_open_rollout(session)
             stranded = await _seed_agent(
                 session,
@@ -259,7 +282,7 @@ class TestEnabledMovesAllThreeLegsTogether:
         generator.generate.assert_awaited_once_with(11, bench_version=_DESIRED_VERSION)
 
     async def test_repeated_passes_are_idempotent(self, session: AsyncSession) -> None:
-        async with session.begin():
+        async with _seeding_the_retired_era(session):
             await _seed_open_rollout(session)
             await _seed_agent(
                 session,
@@ -283,7 +306,7 @@ class TestEnabledMovesAllThreeLegsTogether:
     async def test_the_cap_bounds_the_whole_backlog(
         self, session: AsyncSession
     ) -> None:
-        async with session.begin():
+        async with _seeding_the_retired_era(session):
             await _seed_open_rollout(session)
             for index in range(4):
                 await _seed_agent(

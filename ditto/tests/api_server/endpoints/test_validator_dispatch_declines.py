@@ -162,7 +162,9 @@ class TestSlotCapDeclineReason:
         reads the dashboard to do exactly that.
         """
         settings = ValidatorSlotSettings(
-            max_concurrent_slots=DISK_RESTRICTED_SLOTS, disk_percent_ceiling=90
+            max_concurrent_slots=DISK_RESTRICTED_SLOTS,
+            disk_percent_ceiling=90,
+            resource_block_percent_ceiling=100,
         )
 
         assert (
@@ -170,7 +172,7 @@ class TestSlotCapDeclineReason:
                 slot_id="slot-1",
                 settings=settings,
                 advertised_slots=4,
-                disk_percent=99,
+                disk_percent=92,
             )
             == "slot_cap"
         )
@@ -178,7 +180,9 @@ class TestSlotCapDeclineReason:
     def test_a_validator_offering_one_slot_is_not_blamed_on_the_disk(self) -> None:
         """The cap can only narrow the offer; a one-slot host is at its own limit."""
         settings = ValidatorSlotSettings(
-            max_concurrent_slots=4, disk_percent_ceiling=90
+            max_concurrent_slots=4,
+            disk_percent_ceiling=90,
+            resource_block_percent_ceiling=100,
         )
 
         assert (
@@ -186,7 +190,7 @@ class TestSlotCapDeclineReason:
                 slot_id="slot-0",
                 settings=settings,
                 advertised_slots=1,
-                disk_percent=99,
+                disk_percent=92,
             )
             == "slot_cap"
         )

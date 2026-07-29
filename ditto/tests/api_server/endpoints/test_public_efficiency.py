@@ -39,6 +39,7 @@ from ditto.db.models import (
 )
 from ditto.db.queries.scores import upsert_score
 from ditto.tests.api_server.conftest import make_api_server_config
+from ditto.tests.legacy_era import retired_era_writes_allowed
 
 _VALIDATORS = [
     "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
@@ -400,15 +401,28 @@ class TestLeaderboardBonusExposure:
     async def test_pre_v7_board_is_untouched(
         self, session_maker: async_sessionmaker[AsyncSession]
     ) -> None:
+        """A board on a retired era stays byte-identical with the flag ON.
+
+        The bonus is a v7 feature, so the only way to prove it never engages
+        below v7 is to serve a board built from genuinely sub-v7 scores. The
+        bench-version floor refuses to write those, which is exactly the
+        production situation: the v2 rows are grandfathered by a ``NOT VALID``
+        constraint and are still read back by the leaderboard. The helper
+        reproduces that state rather than pretending v2 rows no longer exist.
+        """
         # Default active version (2): flag ON but the bonus must never engage.
-        for i, miner in enumerate(_MINERS[:3]):
-            await _seed_finalized(
-                session_maker,
-                miner=miner,
-                composite=0.8 - i * 0.1,
-                total_tokens=100_000 * (i + 1),
-                bench_version=2,
-            )
+        async with (
+            session_maker() as floor_session,
+            retired_era_writes_allowed(floor_session),
+        ):
+            for i, miner in enumerate(_MINERS[:3]):
+                await _seed_finalized(
+                    session_maker,
+                    miner=miner,
+                    composite=0.8 - i * 0.1,
+                    total_tokens=100_000 * (i + 1),
+                    bench_version=2,
+                )
         app = _make_app(session_maker, efficiency=_ENABLED)
         async with _client(app) as client:
             payload = (await client.get("/api/v1/public/leaderboard")).json()

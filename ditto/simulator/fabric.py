@@ -45,6 +45,7 @@ from ditto.db.models import (
     ValidatorTicket,
 )
 from ditto.db.queries.audit import EVENT_FINALIZED, EVENT_SCORE, append_audit_entry
+from ditto.db.queries.benchmark_rollout import MIN_SCOREABLE_BENCH_VERSION
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -58,9 +59,19 @@ _UUID_NAMESPACE = uuid_mod.UUID("dd110000-5117-4a70-8000-000000000118")
 # Base58 alphabet used by SS58 addresses (no 0, O, I, l).
 _BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
-# Default bench version when no rollout row is activated (matches
-# ``ditto.db.queries.benchmark_rollout.DEFAULT_BENCH_VERSION``).
-DEFAULT_BENCH_VERSION = 2
+# Bench version the simulator seeds under.
+#
+# This used to mirror ``benchmark_rollout.DEFAULT_BENCH_VERSION`` (2), which is
+# the version assumed when no rollout has ever activated. That is a statement
+# about the very beginning of the subnet's history, and it stopped being a
+# usable default the moment v2-v6 were retired: every row the simulator wrote
+# would now be refused by ``scores_bench_version_floor`` and the
+# ``validator_tickets`` floor trigger, so seeding a local stack would fail
+# outright.
+#
+# Pinned to the floor instead. The simulator exists to populate a database that
+# behaves like production, and production cannot hold a sub-v7 score.
+DEFAULT_BENCH_VERSION = MIN_SCOREABLE_BENCH_VERSION
 
 # Tables the simulator owns, children before parents. TRUNCATE ... CASCADE
 # makes the order advisory, but keeping it dependency-safe documents intent.

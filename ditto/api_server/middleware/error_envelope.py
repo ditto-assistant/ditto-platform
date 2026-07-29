@@ -23,6 +23,7 @@ from ditto.api_server.endpoints.screener import (
 )
 from ditto.api_server.endpoints.validator import (
     AgentNotEvaluatableError,
+    RetiredBenchVersionError,
     ValidatorAuthError,
 )
 from ditto.api_server.middleware.request_id import (
@@ -78,6 +79,16 @@ ERROR_CODE_PAYMENT_REPLAYED = 3207
 # driving the evaluate -> score loop; distinct from the agent-side 1xxx codes.
 ERROR_CODE_VALIDATOR_AUTH = 4000
 ERROR_CODE_AGENT_NOT_EVALUATABLE = 4001
+# 4002 -> 410 Gone. TERMINAL. The benchmark era this score belongs to is
+# retired; the score ledger's CHECK constraints refuse the row and no future
+# event brings the era back. Distinct from 4001, which is about the *agent*
+# and can clear when the agent advances -- this one never clears.
+#
+# 410 rather than 409 on purpose: a conflict invites a retry, and this must
+# not be retried. Specifically it must not be handed back as
+# ``fail_job(reason="infrastructure")``, which is no-fault and would re-lease
+# without bound. See ``RetiredBenchVersionError``.
+ERROR_CODE_BENCH_VERSION_RETIRED = 4002
 
 # Inference-proxy declines (41xx, inside the validator range because the caller
 # is the validator's broker). These exist because the HTTP status alone cannot
@@ -436,6 +447,17 @@ def register_exception_handlers(app: FastAPI) -> None:
         logger.info(f"agent not in evaluatable state: {exc}")
         return _envelope_response(
             409, ERROR_CODE_AGENT_NOT_EVALUATABLE, "agent is not evaluatable"
+        )
+
+    @app.exception_handler(RetiredBenchVersionError)
+    async def _retired_bench_version_handler(
+        _request: Request, exc: RetiredBenchVersionError
+    ) -> JSONResponse:
+        logger.info(f"score rejected for a retired benchmark era: {exc}")
+        return _envelope_response(
+            410,
+            ERROR_CODE_BENCH_VERSION_RETIRED,
+            "benchmark version is retired and can no longer be scored",
         )
 
     @app.exception_handler(ScreenerAuthError)

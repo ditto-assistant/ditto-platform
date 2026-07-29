@@ -124,6 +124,22 @@ MIN_OWNER_CONCURRENT_SUBMISSIONS = 1
 MAX_OWNER_CONCURRENT_SUBMISSIONS = 3
 DEFAULT_OWNER_CONCURRENT_SUBMISSIONS = 2
 
+# ---------------------------------------------------------------------------
+# Similarity budget bounds
+# ---------------------------------------------------------------------------
+# Mirror ``ditto.db.queries.queue_order`` and
+# ``ditto.db.queries.similarity_grouping`` for the same reason as the owner
+# bounds above -- those modules import this package, so importing back would be
+# a cycle -- and ``test_queue_policy_bounds_match_queue_constants`` asserts they
+# agree.
+MIN_SIMILARITY_CONCURRENT_SUBMISSIONS = 1
+MAX_SIMILARITY_CONCURRENT_SUBMISSIONS = 3
+DEFAULT_SIMILARITY_CONCURRENT_SUBMISSIONS = 1
+MIN_SIMILARITY_THRESHOLD_SETTING = 0.70
+MAX_SIMILARITY_THRESHOLD_SETTING = 1.0
+DEFAULT_SIMILARITY_JACCARD_THRESHOLD = 0.90
+DEFAULT_SIMILARITY_CONTAINMENT_THRESHOLD = 0.95
+
 # Fields the queue refuses to change while a benchmark rollout is open, because
 # they move the modulus of a counter that is measured from rollout start.
 ROLLOUT_LOCKED_FIELDS = ("lane_cycle_size", "fresh_submission_slots")
@@ -162,8 +178,14 @@ class PrevGenCarryoverSettings(BaseModel):
     * :attr:`enabled`, :attr:`max_agents`, :attr:`min_score_count`,
       :attr:`include_exhausted`, :attr:`dedupe_scope` and
       :attr:`require_cohort_complete` shape the adopted carryover.
-    * :attr:`allow_retired_era_backfill` shapes the retired-era source backfill.
     * :attr:`require_desired_era_drained` applies to both.
+
+    Neither lane can reach a RETIRED era any more, and no setting on this board
+    can put one back. ``allow_retired_era_backfill`` used to live here and did
+    exactly that; it is gone, along with the branch that read it. The floor now
+    sits in the database (``MIN_SCOREABLE_BENCH_VERSION`` and the constraints
+    named there), so what these fields tune is priority WITHIN the scoreable
+    versions -- never whether a dead one comes back.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
@@ -262,41 +284,6 @@ class PrevGenCarryoverSettings(BaseModel):
     generation.
     """
 
-    allow_retired_era_backfill: bool = False
-    """Whether the source-backfill lane may ticket an era that has RETIRED.
-
-    Ships ``False``, which is a change in behaviour and the point of the field.
-
-    The source-backfill lane
-    (``ditto.api_server.endpoints.validator._issue_source_backfill_ticket``)
-    was written to keep a source-version validator busy *during* a rollout: the
-    era it tickets is still the active one, so the scores it collects still
-    count, and the alternative is an idle slot. That case is untouched -- while a
-    rollout is open, ``rollout.from_version`` IS the active version and this
-    setting never comes up.
-
-    It also kept running after activation, and there the same lane means
-    something else entirely. The active version has moved on, so every ticket it
-    issues is for a version no quorum will ever be assembled on: the benchmark is
-    retired, the score cannot be recorded against the leaderboard, and the slot
-    it occupies is a slot the live era does not get. On a four-slot validator
-    that is up to three of four slots producing nothing.
-
-    :attr:`require_desired_era_drained` was aimed at this and cannot reach it. It
-    asks whether any desired-era submission is leasable *at this instant*, and a
-    deep queue is routinely momentarily unleasable -- owner serialization, one
-    ticket per (agent, version, validator), and a capable fleet no larger than
-    the quorum all conspire to empty the leasable set while the queue behind it
-    is long. The gate then answers "drained", truthfully, and the retired lane
-    floods in. Priority was the wrong axis: a retired era does not need to be
-    last, it needs to be never.
-
-    Set ``True`` to restore the old post-activation behaviour -- the retired era
-    then resumes issuing under the priority gates above -- without a deploy. It
-    is worth turning on only for something that still consumes retired-era
-    scores; nothing in the ledger does.
-    """
-
     require_cohort_complete: bool = True
     """Whether carryover waits for the inherited rescore cohort to settle.
 
@@ -306,6 +293,99 @@ class PrevGenCarryoverSettings(BaseModel):
     delay the transition it is riding on. ``False`` interleaves carryover with
     cohort work, which finishes the backlog sooner at the cost of slowing
     activation.
+    """
+
+
+class SimilarityBudgetSettings(BaseModel):
+    """How much fleet capacity one *submission* may hold, across all keys.
+
+    The owner ceiling above is keyed on the payment-time coldkey, and an
+    operator who spreads one submission across many coldkeys is -- on every
+    signal the platform can verify -- many owners. In the production window this
+    board was calibrated against, one submission family held 25 of 76 live
+    evaluations across 15 hotkeys and 6 coldkeys while honest miners waited.
+
+    This board bounds that directly: near-identical submissions share one
+    concurrency budget, whoever paid. It is **queue fairness only**. A grouped
+    submission is not held, rejected, quarantined, re-screened or scored
+    differently; it waits for the budget to free, exactly as every miner already
+    waits behind the owner rail, and it is leased the moment the twin's lease
+    ends. Nothing on this board is evidence that anybody copied anything --
+    copy enforcement is a separate mechanism with a far higher bar, because
+    there a false positive costs a miner their submission rather than a wait.
+
+    The two thresholds are the operator's calibration knob and should be moved
+    together with the measurement, not by feel; the module docstring of
+    ``ditto.db.queries.similarity_grouping`` records the production
+    distributions the shipped values were chosen from.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    enabled: bool = True
+    """Whether the similarity rail is consulted at all.
+
+    Ships ``True``, unlike the carryover board, and the difference is
+    deliberate: carryover admits work that would otherwise never run, so it must
+    be an explicit decision; this rail only *bounds* work that is already
+    over-running the fleet, and shipping it off would leave the queue in the
+    state that motivated it. ``False`` is the kill switch and it is complete --
+    with the rail off no sketch is read and the allocator behaves byte for byte
+    as it did before, so an operator who sees an unexpected grouping can undo it
+    in one revision without a deploy.
+    """
+
+    concurrent_submission_limit: Annotated[
+        int,
+        Field(
+            ge=MIN_SIMILARITY_CONCURRENT_SUBMISSIONS,
+            le=MAX_SIMILARITY_CONCURRENT_SUBMISSIONS,
+        ),
+    ] = DEFAULT_SIMILARITY_CONCURRENT_SUBMISSIONS
+    """How many near-identical submissions may hold live leases at once.
+
+    Ships at ``1``: one copy of a submission runs at a time. Tighter than the
+    owner ceiling's ``2`` on purpose -- the owner ceiling relaxes to fill idle
+    slots, and idle slots filled by twenty copies of one submission is the exact
+    outcome this rail exists to prevent, so it does not relax. Raising it to
+    ``2`` or ``3`` widens the budget uniformly for every family.
+
+    The unit is submissions, not leases, matching both owner rails. One
+    submission can occupy at most a full quorum, and filling a submission's own
+    quorum is never similarity contention: three validators scoring one row is a
+    completed evaluation, not a monopoly.
+    """
+
+    jaccard_threshold: Annotated[
+        float,
+        Field(ge=MIN_SIMILARITY_THRESHOLD_SETTING, le=MAX_SIMILARITY_THRESHOLD_SETTING),
+    ] = DEFAULT_SIMILARITY_JACCARD_THRESHOLD
+    """Symmetric-overlap threshold on the miner-authored residual.
+
+    The primary channel. ``0.90`` ships because it is the widest value measured
+    to be clean: at ``0.90`` zero of 13,464 production pairs drawn from
+    independent miners are grouped, and the family this board targets still
+    collapses to a single budget. Lowering it to ``0.85`` admits a false pair
+    and merges nothing new.
+
+    The floor of ``0.70`` is not a style choice. Independent production miners
+    reach a 99.9th percentile of 0.625 on this metric, so a threshold beneath
+    the floor would configure exactly the false grouping the rail must avoid --
+    and a falsely grouped honest miner silently loses half their throughput.
+    """
+
+    containment_threshold: Annotated[
+        float,
+        Field(ge=MIN_SIMILARITY_THRESHOLD_SETTING, le=MAX_SIMILARITY_THRESHOLD_SETTING),
+    ] = DEFAULT_SIMILARITY_CONTAINMENT_THRESHOLD
+    """Asymmetric-overlap threshold, for a resubmission padded with extra files.
+
+    Padding dilutes Jaccard while leaving containment near 1.0, so this is the
+    channel that keeps the rail from being defeated by adding junk. It sits
+    higher than the Jaccard threshold (``0.95``) because it is the looser
+    measure: independent production miners reach 0.941 on it, against 0.891 on
+    Jaccard. A scale guard in the grouping module keeps its degenerate case --
+    a small residual sitting inside a large one -- from ever reaching here.
     """
 
 
@@ -403,6 +483,9 @@ class QueuePolicySettings(BaseModel):
     ceiling of 3 exists so that even that worst case cannot be raised past the
     point where one owner could hold a small fleet for a full lease.
     """
+
+    similarity_budget: SimilarityBudgetSettings = SimilarityBudgetSettings()
+    """How much fleet capacity one submission may hold across every key."""
 
     prev_gen_carryover: PrevGenCarryoverSettings = PrevGenCarryoverSettings()
     """Adoption policy for stranded previous-generation submissions."""
@@ -570,6 +653,14 @@ class AdminQueuePolicySettingsRequest(BaseModel):
         if carryover_missing:
             raise ValueError(
                 f"prev_gen_carryover is stored whole too; missing {carryover_missing}"
+            )
+        similarity_missing = sorted(
+            set(SimilarityBudgetSettings.model_fields)
+            - self.settings.similarity_budget.model_fields_set
+        )
+        if similarity_missing:
+            raise ValueError(
+                f"similarity_budget is stored whole too; missing {similarity_missing}"
             )
         return self
 

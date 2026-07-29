@@ -74,3 +74,48 @@ def test_draining_can_keep_active_progress_but_has_no_free_slots() -> None:
         active=[_active("slot-1")],
     )
     assert capacity.free_healthy_slots == ()
+
+
+def test_resource_constrained_reports_the_claim_but_offers_nothing() -> None:
+    """A constrained host is visibly idle-by-choice, not silently absent.
+
+    It keeps advertising ``configured_slots`` and keeps reporting the lease it
+    already holds, so the platform's liveness gate still sees the live run --
+    it just has no free slot to give it. That distinction is the whole point:
+    an absent slot was indistinguishable from a free one, which is what cost a
+    live lease before (#274).
+    """
+    capacity = BenchmarkCapacity(
+        configured_slots=4,
+        admission="resource_constrained",
+        healthy_slots=[],
+        active=[_active("slot-1")],
+    )
+
+    assert capacity.free_healthy_slots == ()
+    assert capacity.configured_slots == 4
+    assert [slot.slot_id for slot in capacity.active] == ["slot-1"]
+
+
+def test_resource_constrained_cannot_also_advertise_healthy_slots() -> None:
+    with pytest.raises(ValidationError):
+        BenchmarkCapacity(
+            configured_slots=2,
+            admission="resource_constrained",
+            healthy_slots=["slot-0"],
+        )
+
+
+def test_an_older_validators_capacity_token_is_unchanged() -> None:
+    """Adding an admission value adds no key, so no signature moves.
+
+    ``admission`` was already part of every v10+ signed token. A validator that
+    has never heard of the new value signs exactly the bytes it always did, so
+    the fleet's proto 6 and proto 15 members keep verifying.
+    """
+    legacy = BenchmarkCapacity(configured_slots=2, healthy_slots=["slot-0", "slot-1"])
+
+    assert benchmark_capacity_signing_token(legacy) == (
+        '94:{"active":[],"admission":"accepting","configured_slots":2,'
+        '"healthy_slots":["slot-0","slot-1"]}'
+    )

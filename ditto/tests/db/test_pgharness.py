@@ -54,11 +54,21 @@ async def _check_predicates(session: AsyncSession, schema: str) -> dict[str, lis
     that wrote raw DDL, or that let Postgres auto-name an inline column
     CHECK, did not. Comparing names would drown the real drift in ~44
     cosmetic mismatches.
+
+    ``NOT VALID`` is stripped for the same reason, and only for that reason. It
+    is not part of the predicate: it says whether Postgres re-examined the rows
+    that were already in the table when the constraint was added, and a
+    constraint carrying it is enforced on every INSERT and UPDATE exactly like
+    one that does not. The retired-era floor is declared that way on purpose --
+    the historical v2-v6 rows must survive -- and ``CheckConstraint`` has no way
+    to say so, so ``create_all`` can only ever emit the bare predicate. Comparing
+    the raw strings would report the floor as permanent, unfixable drift and
+    train the next reader to ignore this test.
     """
     rows = (await session.execute(text(_CONSTRAINT_DEFS), {"schema": schema})).all()
     grouped: dict[str, list[str]] = {}
     for table, definition in rows:
-        grouped.setdefault(table, []).append(definition)
+        grouped.setdefault(table, []).append(definition.removesuffix(" NOT VALID"))
     return {table: sorted(defs) for table, defs in grouped.items()}
 
 

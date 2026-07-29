@@ -108,6 +108,7 @@ from ditto.api_models.validator_slot_settings import (
 )
 from ditto.api_server.anti_copy_comparison import ANTI_COPY_ALGORITHM_VERSION
 from ditto.api_server.artifact_audit import client_ip, request_detail
+from ditto.api_server.attestation import expected_netuid
 from ditto.api_server.benchmark_rollout import (
     refresh_rolling_qualification,
 )
@@ -136,6 +137,7 @@ from ditto.api_server.koth import (
     retest_cohort,
     top5_round_is_due,
 )
+from ditto.api_server.model_use import evaluate_model_use, model_use_policy
 from ditto.api_server.onchain_seed import derive_validator_seed
 from ditto.api_server.queue_policy_settings import (
     DEFAULT_SETTINGS as QUEUE_POLICY_DEFAULTS,
@@ -149,10 +151,9 @@ from ditto.api_server.validator_slot_settings import (
     DEFAULT_SETTINGS as SLOT_SETTINGS_DEFAULT,
 )
 from ditto.api_server.validator_slot_settings import (
-    DISK_RESTRICTED_SLOTS,
-    ValidatorSlotSettingsResolver,
+    HostResourceSample,
     allowed_slot_count,
-    disk_ceiling_tripped,
+    resolve_slot_settings,
 )
 from ditto.chain import ChainError
 from ditto.db.models import (
@@ -171,6 +172,7 @@ from ditto.db.queries.artifact_fetch_audit import (
     ENDPOINT_VALIDATOR_ARTIFACT,
     record_artifact_fetch,
 )
+from ditto.db.queries.attestation import list_linked_hotkeys
 from ditto.db.queries.audit import (
     EVENT_AUDIT,
     EVENT_FINALIZED,
@@ -184,6 +186,7 @@ from ditto.db.queries.benchmark_admission import activated_rollout_for_version
 from ditto.db.queries.benchmark_carryover import carryover_agent_ids
 from ditto.db.queries.benchmark_rollout import (
     LEGACY_BENCH_VERSION,
+    MIN_SCOREABLE_BENCH_VERSION,
     active_bench_version,
     heartbeat_supports_version,
     issue_rollout_ticket,
@@ -209,6 +212,7 @@ from ditto.db.queries.heartbeats import (
 )
 from ditto.db.queries.inference import (
     ensure_inference_grant,
+    get_lease_model_usage,
     revoke_ticket_inference,
     ticket_inference_revoked_mid_lease,
 )
@@ -233,9 +237,14 @@ from ditto.db.queries.scores import (
     quorum_composites,
     upsert_score,
 )
+from ditto.db.queries.similarity_grouping import (
+    SimilarityBudgetPolicy,
+    policy_from_settings,
+)
 from ditto.db.queries.tickets import (
     OWNER_CONCURRENT_SUBMISSION_LIMIT_DEFAULT,
     RETRY_COOLDOWN,
+    SIMILARITY_CONCURRENT_SUBMISSION_LIMIT_DEFAULT,
     get_live_slot_ticket,
     get_open_ticket,
     issue_confirmation_ticket,
@@ -252,6 +261,7 @@ from ditto.metrics import (
     VALIDATOR_HEARTBEAT_PAYLOAD_DEGRADED,
     DispatchDeclineReason,
 )
+from ditto.score_order import rank_submissions
 
 if TYPE_CHECKING:
     from ditto.api_server.config import InferenceProxyConfig
@@ -507,7 +517,8 @@ def _slot_cap_decline_reason(
     slot_id: str,
     settings: ValidatorSlotSettings,
     advertised_slots: int,
-    disk_percent: int | None,
+    sample: HostResourceSample | None = None,
+    disk_percent: int | None = None,
 ) -> DispatchDeclineReason:
     """Name the lever behind a :func:`_slot_cap_declines` refusal.
 
@@ -523,17 +534,26 @@ def _slot_cap_decline_reason(
     is a backroom setting somebody has to raise.
 
     The breaker is only named when it actually *narrowed* the allowance: with a
-    ``max_concurrent_slots`` already at or below :data:`DISK_RESTRICTED_SLOTS`,
-    the operator cap alone would have declined this poll, and blaming the disk
-    would send whoever is reading the dashboard to clear space for nothing.
+    ``max_concurrent_slots`` already at or below the resource throttle's
+    one-slot allowance, the operator cap alone would have declined this poll.
+    The wire label retains its historical ``disk_breaker`` name while the
+    breaker now covers CPU, memory, and disk pressure.
     """
     if _slot_ordinal(slot_id) >= HARD_SLOT_CEILING:
         return "slot_ceiling"
-    if disk_ceiling_tripped(settings, disk_percent=disk_percent) and (
+    observed = sample or HostResourceSample(disk_percent=disk_percent)
+    unrestricted = allowed_slot_count(
+        settings,
+        advertised_slots=advertised_slots,
+        sample=HostResourceSample(),
+    )
+    if (
         allowed_slot_count(
-            settings, advertised_slots=advertised_slots, disk_percent=None
+            settings,
+            advertised_slots=advertised_slots,
+            sample=observed,
         )
-        > DISK_RESTRICTED_SLOTS
+        < unrestricted
     ):
         return "disk_breaker"
     return "slot_cap"
@@ -609,7 +629,7 @@ async def _idle_retest_slot(
     allowed = allowed_slot_count(
         slot_settings,
         advertised_slots=(capacity.configured_slots if capacity is not None else 1),
-        disk_percent=_heartbeat_disk_percent(heartbeat),
+        sample=_heartbeat_resource_sample(heartbeat),
     )
     if len(held) >= allowed:
         return None
@@ -620,35 +640,43 @@ async def _idle_retest_slot(
     return min(free, key=_slot_ordinal)
 
 
-def _heartbeat_disk_percent(heartbeat: ValidatorHeartbeat | None) -> int | None:
-    """Read the last reported host disk usage, or None when it is unknown.
+def _heartbeat_percent(metrics: object, key: str) -> int | None:
+    """Read one coarse percentage out of the stored metrics blob."""
+    if not isinstance(metrics, dict):
+        return None
+    value = metrics.get(key)
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+def _heartbeat_resource_sample(
+    heartbeat: ValidatorHeartbeat | None,
+) -> HostResourceSample:
+    """Read the last reported host utilisation, per resource.
 
     Unknown is deliberately not treated as a tripped breaker: a validator that
     reports no metrics must not lose the slots it already had.
     """
     if heartbeat is None:
-        return None
+        return HostResourceSample()
     metrics = heartbeat.system_metrics
-    if not isinstance(metrics, dict):
-        return None
-    value = metrics.get("disk_percent")
-    if isinstance(value, bool) or not isinstance(value, int):
-        return None
-    return value
+    return HostResourceSample(
+        cpu_percent=_heartbeat_percent(metrics, "cpu_percent"),
+        memory_percent=_heartbeat_percent(metrics, "memory_percent"),
+        disk_percent=_heartbeat_percent(metrics, "disk_percent"),
+    )
 
 
 async def _validator_slot_settings(request: Request) -> ValidatorSlotSettings:
     """Resolve the operator slot cap, falling back to the conservative default.
 
     A missing resolver (an app built without lifespan) must not uncap the
-    fleet, so the default policy is returned instead of an unbounded one.
+    fleet, so the default policy is returned instead of an unbounded one. The
+    resolution itself is shared with the public fleet view, which must report
+    the same cap this path enforces.
     """
-    resolver: ValidatorSlotSettingsResolver | None = getattr(
-        request.app.state, "validator_slot_settings", None
-    )
-    if resolver is None:
-        return SLOT_SETTINGS_DEFAULT
-    return await resolver.resolve(getattr(request.app.state, "session_maker", None))
+    return await resolve_slot_settings(request.app.state)
 
 
 PREV_GEN_CARRYOVER_DEFAULTS = QUEUE_POLICY_DEFAULTS.prev_gen_carryover
@@ -726,26 +754,51 @@ async def _issue_source_backfill_ticket(
     slot_settings: ValidatorSlotSettings = SLOT_SETTINGS_DEFAULT,
     carryover_settings: PrevGenCarryoverSettings = PREV_GEN_CARRYOVER_DEFAULTS,
     owner_concurrent_submission_limit: int = OWNER_CONCURRENT_SUBMISSION_LIMIT_DEFAULT,
+    similarity_policy: SimilarityBudgetPolicy | None = None,
+    similarity_concurrent_submission_limit: int = (
+        SIMILARITY_CONCURRENT_SUBMISSION_LIMIT_DEFAULT
+    ),
     resume_only: bool = False,
 ) -> ValidatorTicket | None:
     """Use otherwise-idle capacity after the desired era has nothing to give.
 
-    Retired-era work is previous-generation work, exactly like the adopted
-    carryover below, so both answer to the same operator policy
-    (``queue_policy.prev_gen_carryover``): it issues only into a genuinely empty
-    desired-era queue. A lease already in flight is never revoked -- the gate
-    guards new admission, not resumption, because expiring a running benchmark
-    would burn a retry attempt for a submission that did nothing wrong.
+    Previous-generation work answers to the same operator policy as the adopted
+    carryover below (``queue_policy.prev_gen_carryover``): it issues only into a
+    genuinely empty desired-era queue.
 
     ``active_version`` is the era the fleet is actually scoring. While a rollout
     is open it equals ``rollout.from_version``, and this lane does what it was
     written for (#362): keep a source-version validator busy draining the source
     backlog instead of idling through the transition, producing scores that
-    still count. Once the rollout activates the two diverge, and every ticket
-    this lane issues is for an era nobody will ever score again -- see
-    ``PrevGenCarryoverSettings.allow_retired_era_backfill``, which is why that
-    setting ships OFF.
+    still count. That is the ONLY case this lane serves now -- see the floor
+    below.
     """
+    # The floor, checked before anything else and before the resume path.
+    #
+    # Two separate conditions, because they fail for different reasons and one
+    # does not imply the other:
+    #
+    # * ``from_version < active_version`` -- the rollout activated and this
+    #   era is behind the fleet. Every ticket would be for a version no quorum
+    #   will ever be assembled on.
+    # * ``from_version < MIN_SCOREABLE_BENCH_VERSION`` -- the era is RETIRED
+    #   outright. Its scores cannot be written at all; the database rejects
+    #   them and the ticket trigger rejects the lease.
+    #
+    # This sits ABOVE the existing-lease resume below, and that placement is the
+    # entire point. The resume path re-issued an unexpired ``from_version``
+    # lease before reaching the old retired-era gate, and ``request_job``
+    # resurrects the activated v7 rollout to feed this lane -- whose
+    # ``from_version`` is 6. So "no rollout is open" did not mean "no v6
+    # tickets": a v6 lease kept renewing itself indefinitely with no flag
+    # involved. Resumption is not exempt from a floor. A lease for an era that
+    # can no longer be scored is not work in progress, it is a slot the live era
+    # does not get, and the score at the end of it would be rejected anyway.
+    if (
+        rollout.from_version < active_version
+        or rollout.from_version < MIN_SCOREABLE_BENCH_VERSION
+    ):
+        return None
     if heartbeat is None or not heartbeat_supports_version(
         heartbeat, now=now, version=rollout.from_version
     ):
@@ -788,24 +841,25 @@ async def _issue_source_backfill_ticket(
             validator_running_benchmark=validator_running_benchmark,
             slot_id=slot_id,
             owner_concurrent_submission_limit=owner_concurrent_submission_limit,
+            similarity_policy=similarity_policy,
+            similarity_concurrent_submission_limit=(
+                similarity_concurrent_submission_limit
+            ),
         )
     if resume_only:
         return None
-    # Everything below is NEW admission. A retired era gets none of it.
+    # NEW admission below. The retired-era question is already settled at the
+    # top of this function, for resume and admission alike, and there is no
+    # longer a setting that can re-open it.
     #
-    # `_prev_gen_lane_open` cannot stand in for this. It asks whether any
-    # desired-era work is leasable *right now*, and "nothing leasable this
-    # instant" is not "the desired era is finished": owner serialization, the
-    # per-(agent, version, validator) rule and quorum-sized capable fleets all
-    # make a deep v7 queue momentarily unleasable, at which point that gate
-    # correctly reports drained and this lane fills the fleet with tickets for a
-    # version that will never be scored again. Priority was the wrong axis --
+    # `_prev_gen_lane_open` never could have stood in for that floor. It asks
+    # whether any desired-era work is leasable *right now*, and "nothing
+    # leasable this instant" is not "the desired era is finished": owner
+    # serialization, the per-(agent, version, validator) rule and quorum-sized
+    # capable fleets all make a deep v7 queue momentarily unleasable, at which
+    # point that gate correctly reports drained. Priority was the wrong axis --
     # a retired era does not need to be last, it needs to be never.
-    if (
-        rollout.from_version != active_version
-        and not carryover_settings.allow_retired_era_backfill
-    ):
-        return None
+    #
     # Checked before the fleet lock so a poll that is going to decline anyway
     # does not serialize behind one that is not.
     if not await _prev_gen_lane_open(
@@ -856,7 +910,7 @@ async def _issue_source_backfill_ticket(
                 allowed_slot_count(
                     slot_settings,
                     advertised_slots=len(capacity.healthy_slots),
-                    disk_percent=_heartbeat_disk_percent(candidate),
+                    sample=_heartbeat_resource_sample(candidate),
                 )
                 if capacity.admission == "accepting"
                 else 0
@@ -890,6 +944,8 @@ async def _issue_source_backfill_ticket(
         validator_running_benchmark=validator_running_benchmark,
         slot_id=slot_id,
         owner_concurrent_submission_limit=owner_concurrent_submission_limit,
+        similarity_policy=similarity_policy,
+        similarity_concurrent_submission_limit=(similarity_concurrent_submission_limit),
     )
 
 
@@ -905,6 +961,10 @@ async def _issue_prev_gen_carryover_ticket(
     validator_running_benchmark: bool,
     slot_id: str,
     owner_concurrent_submission_limit: int = OWNER_CONCURRENT_SUBMISSION_LIMIT_DEFAULT,
+    similarity_policy: SimilarityBudgetPolicy | None = None,
+    similarity_concurrent_submission_limit: int = (
+        SIMILARITY_CONCURRENT_SUBMISSION_LIMIT_DEFAULT
+    ),
 ) -> ValidatorTicket | None:
     """Lease an adopted previous-generation submission in the new era.
 
@@ -959,6 +1019,8 @@ async def _issue_prev_gen_carryover_ticket(
         slot_id=slot_id,
         only_agent_ids=adopted,
         owner_concurrent_submission_limit=owner_concurrent_submission_limit,
+        similarity_policy=similarity_policy,
+        similarity_concurrent_submission_limit=(similarity_concurrent_submission_limit),
     )
 
 
@@ -1047,6 +1109,33 @@ class ValidatorAuthError(Exception):
     registered on the netuid, a hotkey without a ``validator_permit``, and
     a score whose signature does not verify. The envelope handler maps all
     of these to HTTP 401 + code 4000.
+    """
+
+
+class RetiredBenchVersionError(Exception):
+    """Raised when a score is submitted for a benchmark era that is retired.
+
+    Maps to HTTP **410 Gone** + code 4002, and the status is the whole point.
+    This is TERMINAL and it is the validator's cue to stop: the era is gone,
+    the database will not accept the row, and no amount of retrying changes
+    that. 409 was available and deliberately not used -- it reads as a
+    conflict, and a conflict invites a retry.
+
+    It must never be reported back as ``fail_job(reason="infrastructure")``.
+    Infrastructure is NO-FAULT: it mints a compensating grant, raises the
+    attempt cap and re-leases, forever. That is the exact loop that burned
+    4.5 validator-hours per attempt on the ``mnemo*`` family, and a retired
+    era would feed it indefinitely because the condition never clears. The
+    correct hand-back is ``scoring_error`` (consumes the attempt, no grant),
+    which is what the canonical lane already does for a ``PlatformError`` out
+    of ``submit_score``.
+
+    Belt and braces, though: even a misclassified ``infrastructure`` report
+    cannot loop, because the reissue it asks for has to insert a sub-v7
+    ``validator_tickets`` row and the
+    ``validator_tickets_bench_version_floor`` trigger refuses it. The lease
+    dies either way. That is the difference between closing this in policy and
+    closing it in the schema.
     """
 
 
@@ -1206,6 +1295,24 @@ def _score_details(
     if report.per_case:
         details["per_case"] = [item.model_dump(mode="json") for item in report.per_case]
     return details
+
+
+def _retry_details_match(
+    stored: dict[str, Any] | None, reported: dict[str, Any]
+) -> bool:
+    """Compare signed score details while excluding platform-owned annotations.
+
+    ``model_use`` is derived from the platform's inference ledger only after a
+    score is accepted; it is neither supplied nor signed by the validator. An
+    exact transport retry therefore cannot reproduce it. Every scorer-owned
+    field remains part of the exact comparison, so this does not weaken the
+    one-ticket/one-result guard.
+    """
+    if stored is None:
+        return not reported
+    comparable = dict(stored)
+    comparable.pop("model_use", None)
+    return comparable == reported
 
 
 def _score_signing_message(
@@ -2115,11 +2222,11 @@ async def request_job(
             # The exemption cannot be forged -- heartbeat ingest drops any
             # active slot with no matching open ticket -- so ``capacity.active``
             # only ever names slots the platform itself leased.
-            disk_percent = _heartbeat_disk_percent(heartbeat)
+            resource_sample = _heartbeat_resource_sample(heartbeat)
             allowed_slots = allowed_slot_count(
                 slot_settings,
                 advertised_slots=capacity.configured_slots,
-                disk_percent=disk_percent,
+                sample=resource_sample,
             )
             if _slot_cap_declines(
                 slot_id=slot_id,
@@ -2138,7 +2245,7 @@ async def request_job(
                         slot_id=slot_id,
                         settings=slot_settings,
                         advertised_slots=capacity.configured_slots,
-                        disk_percent=disk_percent,
+                        sample=resource_sample,
                     ),
                     validator_hotkey=payload.validator_hotkey,
                     slot_id=slot_id,
@@ -2175,6 +2282,12 @@ async def request_job(
                     owner_concurrent_submission_limit=(
                         queue_policy.owner_concurrent_submission_limit
                     ),
+                    similarity_policy=policy_from_settings(
+                        queue_policy.similarity_budget
+                    ),
+                    similarity_concurrent_submission_limit=(
+                        queue_policy.similarity_budget.concurrent_submission_limit
+                    ),
                 )
                 if fresh_lane_due
                 else None
@@ -2209,6 +2322,12 @@ async def request_job(
                     owner_concurrent_submission_limit=(
                         queue_policy.owner_concurrent_submission_limit
                     ),
+                    similarity_policy=policy_from_settings(
+                        queue_policy.similarity_budget
+                    ),
+                    similarity_concurrent_submission_limit=(
+                        queue_policy.similarity_budget.concurrent_submission_limit
+                    ),
                 )
             if ticket is None and not fresh_lane_due:
                 ticket = await _issue_prev_gen_carryover_ticket(
@@ -2223,6 +2342,12 @@ async def request_job(
                     slot_id=slot_id,
                     owner_concurrent_submission_limit=(
                         queue_policy.owner_concurrent_submission_limit
+                    ),
+                    similarity_policy=policy_from_settings(
+                        queue_policy.similarity_budget
+                    ),
+                    similarity_concurrent_submission_limit=(
+                        queue_policy.similarity_budget.concurrent_submission_limit
                     ),
                 )
         else:
@@ -2276,6 +2401,12 @@ async def request_job(
                     slot_id=slot_id,
                     slot_settings=slot_settings,
                     resume_only=True,
+                    similarity_policy=policy_from_settings(
+                        queue_policy.similarity_budget
+                    ),
+                    similarity_concurrent_submission_limit=(
+                        queue_policy.similarity_budget.concurrent_submission_limit
+                    ),
                 )
             if ticket is None and rollout is None:
                 stale_ticket = await session.scalar(
@@ -2339,6 +2470,12 @@ async def request_job(
                         owner_concurrent_submission_limit=(
                             queue_policy.owner_concurrent_submission_limit
                         ),
+                        similarity_policy=policy_from_settings(
+                            queue_policy.similarity_budget
+                        ),
+                        similarity_concurrent_submission_limit=(
+                            queue_policy.similarity_budget.concurrent_submission_limit
+                        ),
                     )
                 )
             if ticket is None and rollout is None:
@@ -2383,6 +2520,12 @@ async def request_job(
                     carryover_settings=queue_policy.prev_gen_carryover,
                     owner_concurrent_submission_limit=(
                         queue_policy.owner_concurrent_submission_limit
+                    ),
+                    similarity_policy=policy_from_settings(
+                        queue_policy.similarity_budget
+                    ),
+                    similarity_concurrent_submission_limit=(
+                        queue_policy.similarity_budget.concurrent_submission_limit
                     ),
                 )
             if ticket is None and rollout is not None:
@@ -2563,7 +2706,7 @@ async def _current_koth_entries(
         )
         if row.eligible and row.composite > 0.0
     ]
-    rows.sort(key=lambda row: (-row.composite, row.first_seen, row.agent_id))
+    rows = rank_submissions(rows)
     quorum = await quorum_composites(
         session,
         [row.agent_id for row in rows],
@@ -4229,7 +4372,30 @@ async def submit_score(
         chain, netuid, payload.validator_hotkey, network=network
     )
 
-    # 3. Atomic: record the score + advance status together. The row lock
+    # 3. Retired-era floor, checked before the transaction opens.
+    #
+    # Deliberately outside ``session.begin()``: the answer depends on nothing
+    # in the database, so taking the agent row lock first would serialize live
+    # v7 scorers behind a submission that is going to be refused regardless.
+    #
+    # The in-flight lease this refuses is left ISSUED rather than closed here.
+    # That is the safe direction. Closing it would need this check to live
+    # inside the transaction that the rejection then rolls back, and a lease
+    # left alone still reaches a terminal state two ways: the validator reports
+    # the 410 through ``fail_job`` (``scoring_error`` -- consumes the attempt,
+    # mints no grant), or, if it says nothing at all, the overdue sweep expires
+    # it at its own deadline, at most ~90 minutes out. Neither can be re-leased
+    # afterwards: ``_issue_source_backfill_ticket`` refuses to resume beneath
+    # the floor, and the ``validator_tickets_bench_version_floor`` trigger
+    # refuses to insert a fresh sub-v7 ticket even if something asked.
+    report_version = report.bench_version or LEGACY_BENCH_VERSION
+    if report_version < MIN_SCOREABLE_BENCH_VERSION:
+        raise RetiredBenchVersionError(
+            f"benchmark v{report_version} is retired; the score ledger accepts "
+            f"v{MIN_SCOREABLE_BENCH_VERSION} and later only"
+        )
+
+    # 4. Atomic: record the score + advance status together. The row lock
     #    serializes concurrent scorers so the status guard + transition below
     #    can't be lost-updated.
     async with session.begin():
@@ -4243,7 +4409,6 @@ async def submit_score(
                 status_code=409,
                 detail="score submission is missing its ticket lease deadline",
             )
-        report_version = report.bench_version or LEGACY_BENCH_VERSION
         prior_ticket = await session.get(
             ValidatorTicket,
             (agent_id, report_version, payload.validator_hotkey),
@@ -4271,7 +4436,7 @@ async def submit_score(
                 and prior_score.n == report.n
                 and _aware_utc(prior_score.generated_at)
                 == _aware_utc(report.generated_at)
-                and prior_score.details == retry_details
+                and _retry_details_match(prior_score.details, retry_details)
             )
             if exact_retry:
                 return SubmitScoreResponse(
@@ -4451,6 +4616,23 @@ async def submit_score(
                 },
                 recorded_at=audit_now,
             )
+        # What this run actually spent on the reader model, read off the grant
+        # bound to this exact lease. Captured here, before the grant is revoked
+        # a few hundred lines below, and denormalized onto the score because
+        # inference_grants is pruned within days while scores are permanent.
+        #
+        # The validator does not and cannot report these numbers -- the
+        # platform's own proxy meters them as it charges each request -- so
+        # they are not part of the signed report and need no wire change.
+        model_usage = await get_lease_model_usage(session, ticket=ticket)
+        # The verdict is stamped alongside the raw counters so a miner can see
+        # not just the numbers but the finding and its reason. In SHADOW (the
+        # default) this records what enforcement *would* have done and changes
+        # no score -- ditto-platform#506 invariant 5.
+        model_use = evaluate_model_use(
+            model_usage, cases=report.n, policy=model_use_policy()
+        )
+        score_details["model_use"] = model_use.as_public_dict()
         await upsert_score(
             session,
             agent_id=agent_id,
@@ -4466,6 +4648,7 @@ async def submit_score(
             generated_at=report.generated_at,
             signature=payload.signature,
             details=score_details or None,
+            model_usage=model_usage,
         )
         await record_ticket_route_quality(
             session,
@@ -4590,10 +4773,24 @@ async def submit_score(
                 miner_coldkey = await get_miner_coldkey_for_agent(
                     session, agent_id=agent_id
                 )
+                # Hotkeys cryptographically proven to be this same operator. A
+                # rotated miner is not a copier of their own earlier work; the
+                # coldkey exemption above cannot see that, because rotating is
+                # exactly what broke coldkey equality. Copy screening only --
+                # this never reaches emission_owner_key.
+                linked_hotkeys = frozenset(
+                    link.hotkey
+                    for link in await list_linked_hotkeys(
+                        session,
+                        hotkey=agent.miner_hotkey,
+                        netuid=expected_netuid(),
+                    )
+                )
                 decision = evaluate_duplicate_signals(
                     agent_id=agent_id,
                     miner_hotkey=agent.miner_hotkey,
                     miner_coldkey=miner_coldkey,
+                    linked_owner_hotkeys=linked_hotkeys,
                     submitted_at=agent.created_at,
                     sha256=agent.sha256,
                     composite=median_composite,

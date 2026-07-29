@@ -44,6 +44,45 @@ DEFAULT_SETTINGS = QueuePolicySettings()
 DEFAULT_SETTINGS_TTL_SECONDS = 5.0
 
 
+# Keys that were removed from the policy and must be ignored when a revision
+# written before the removal is read back.
+#
+# ``prev_gen_carryover`` is stored WHOLE, and the model is ``extra="forbid"``.
+# Without this, a revision that still carries a retired key fails validation --
+# and because this decoder fails open, the operator's ENTIRE policy (cohort
+# sizes, lane cycle, owner limits, all of it) would silently revert to the
+# shipped defaults behind one log line. Dropping the dead key instead keeps
+# every setting the operator actually chose.
+#
+# Read-side only, and deliberately so: the WRITE path stays strict, so an
+# operator or a stale Backroom client that still sends the key is REJECTED
+# rather than quietly ignored. Forgiving a stored document is not the same as
+# accepting a new instruction.
+_RETIRED_CARRYOVER_KEYS = frozenset({"allow_retired_era_backfill"})
+
+
+def _without_retired_keys(settings: object) -> object:
+    """Strip removed keys from a stored payload, leaving everything else alone."""
+    if not isinstance(settings, dict):
+        return settings
+    carryover = settings.get("prev_gen_carryover")
+    if not isinstance(carryover, dict):
+        return settings
+    retired = _RETIRED_CARRYOVER_KEYS & carryover.keys()
+    if not retired:
+        return settings
+    logger.info(
+        "dropping retired queue-policy keys %s from a stored revision",
+        sorted(retired),
+    )
+    return {
+        **settings,
+        "prev_gen_carryover": {
+            key: value for key, value in carryover.items() if key not in retired
+        },
+    }
+
+
 def settings_from_row(
     row: QueuePolicySettingsRevision | None,
 ) -> QueuePolicySettings:
@@ -53,11 +92,14 @@ def settings_from_row(
     row must not be able to wedge the validator queue or block an operator from
     starting a rollout, and the defaults are the behaviour every prior release
     had.
+
+    Keys retired since the revision was written are dropped first, so removing
+    a field does not turn every older revision into a silent policy reset.
     """
     if row is None:
         return DEFAULT_SETTINGS
     try:
-        return QueuePolicySettings.model_validate(row.settings)
+        return QueuePolicySettings.model_validate(_without_retired_keys(row.settings))
     except ValidationError:
         logger.warning(
             "queue policy settings revision %s is invalid; using defaults",

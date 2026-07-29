@@ -145,7 +145,7 @@ class TestBounds:
         self, session: AsyncSession, limit: int
     ) -> None:
         with pytest.raises(ValueError, match="between 5 and 25"):
-            await historical_rescore_cohort(session, source_version=4, limit=limit)
+            await historical_rescore_cohort(session, source_version=7, limit=limit)
 
     async def test_historical_cohort_accepts_the_ceiling(
         self, session: AsyncSession
@@ -155,7 +155,7 @@ class TestBounds:
         assert (
             await historical_rescore_cohort(
                 session,
-                source_version=4,
+                source_version=7,
                 limit=MAX_PERSISTED_RESCORE_COHORT_SIZE,
             )
             == []
@@ -168,33 +168,38 @@ class TestHistoricalBackfill:
     ) -> None:
         """Requirement 4: the ceiling cannot reach into a third benchmark era.
 
-        Six v4 agents and six v3 agents cannot fill twenty-five slots. If the
-        limit drove how far back the fallback reached, the v2 era would be
+        Six v9 agents and six v8 agents cannot fill twenty-five slots. If the
+        limit drove how far back the fallback reached, the v7 era would be
         pulled in to make up the difference. It must not be.
+
+        The three eras are 9/8/7 rather than the 4/3/2 this was first written
+        against: the bench-version floor refuses to write a score below 7 at
+        all, and the rule under test is about adjacency, not about which
+        absolute versions happen to be current.
         """
         async with session.begin():
-            v4 = await _seed_era(session, version=4, count=6, offset=4000)
-            v3 = await _seed_era(session, version=3, count=6, offset=3000)
-            await _seed_era(session, version=2, count=10, offset=2000)
+            v9 = await _seed_era(session, version=9, count=6, offset=9000)
+            v8 = await _seed_era(session, version=8, count=6, offset=8000)
+            await _seed_era(session, version=7, count=10, offset=7000)
 
             cohort = await historical_rescore_cohort(
                 session,
-                source_version=4,
+                source_version=9,
                 limit=MAX_PERSISTED_RESCORE_COHORT_SIZE,
             )
 
-        assert [member.agent_id for member in cohort] == [*v4, *v3]
+        assert [member.agent_id for member in cohort] == [*v9, *v8]
         assert len(cohort) == 12
-        assert not any("v2" in member.miner_hotkey for member in cohort)
+        assert not any("v7" in member.miner_hotkey for member in cohort)
 
     async def test_widening_admits_more_of_the_previous_era(
         self, session: AsyncSession
     ) -> None:
         async with session.begin():
-            await _seed_era(session, version=4, count=20, offset=4000)
-            ten = await historical_rescore_cohort(session, source_version=4, limit=10)
+            await _seed_era(session, version=7, count=20, offset=7000)
+            ten = await historical_rescore_cohort(session, source_version=7, limit=10)
             twenty_five = await historical_rescore_cohort(
-                session, source_version=4, limit=25
+                session, source_version=7, limit=25
             )
         assert len(ten) == 10
         assert len(twenty_five) == 20
@@ -209,15 +214,15 @@ class TestSnapshotFreezesTheTarget:
     ) -> None:
         """Requirement 3: the effective size is recoverable after the fact."""
         async with session.begin():
-            agent_ids = await _seed_era(session, version=4, count=12, offset=4000)
+            agent_ids = await _seed_era(session, version=7, count=12, offset=7000)
             members = _members(agent_ids)
             rollout = await create_rollout_snapshot(
                 session,
                 members=members,
                 datasets=_pins(members),
                 now=_NOW,
-                from_version=4,
-                desired_version=5,
+                from_version=7,
+                desired_version=8,
                 rescore_cohort_target=25,
             )
             rollout_id = rollout.rollout_id
@@ -241,15 +246,15 @@ class TestSnapshotFreezesTheTarget:
 
     async def test_snapshot_defaults_to_ten(self, session: AsyncSession) -> None:
         async with session.begin():
-            agent_ids = await _seed_era(session, version=4, count=6, offset=4000)
+            agent_ids = await _seed_era(session, version=7, count=6, offset=7000)
             members = _members(agent_ids)
             rollout = await create_rollout_snapshot(
                 session,
                 members=members,
                 datasets=_pins(members),
                 now=_NOW,
-                from_version=4,
-                desired_version=5,
+                from_version=7,
+                desired_version=8,
             )
             assert rollout.rescore_cohort_target == DEFAULT_RESCORE_COHORT_SIZE
 
@@ -258,7 +263,7 @@ class TestSnapshotFreezesTheTarget:
         self, session: AsyncSession, target: int
     ) -> None:
         async with session.begin():
-            agent_ids = await _seed_era(session, version=4, count=6, offset=4000)
+            agent_ids = await _seed_era(session, version=7, count=6, offset=7000)
             members = _members(agent_ids)
             with pytest.raises(ValueError, match="between 5 and 25"):
                 await create_rollout_snapshot(
@@ -266,8 +271,8 @@ class TestSnapshotFreezesTheTarget:
                     members=members,
                     datasets=_pins(members),
                     now=_NOW,
-                    from_version=4,
-                    desired_version=5,
+                    from_version=7,
+                    desired_version=8,
                     rescore_cohort_target=target,
                 )
 
@@ -275,7 +280,7 @@ class TestSnapshotFreezesTheTarget:
         self, session: AsyncSession
     ) -> None:
         async with session.begin():
-            agent_ids = await _seed_era(session, version=4, count=12, offset=4000)
+            agent_ids = await _seed_era(session, version=7, count=12, offset=7000)
             members = _members(agent_ids)
             with pytest.raises(ValueError, match="between 5 and 10 members"):
                 await create_rollout_snapshot(
@@ -283,8 +288,8 @@ class TestSnapshotFreezesTheTarget:
                     members=members,
                     datasets=_pins(members),
                     now=_NOW,
-                    from_version=4,
-                    desired_version=5,
+                    from_version=7,
+                    desired_version=8,
                     rescore_cohort_target=10,
                 )
 
@@ -297,15 +302,15 @@ class TestMidRolloutChangeIsIgnored:
     ) -> None:
         async with session_maker() as session:
             async with session.begin():
-                agent_ids = await _seed_era(session, version=4, count=20, offset=4000)
+                agent_ids = await _seed_era(session, version=7, count=20, offset=7000)
                 members = _members(agent_ids[:10])
                 rollout = await create_rollout_snapshot(
                     session,
                     members=members,
                     datasets=_pins(members),
                     now=_NOW,
-                    from_version=4,
-                    desired_version=5,
+                    from_version=7,
+                    desired_version=8,
                     rescore_cohort_target=10,
                 )
                 rollout_id = rollout.rollout_id
@@ -352,15 +357,15 @@ class TestMidRolloutChangeIsIgnored:
         the historical default of ten.
         """
         async with session.begin():
-            agent_ids = await _seed_era(session, version=4, count=20, offset=4000)
+            agent_ids = await _seed_era(session, version=7, count=20, offset=7000)
             members = _members(agent_ids[:5])
             rollout = await create_rollout_snapshot(
                 session,
                 members=members,
                 datasets=_pins(members),
                 now=_NOW,
-                from_version=4,
-                desired_version=5,
+                from_version=7,
+                desired_version=8,
                 rescore_cohort_target=25,
             )
             cohort = await _rollout_rescore_cohort(session, rollout=rollout)
@@ -374,15 +379,15 @@ class TestMidRolloutChangeIsIgnored:
         """The CHECK constraint is the primary guard against a bad target."""
         with pytest.raises(IntegrityError):
             async with session.begin():
-                agent_ids = await _seed_era(session, version=4, count=6, offset=4000)
+                agent_ids = await _seed_era(session, version=7, count=6, offset=7000)
                 members = _members(agent_ids)
                 rollout = await create_rollout_snapshot(
                     session,
                     members=members,
                     datasets=_pins(members),
                     now=_NOW,
-                    from_version=4,
-                    desired_version=5,
+                    from_version=7,
+                    desired_version=8,
                 )
                 rollout.rescore_cohort_target = 99
                 await session.flush()
@@ -398,15 +403,15 @@ class TestMidRolloutChangeIsIgnored:
         than testing the constraint again.
         """
         async with session.begin():
-            agent_ids = await _seed_era(session, version=4, count=6, offset=4000)
+            agent_ids = await _seed_era(session, version=7, count=6, offset=7000)
             members = _members(agent_ids)
             rollout = await create_rollout_snapshot(
                 session,
                 members=members,
                 datasets=_pins(members),
                 now=_NOW,
-                from_version=4,
-                desired_version=5,
+                from_version=7,
+                desired_version=8,
             )
             await session.flush()
             set_committed_value(rollout, "rescore_cohort_target", 99)

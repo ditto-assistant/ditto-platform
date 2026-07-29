@@ -56,6 +56,12 @@ def _settings(**overrides: object) -> dict[str, object]:
         "lane_cycle_size": 4,
         "fresh_submission_slots": [0, 1, 3],
         "owner_concurrent_submission_limit": 2,
+        "similarity_budget": {
+            "enabled": True,
+            "concurrent_submission_limit": 1,
+            "jaccard_threshold": 0.9,
+            "containment_threshold": 0.95,
+        },
         "prev_gen_carryover": {
             "enabled": False,
             "max_agents": 10,
@@ -64,7 +70,6 @@ def _settings(**overrides: object) -> dict[str, object]:
             "dedupe_scope": "coldkey",
             "require_cohort_complete": True,
             "require_desired_era_drained": True,
-            "allow_retired_era_backfill": False,
         },
     }
     settings.update(overrides)
@@ -148,7 +153,6 @@ class TestDefaultAndRoundTrip:
             "dedupe_scope": "coldkey",
             "require_cohort_complete": True,
             "require_desired_era_drained": True,
-            "allow_retired_era_backfill": False,
         }
 
     async def test_apply_then_get_reflects_the_revision(
@@ -374,7 +378,6 @@ class TestWholePolicyWrites:
             "dedupe_scope": "coldkey",
             "require_cohort_complete": True,
             "require_desired_era_drained": True,
-            "allow_retired_era_backfill": False,
         }
         created = await client.post(
             _URL, headers=_HEADERS, json=_payload(prev_gen_carryover=carryover)
@@ -551,7 +554,6 @@ class TestLaneModulusIsLockedDuringARollout:
                     "dedupe_scope": "coldkey",
                     "require_cohort_complete": True,
                     "require_desired_era_drained": True,
-                    "allow_retired_era_backfill": False,
                 },
             ),
         )

@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 
 from ditto.api_models.ticket_status import TicketPurpose, TicketStatus
 from ditto.db.models import ScreeningAttempt, ValidatorTicket
+from ditto.simulator.fabric import DEFAULT_BENCH_VERSION
 
 if TYPE_CHECKING:
     from ditto.simulator.scenarios import ScenarioContext
@@ -75,7 +76,7 @@ async def apply(ctx: ScenarioContext) -> None:
                 purpose_revision=1,
                 issued_at=f.hours_ago(5),
                 deadline=f.hours_ago(3),
-                bench_version=2,
+                bench_version=DEFAULT_BENCH_VERSION,
             )
         )
         await session.flush()
@@ -141,7 +142,7 @@ async def apply(ctx: ScenarioContext) -> None:
                     purpose_revision=1,
                     issued_at=issued_at,
                     deadline=issued_at + timedelta(hours=2),
-                    bench_version=2,
+                    bench_version=DEFAULT_BENCH_VERSION,
                 )
                 for name in ("validator-1", "validator-2")
             ]

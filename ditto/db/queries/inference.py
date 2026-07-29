@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import secrets
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import TYPE_CHECKING
@@ -15,6 +16,7 @@ from sqlalchemy.exc import IntegrityError
 from ditto.api_models.ticket_status import TicketStatus
 from ditto.api_server.inference_routing import benchmark_model, select_route
 from ditto.db.models import InferenceGrant, InferenceRequest, ValidatorTicket
+from ditto.metrics import INFERENCE_ADMISSION_AT_CAPACITY
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -37,6 +39,66 @@ Bumped when what gets *recorded* as a grant's token usage changes, so that a
 total is never silently compared across two different meters. See
 ``InferenceGrant.usage_accounting_version``.
 """
+
+
+@dataclass(frozen=True)
+class LeaseModelUsage:
+    """What one lease actually spent on the language model.
+
+    Read off the grant bound to a single ticket lease, which is where the
+    platform's own inference proxy books usage as it charges requests. The
+    validator never sees these numbers and cannot report them, so this is the
+    authoritative -- and unspoofable-by-the-validator -- account of whether a
+    run used the model at all.
+
+    ``chat_*`` counts the reader model. Embeddings are tracked separately by
+    the grant and deliberately excluded: a retrieval-only agent embeds
+    heavily, so folding embeddings in would erase exactly the signal this
+    exists to measure.
+    """
+
+    chat_calls: int
+    prompt_tokens: int
+    completion_tokens: int
+    accounting_version: int
+
+    @property
+    def total_tokens(self) -> int:
+        return self.prompt_tokens + self.completion_tokens
+
+
+async def get_lease_model_usage(
+    session: AsyncSession,
+    *,
+    ticket: ValidatorTicket,
+) -> LeaseModelUsage | None:
+    """Return the model spend booked against ``ticket``'s lease, if any.
+
+    Keyed on the same four columns as the ``inference_grants_ticket_lease``
+    unique constraint, so this resolves the one grant that belongs to this
+    exact lease rather than guessing by time proximity. Returns ``None`` when
+    no grant exists -- the proxy was disabled, or the lease predates it --
+    which callers must treat as *unknown*, never as *unused*.
+
+    Read-only: this takes no lock and adds no column to ``inference_grants``,
+    which is a hot table.
+    """
+    grant = await session.scalar(
+        select(InferenceGrant).where(
+            InferenceGrant.agent_id == ticket.agent_id,
+            InferenceGrant.bench_version == ticket.bench_version,
+            InferenceGrant.validator_hotkey == ticket.validator_hotkey,
+            InferenceGrant.ticket_deadline == _aware(ticket.deadline),
+        )
+    )
+    if grant is None:
+        return None
+    return LeaseModelUsage(
+        chat_calls=int(grant.request_count or 0),
+        prompt_tokens=int(grant.prompt_tokens or 0),
+        completion_tokens=int(grant.completion_tokens or 0),
+        accounting_version=int(grant.usage_accounting_version or 0),
+    )
 
 
 async def ensure_inference_grant(
@@ -363,6 +425,36 @@ class InferenceDecline(StrEnum):
 # means "your lease is dead" is how a healthy run gets thrown away.
 
 
+def _at_capacity(request_kind: str, scope: str) -> InferenceDecline:
+    """Record which admission gate declined, then answer the one wire value.
+
+    The return is always :attr:`InferenceDecline.AT_CAPACITY`; only the metric
+    knows the difference. Keeping the decline itself undifferentiated is the
+    point -- a broker's correct response to every one of these is identical
+    (back off, retry), so splitting the wire contract would add a decision the
+    caller must not make. The operator's question is the opposite one, and it
+    has no answer today: *which* ceiling is binding, if any.
+    """
+    INFERENCE_ADMISSION_AT_CAPACITY.labels(lane=request_kind, scope=scope).inc()
+    return InferenceDecline.AT_CAPACITY
+
+
+def _first_exhausted_scope(
+    gates: tuple[tuple[str, int, int], ...],
+) -> str | None:
+    """Return the first ``(scope, observed, limit)`` gate that is at its limit.
+
+    First rather than all: the caller declines on any one of them, so the
+    remaining gates are not evaluated as causes. Ordering is therefore
+    significant and is narrowest-to-widest, so a report reads as the tightest
+    binding constraint rather than whichever check happened to be written last.
+    """
+    for scope, observed, limit in gates:
+        if observed >= limit:
+            return scope
+    return None
+
+
 async def begin_inference_request(
     session: AsyncSession,
     *,
@@ -622,7 +714,7 @@ async def begin_inference_request(
         # spent yet and they settle within the provider timeout, so this is
         # backpressure, not exhaustion -- answering it terminally would throw
         # away a run that still had room.
-        return InferenceDecline.AT_CAPACITY
+        return _at_capacity(request_kind, "token_reservation")
     active_requests = (
         grant.active_requests
         if request_kind == "chat"
@@ -637,7 +729,7 @@ async def begin_inference_request(
         # Healthy lease, lane momentarily full. This is the limit an operator
         # tunes from backroom, so it is also the one most likely to move under a
         # live run -- it must degrade to backpressure, never to a lost run.
-        return InferenceDecline.AT_CAPACITY
+        return _at_capacity(request_kind, "per_ticket")
 
     # Fast replay path avoids an ORM identity collision in the common case;
     # the composite primary key and nested transaction remain authoritative
@@ -710,14 +802,24 @@ async def begin_inference_request(
         if request_kind == "chat"
         else config.embedding_global_requests_per_minute
     )
-    if (
-        int(validator_active or 0) >= per_validator_concurrency
-        or int(global_active or 0) >= global_concurrency
-        or int(ticket_recent or 0) >= per_ticket_rpm
-        or int(validator_recent or 0) >= per_validator_rpm
-        or int(global_recent or 0) >= global_rpm
-    ):
-        return InferenceDecline.AT_CAPACITY
+    # One decline, five reasons. The caller still sees a single AT_CAPACITY --
+    # the wire contract is deliberately unchanged, because a broker must treat
+    # every one of these identically (back off and retry). The gates are
+    # enumerated rather than or-ed only so the metric can name which one tripped:
+    # "the lane declined" and "the *global* ceiling declined" are the same event
+    # to the validator and completely different events to the operator deciding
+    # whether a ceiling needs to move.
+    exhausted_scope = _first_exhausted_scope(
+        (
+            ("per_validator", int(validator_active or 0), per_validator_concurrency),
+            ("global", int(global_active or 0), global_concurrency),
+            ("per_ticket_rpm", int(ticket_recent or 0), per_ticket_rpm),
+            ("per_validator_rpm", int(validator_recent or 0), per_validator_rpm),
+            ("global_rpm", int(global_recent or 0), global_rpm),
+        )
+    )
+    if exhausted_scope is not None:
+        return _at_capacity(request_kind, exhausted_scope)
 
     request = InferenceRequest(
         grant_id=grant.grant_id,

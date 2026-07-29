@@ -15,7 +15,9 @@ lock guarantees one validator cannot hold two live assignments across agents.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Collection
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Literal
 from uuid import UUID
@@ -37,12 +39,14 @@ from ditto.db.queries.benchmark_admission import (
     activated_rollout_for_version,
     benchmark_admission_predicate,
 )
+from ditto.db.queries.benchmark_rollout import MIN_SCOREABLE_BENCH_VERSION
 from ditto.db.queries.lease_liveness import maybe_force_expire_lease
 from ditto.db.queries.queue_order import (
     EMISSION_CONTENDER_COUNT,
     MIN_OWNER_CONCURRENT_SUBMISSION_LIMIT,
     OWNER_CONCURRENT_SUBMISSION_LIMIT_DEFAULT,
     PROVISIONAL_CONTENDER_LANE_SIZE,
+    SIMILARITY_CONCURRENT_SUBMISSION_LIMIT_DEFAULT,
     eligible_screened_image_predicate,
     owner_capacity_gate,
     owner_live_lease_agent_ids,
@@ -53,14 +57,31 @@ from ditto.db.queries.queue_order import (
     resolve_owner_linkage,
     selected_owner_agent_id,
 )
+from ditto.db.queries.score_ranking import (
+    rank_submissions,
+    resolve_ranking_scores,
+)
 from ditto.db.queries.scores import (
     SCORING_QUORUM,
+    LedgerRow,
     list_eligible_ledger,
+)
+from ditto.db.queries.similarity_budget import (
+    SubmissionSketch,
+    live_lease_sketches,
+    load_submission_sketches,
+)
+from ditto.db.queries.similarity_grouping import (
+    SimilarityBudgetPolicy,
+    SimilarityMatch,
+    similar_submissions,
 )
 
 if TYPE_CHECKING:
     from sqlalchemy import ColumnElement, Select
     from sqlalchemy.ext.asyncio import AsyncSession
+
+logger = logging.getLogger(__name__)
 
 
 def _as_utc(dt: datetime) -> datetime:
@@ -118,31 +139,95 @@ def retry_budget_spent() -> ColumnElement[bool]:
 # that already import them from this module.
 
 
-async def get_score_priority_floors(
+@dataclass(frozen=True)
+class ScoreFloor:
+    """One queue floor: the number, and the ledger row it was cut from."""
+
+    row: LedgerRow
+    score: float
+    """The holder's ``official_composite`` -- the number the board ranks it on,
+    which is not in general the raw quorum median on :attr:`row`."""
+
+
+async def get_score_priority_floor_rows(
     session: AsyncSession, *, bench_version: int | None = None
-) -> tuple[float | None, float | None]:
-    """Return finalized fifth-place and tenth-place floors for one benchmark era."""
+) -> tuple[ScoreFloor | None, ScoreFloor | None]:
+    """Return the fifth- and tenth-place floors with the rows that hold them.
+
+    Both floors are cut in the canonical order
+    (:func:`ditto.score_order.rank_submissions`) on the canonical
+    score (``official_composite``, the continual-mean estimator), which is the
+    same order and the same number the public board's ``rank`` and the
+    validator's weight fold read. The floors used to be cut on the raw
+    ``composite`` the ledger read happens to return, so "fifth place" named two
+    different agents depending on which surface you asked -- and, worse, the
+    gate the floor drives claims a submission "cannot reach the emission set"
+    while emission-set membership is decided by ``official_composite``.
+
+    The floats alone are still not checkable by a miner, so these return the
+    rows: any message that quotes a floor must be able to name the row it came
+    from.
+
+    Returns ``(continuation_row, provisional_row)``, each ``None`` when the era
+    has fewer eligible agents than the position needs.
+    """
     eligible = [
         row
         for row in await list_eligible_ledger(
             session,
             include_fingerprints=False,
-            include_details=False,
             bench_version=bench_version,
         )
         if row.eligible
     ]
-    continuation = (
-        eligible[EMISSION_CONTENDER_COUNT - 1].composite
-        if len(eligible) >= EMISSION_CONTENDER_COUNT
-        else None
+    # Nothing below rank five can move either floor, so an era still filling up
+    # never pays for the continual-mean reads.
+    if len(eligible) < EMISSION_CONTENDER_COUNT:
+        return None, None
+    official = await resolve_ranking_scores(
+        session, rows=eligible, bench_version=bench_version
     )
-    provisional = (
-        eligible[PROVISIONAL_CONTENDER_LANE_SIZE - 1].composite
-        if len(eligible) >= PROVISIONAL_CONTENDER_LANE_SIZE
-        else None
+    ranked = rank_submissions(eligible, scores=official)
+
+    def floor_at(position: int) -> ScoreFloor | None:
+        if len(ranked) < position:
+            return None
+        row = ranked[position - 1]
+        return ScoreFloor(row=row, score=official.get(row.agent_id, row.composite))
+
+    return floor_at(EMISSION_CONTENDER_COUNT), floor_at(PROVISIONAL_CONTENDER_LANE_SIZE)
+
+
+async def get_score_priority_floors(
+    session: AsyncSession, *, bench_version: int | None = None
+) -> tuple[float | None, float | None]:
+    """Return finalized fifth-place and tenth-place floors for one benchmark era.
+
+    The floats are the holders' ``official_composite`` -- the number the board
+    ranks them on -- not the raw quorum median stored on the ledger row.
+    """
+    continuation, provisional = await get_score_priority_floor_rows(
+        session, bench_version=bench_version
     )
-    return continuation, provisional
+    return (
+        continuation.score if continuation is not None else None,
+        provisional.score if provisional is not None else None,
+    )
+
+
+async def get_score_continuation_floor_row(
+    session: AsyncSession, *, bench_version: int | None = None
+) -> ScoreFloor | None:
+    """Return the fifth-place continuation floor and the row that holds it.
+
+    Same selection as :func:`get_score_continuation_floor`, kept as one call so
+    the quoted number and the agent it belongs to can never come from two
+    separate reads of a moving ledger.
+    """
+    continuation, _ = await get_score_priority_floor_rows(
+        session, bench_version=bench_version
+    )
+    return continuation
 
 
 async def get_score_continuation_floor(
@@ -162,6 +247,15 @@ async def get_score_continuation_floor(
     version-scoped composite against this floor must pass that same version.
     Returns ``None`` when the era does not yet have five eligible agents, which
     correctly disables the floor for a benchmark version still filling up.
+
+    The cut is by ``official_composite`` in the canonical order, so this IS the
+    score of the row the public board shows at ``rank: 5`` among finalized
+    entries. That is deliberate: the gate this floor drives says a submission
+    "cannot reach the emission set", and emission-set membership is decided by
+    ``official_composite`` in :func:`ditto.api_server.koth.project_koth`. Cutting
+    the floor on the raw quorum median instead was gating on a number nothing
+    downstream ranks by. Use :func:`get_score_continuation_floor_row` when the
+    number has to be attributed to an agent a miner can look up.
     """
     continuation, _ = await get_score_priority_floors(
         session, bench_version=bench_version
@@ -223,7 +317,7 @@ async def issue_ticket(
     validator_hotkey: str,
     now: datetime,
     ttl: timedelta,
-    bench_version: int | None = 2,
+    bench_version: int | None = MIN_SCOREABLE_BENCH_VERSION,
     artifact_mode: Literal["legacy", "prefer_screened", "screened_only"] = "legacy",
     validator_running_benchmark: bool = False,
     submitted_at_or_after: datetime | None = None,
@@ -232,6 +326,10 @@ async def issue_ticket(
     slot_id: str = "slot-0",
     only_agent_ids: Collection[UUID] | None = None,
     owner_concurrent_submission_limit: int = OWNER_CONCURRENT_SUBMISSION_LIMIT_DEFAULT,
+    similarity_policy: SimilarityBudgetPolicy | None = None,
+    similarity_concurrent_submission_limit: int = (
+        SIMILARITY_CONCURRENT_SUBMISSION_LIMIT_DEFAULT
+    ),
 ) -> ValidatorTicket | None:
     """Issue a ticket to ``validator_hotkey`` for the next eligible agent.
 
@@ -271,6 +369,18 @@ async def issue_ticket(
     but can never be served ahead of another owner. ``1`` disables the second
     pass entirely and restores strict serialization; see
     :func:`~ditto.db.queries.queue_order.owner_capacity_gate`.
+
+    ``similarity_policy`` turns on the fairness rail that the owner ceiling
+    cannot reach: near-identical submissions share one concurrency budget
+    whichever key paid for them, because spreading one submission across many
+    coldkeys defeats every ownership-derived rule the platform can verify.
+    ``None`` (the default) leaves it off entirely -- no sketch is read and the
+    allocator behaves exactly as it did before -- so the whole feature is inert
+    until an operator enables it. Unlike the owner ceiling this rail applies on
+    **both** passes, ordinary and last-resort: the monopoly it prevents is one
+    family filling the fleet precisely when nothing else is leasable, which is
+    the last-resort case. It never refuses a submission the owner has already
+    started; see the gate's docstring for that exemption and its bound.
     """
     # No row exists to lock before a validator's first claim. Serialize that
     # gap explicitly on Postgres; the unique partial index remains the durable
@@ -426,6 +536,10 @@ async def issue_ticket(
     # selection and are answered once per distinct owner rather than once per
     # candidate. That also makes the second pass free.
     owner_facts: dict[tuple[str, ...], tuple[UUID | None, set[UUID]]] = {}
+    # The fleet's live-lease sketches, for the same reason and with the same
+    # lifetime: a property of the fleet rather than of the row, read at most
+    # once per issuance and only when the similarity rail is enabled at all.
+    twin_sketches: tuple[SubmissionSketch, ...] | None = None
     skipped: list[UUID] = []
     # Rows this validator was refused purely by the owner ceiling, in the queue
     # order they were refused in. These -- and only these -- are what the
@@ -574,18 +688,50 @@ async def issue_ticket(
                 await owner_live_lease_agent_ids(session, linkage=linkage, now=now),
             )
         owner_selected_agent_id, owner_live_leases = owner_facts[owner_key]
-        if (
-            owner_capacity_gate(
-                agent_id=agent_id,
-                selected_agent_id=owner_selected_agent_id,
-                live_lease_agent_ids=owner_live_leases,
-                concurrent_submission_limit=owner_concurrent_submission_limit,
-                last_resort=last_resort,
-            )
-            is not None
-        ):
+        # The fairness rail's inputs. Read inside the loop but cached across
+        # it: the fleet's live-lease sketches are the same set for every
+        # candidate this pass, and the per-candidate sketch is one projection
+        # of a column the ticket path otherwise never touches.
+        twins: tuple[SimilarityMatch, ...] = ()
+        if similarity_policy is not None:
+            if twin_sketches is None:
+                twin_sketches = await live_lease_sketches(session, now=now)
+            candidate_sketch = (
+                await load_submission_sketches(session, agent_ids=[agent_id])
+            ).get(agent_id)
+            if candidate_sketch is not None:
+                twins = similar_submissions(
+                    candidate_sketch,
+                    [sketch for sketch in twin_sketches if sketch.agent_id != agent_id],
+                    policy=similarity_policy,
+                )
+        gate = owner_capacity_gate(
+            agent_id=agent_id,
+            selected_agent_id=owner_selected_agent_id,
+            live_lease_agent_ids=owner_live_leases,
+            concurrent_submission_limit=owner_concurrent_submission_limit,
+            last_resort=last_resort,
+            similar_lease_agent_ids=[twin.agent_id for twin in twins],
+            similarity_concurrent_submission_limit=(
+                similarity_concurrent_submission_limit
+            ),
+        )
+        if gate is not None:
+            if gate == "similarity_serialized":
+                # Logged rather than silently skipped, because this is the one
+                # refusal whose reason a miner cannot reconstruct from their own
+                # submission -- it depends on a row belonging to someone else.
+                logger.info(
+                    "similarity budget holds agent %s: %s",
+                    agent_id,
+                    ", ".join(twin.describe() for twin in twins[:3]),
+                )
             skipped.append(agent_id)
-            if not last_resort:
+            if not last_resort and gate == "owner_serialized":
+                # Only the owner ceiling is reconsidered on the last-resort
+                # pass. The similarity rail applies on both, so re-offering a
+                # row it refused would relax it in the one situation it exists
+                # for.
                 owner_capacity_skips.append(agent_id)
             continue
         occupied = await session.scalar(
@@ -861,7 +1007,7 @@ async def get_open_ticket(
     validator_hotkey: str,
     now: datetime,
     deadline: datetime,
-    bench_version: int | None = 2,
+    bench_version: int | None = MIN_SCOREABLE_BENCH_VERSION,
     slot_id: str | None = None,
     for_update: bool = False,
 ) -> ValidatorTicket | None:
@@ -968,7 +1114,7 @@ async def mark_ticket_scored(
     *,
     agent_id: UUID,
     validator_hotkey: str,
-    bench_version: int = 2,
+    bench_version: int = MIN_SCOREABLE_BENCH_VERSION,
 ) -> None:
     """Mark the validator's ticket for the agent ``scored`` (slot spent). No-op
     if there is no ticket row (e.g. a legacy score predating ticketing)."""

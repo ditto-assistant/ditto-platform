@@ -25,6 +25,7 @@ from ditto.db.queries.audit import (
     SCORE_RETEST_EVENTS,
     append_audit_entry,
 )
+from ditto.db.queries.benchmark_rollout import MIN_SCOREABLE_BENCH_VERSION
 from ditto.db.queries.lease_liveness import (
     LeaseLiveness,
     lease_liveness,
@@ -252,6 +253,22 @@ async def activate_next_score_retest(
     )
     for entry in queued:
         bench_version = int(entry.payload.get("bench_version", -1))
+        # The floor comes first, and it is a different KIND of check from the
+        # one below it. ``supports_version`` asks what this validator says it
+        # can run; that is capability, and it happened to keep retired eras out
+        # only because no modern validator advertises v6. Capability is not
+        # policy: a validator that did advertise it would have re-leased a dead
+        # era through this path, which is an UPDATE and so was never seen by
+        # the ticket INSERT guard. The database refuses the re-lease now; this
+        # skips it before it gets there.
+        if bench_version < MIN_SCOREABLE_BENCH_VERSION:
+            await _close_unserviceable(
+                session,
+                entry=entry,
+                now=now,
+                reason=f"benchmark v{bench_version} is retired",
+            )
+            continue
         if not supports_version(bench_version):
             continue
         agent = await session.get(Agent, entry.agent_id)

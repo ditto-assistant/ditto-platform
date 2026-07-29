@@ -23,6 +23,8 @@ from ditto.db.models import (
     BenchmarkRollout,
     BenchmarkRolloutMember,
 )
+from ditto.db.queries.benchmark_rollout import MIN_SCOREABLE_BENCH_VERSION
+from ditto.tests.legacy_era import retired_era_writes_allowed
 
 _TOKEN = "test-admin-token-at-least-32-characters"
 _HEADERS = {"Authorization": f"Bearer {_TOKEN}", "X-Admin-Actor": "operator"}
@@ -53,7 +55,7 @@ def _install(app: FastAPI, maker: async_sessionmaker[AsyncSession]) -> None:
 async def _seed(
     maker: async_sessionmaker[AsyncSession],
     *,
-    active_version: int = 4,
+    active_version: int = MIN_SCOREABLE_BENCH_VERSION,
     status: AgentStatus = AgentStatus.EVALUATING,
     policy_version: int = SCREENING_POLICY_VERSION,
     with_image: bool = True,
@@ -65,7 +67,11 @@ async def _seed(
         session.add(
             BenchmarkRollout(
                 rollout_id=uuid4(),
-                from_version=2,
+                # The era this activation came FROM is arbitrary here -- nothing
+                # below reads it -- but it can no longer be v2: the retired-era
+                # floor refuses any rollout row whose target is under v7, and
+                # ``benchmark_rollout_forward`` then pins the source one below.
+                from_version=active_version - 1,
                 desired_version=active_version,
                 status="activated",
                 created_at=_T0 - timedelta(hours=2),
@@ -118,7 +124,7 @@ async def _get(client: httpx.AsyncClient, agent_id: UUID) -> dict:
     return resp.json()
 
 
-async def test_fully_ready_v4_agent_is_leaseable(
+async def test_fully_ready_current_era_agent_is_leaseable(
     app: FastAPI, client: httpx.AsyncClient, sr_maker: async_sessionmaker[AsyncSession]
 ) -> None:
     agent_id = await _seed(sr_maker)
@@ -126,7 +132,7 @@ async def test_fully_ready_v4_agent_is_leaseable(
     body = await _get(client, agent_id)
     assert body["leaseable"] is True
     assert body["blocking_reasons"] == []
-    assert body["active_bench_version"] == 4
+    assert body["active_bench_version"] == MIN_SCOREABLE_BENCH_VERSION
     assert body["has_versioned_dataset"] is True
     assert body["screened_image"]["complete"] is True
 
@@ -156,7 +162,7 @@ async def test_missing_screened_image_blocks_and_names_fields(
     assert any("not built yet" in r for r in body["blocking_reasons"])
 
 
-async def test_missing_v4_dataset_blocks(
+async def test_missing_active_era_dataset_blocks(
     app: FastAPI, client: httpx.AsyncClient, sr_maker: async_sessionmaker[AsyncSession]
 ) -> None:
     agent_id = await _seed(sr_maker, with_dataset=False)
@@ -205,13 +211,25 @@ async def _seed_open_rollout(
     dataset_versions: tuple[int, ...],
     cohort_member: bool = False,
 ) -> UUID:
-    """Seed an active v6 ledger with a still-collecting v6 -> v7 rollout."""
+    """Seed an active v6 ledger with a still-collecting v6 -> v7 rollout.
+
+    The v6 -> v7 transition is the only one this scenario can be written as, so
+    it is not renumbered: v7 is the floor, and the ``benchmark_contract``
+    registry ships nothing above it, so a v7 -> v8 restatement would 500 on an
+    unknown contract rather than exercise the lane split.
+
+    That means the ledger's active era has to be v6, which in turn needs the
+    activation row that PUT it at v6 -- a rollout whose target is under the
+    floor. Production has exactly that row, grandfathered by ``NOT VALID``;
+    ``retired_era_writes_allowed`` reproduces it here and puts the floor back,
+    so everything written afterwards is still refused below v7.
+    """
     rollout_started = _T0 - timedelta(hours=1)
     agent_id = uuid4()
     open_rollout_id = uuid4()
-    async with maker() as session, session.begin():
-        session.add_all(
-            [
+    async with maker() as session:
+        async with retired_era_writes_allowed(session), session.begin():
+            session.add(
                 BenchmarkRollout(
                     rollout_id=uuid4(),
                     from_version=2,
@@ -219,7 +237,36 @@ async def _seed_open_rollout(
                     status="activated",
                     created_at=_T0 - timedelta(days=7),
                     activated_at=_T0 - timedelta(days=6),
-                ),
+                )
+            )
+        await _seed_open_rollout_body(
+            session,
+            agent_id=agent_id,
+            open_rollout_id=open_rollout_id,
+            rollout_started=rollout_started,
+            agent_created_at=agent_created_at,
+            agent_status=agent_status,
+            dataset_versions=dataset_versions,
+            cohort_member=cohort_member,
+        )
+    return agent_id
+
+
+async def _seed_open_rollout_body(
+    session: AsyncSession,
+    *,
+    agent_id: UUID,
+    open_rollout_id: UUID,
+    rollout_started: datetime,
+    agent_created_at: datetime,
+    agent_status: AgentStatus,
+    dataset_versions: tuple[int, ...],
+    cohort_member: bool,
+) -> None:
+    """Everything the scenario needs that the floor still permits."""
+    async with session.begin():
+        session.add_all(
+            [
                 BenchmarkRollout(
                     rollout_id=open_rollout_id,
                     from_version=6,
@@ -267,7 +314,6 @@ async def _seed_open_rollout(
                     frozen_composite=0.97,
                 )
             )
-    return agent_id
 
 
 async def test_submission_that_arrived_during_rollout_reports_the_desired_era(

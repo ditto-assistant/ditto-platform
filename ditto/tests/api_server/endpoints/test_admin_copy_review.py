@@ -28,8 +28,10 @@ from ditto.db.models import (
     ArtifactFetchAudit,
     AthReview,
     AthReviewAction,
+    BenchmarkRollout,
     Score,
 )
+from ditto.db.queries.benchmark_rollout import MIN_SCOREABLE_BENCH_VERSION
 from ditto.db.queries.scores import list_eligible_ledger
 
 _TOKEN = "test-admin-token-at-least-32-characters"
@@ -115,7 +117,30 @@ def _fingerprint(prefix: str, *, corpus: str = _CORPUS_ID) -> dict:
 async def _add_finalized_scores(
     maker: async_sessionmaker[AsyncSession], *, agent_ids: tuple[UUID, UUID]
 ) -> None:
+    """Give both sides of the pair a quorum in the era the ledger is reading.
+
+    The dedicated ``/current-comparison`` endpoint reads through
+    ``list_scores_for_agent``, which filters to ``active_bench_version()``. On
+    an empty database that answers ``DEFAULT_BENCH_VERSION`` (2), so scores
+    written at the current era would simply not be seen and the endpoint would
+    fail closed with a 409. This used to line up by accident -- the ``Score``
+    model defaulted to 2 as well -- and stopped lining up when the retired-era
+    floor moved that default to v7. Recording the v6 -> v7 activation puts the
+    ledger's authority where production's is, so the pair is compared instead
+    of being reported unavailable.
+    """
     async with maker() as session, session.begin():
+        session.add(
+            BenchmarkRollout(
+                rollout_id=uuid4(),
+                from_version=MIN_SCOREABLE_BENCH_VERSION - 1,
+                desired_version=MIN_SCOREABLE_BENCH_VERSION,
+                status="activated",
+                cohort_size=5,
+                created_at=_T0 - timedelta(days=1),
+                activated_at=_T0 - timedelta(hours=1),
+            )
+        )
         for agent_id in agent_ids:
             for index, composite in enumerate((0.79, 0.80, 0.81)):
                 session.add(
@@ -125,12 +150,13 @@ async def _add_finalized_scores(
                         run_id=f"run-{index}",
                         signature=None,
                         seed=7,
+                        bench_version=MIN_SCOREABLE_BENCH_VERSION,
                         composite=composite,
                         tool_mean=composite,
                         memory_mean=composite,
                         median_ms=100 + index,
                         n=114,
-                        details={"bench_version": 2},
+                        details={"bench_version": MIN_SCOREABLE_BENCH_VERSION},
                         generated_at=_T0 + timedelta(minutes=index),
                     )
                 )
@@ -190,7 +216,7 @@ async def _seed_scored_agent(
                     memory_mean=0.90,
                     median_ms=100,
                     n=114,
-                    details={"bench_version": 2},
+                    details={"bench_version": MIN_SCOREABLE_BENCH_VERSION},
                     generated_at=_T0 + timedelta(minutes=index),
                 )
             )

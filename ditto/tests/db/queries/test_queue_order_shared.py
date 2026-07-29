@@ -27,6 +27,7 @@ from ditto.api_models.screener import SCREENING_POLICY_VERSION
 from ditto.api_models.ticket_status import TicketPurpose, TicketStatus
 from ditto.db.models import (
     Agent,
+    BenchmarkDataset,
     BenchmarkRollout,
     EvaluationPayment,
     Score,
@@ -49,7 +50,11 @@ pytestmark = pytest.mark.asyncio
 
 _NOW = datetime(2026, 7, 25, 12, 0, 0, tzinfo=UTC)
 _TTL = timedelta(minutes=90)
-_BENCH = 2
+# The current scoreable era. This was v2 while v2 was still leasable; the
+# bench-version floor now refuses to write a sub-7 ticket or score at all, and
+# nothing here is about a particular benchmark -- the preview and the allocator
+# have to agree on whatever era the fleet is on.
+_BENCH = 7
 _FRESH_VALIDATOR = "5FreshValidatorWithNoPriorTickets"
 
 
@@ -69,6 +74,11 @@ async def _seed_agent(
     a validator cannot post one without holding a lease -- and the allocator's
     contender lane counts accepted tickets, so seeding scores alone would
     quietly disable the lane under test.
+
+    The verified screened image and the dataset pin are here because ``_BENCH``
+    is a post-v2 contract: ``queue_candidate_predicate`` filters out anything
+    without them before ranking begins, so an agent seeded the v2 way is simply
+    not in the queue and every ordering assertion below would pass vacuously.
     """
     agent_id = uuid4()
     async with session.begin():
@@ -81,9 +91,24 @@ async def _seed_agent(
                 status=AgentStatus.EVALUATING,
                 screening_policy_version=SCREENING_POLICY_VERSION,
                 created_at=created_at,
+                screened_image_sha256="12" * 32,
+                screened_image_size_bytes=123,
+                screened_image_id="sha256:" + "34" * 32,
+                screened_image_ref=f"ditto-screen/{agent_id}:latest",
+                screened_image_upload_id=uuid4(),
+                screened_image_verified_at=created_at,
             )
         )
         await session.flush()
+        session.add(
+            BenchmarkDataset(
+                agent_id=agent_id,
+                bench_version=_BENCH,
+                seed=1,
+                sha256="cd" * 32,
+                run_size="full",
+            )
+        )
         if coldkey is not None:
             session.add(
                 EvaluationPayment(
@@ -103,6 +128,7 @@ async def _seed_agent(
             session.add(
                 Score(
                     agent_id=agent_id,
+                    bench_version=_BENCH,
                     validator_hotkey=scorer,
                     run_id=f"run-{index}",
                     signature=None,
@@ -459,7 +485,7 @@ class TestHistoricalDivergences:
             session.add(
                 BenchmarkRollout(
                     rollout_id=uuid4(),
-                    from_version=1,
+                    from_version=_BENCH - 1,
                     desired_version=_BENCH,
                     status="collecting",
                     cohort_size=5,

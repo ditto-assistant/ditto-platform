@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from decimal import Decimal
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from sqlalchemy import (
     JSON,
@@ -863,8 +863,15 @@ class Score(Base):
     validator_hotkey: Mapped[str] = mapped_column(Text, nullable=False)
     """SS58 hotkey of the reporting validator. PK part 2."""
 
-    bench_version: Mapped[int] = mapped_column(Integer, nullable=False, default=2)
-    """Benchmark semantics this signed score and its dataset were produced under."""
+    bench_version: Mapped[int] = mapped_column(Integer, nullable=False, default=7)
+    """Benchmark semantics this signed score and its dataset were produced under.
+
+    Defaults to the floor, not to 2. The old default predated any floor and is
+    now guaranteed to violate ``scores_bench_version_floor``, so it could only
+    ever have produced a runtime IntegrityError. Every production caller passes
+    this explicitly -- ``upsert_score`` requires it -- so the default now serves
+    only fixtures that do not care which era they are in.
+    """
 
     run_id: Mapped[str] = mapped_column(Text, nullable=False)
     """Scoring-engine run identifier (part of the value the signature is bound to)."""
@@ -894,6 +901,25 @@ class Score(Base):
 
     details: Mapped[dict | None] = mapped_column(_JSON_VARIANT, nullable=True)
     """Optional per-case breakdown ``{"per_case": [...]}`` for audit."""
+
+    model_calls: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    """Reader-model calls this run made, off the lease's inference grant.
+
+    Denormalized at submit time from ``inference_grants``. That table is hot
+    and short-retention (grants are pruned within days) while scores are
+    permanent, so the join is not merely slow to reproduce later -- after
+    pruning it is impossible. ``NULL`` means *not measured* (no grant existed
+    for the lease), which is distinct from ``0`` meaning *measured, and the
+    model was never called*.
+    """
+
+    model_prompt_tokens: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    """Prompt tokens the reader model was sent across this run."""
+
+    model_completion_tokens: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True
+    )
+    """Completion tokens the reader model produced across this run."""
 
     generated_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False
@@ -939,6 +965,12 @@ class Score(Base):
         CheckConstraint("n >= 0", name="scores_n_check"),
         CheckConstraint("median_ms >= 0", name="scores_median_ms_check"),
         CheckConstraint("bench_version > 0", name="scores_bench_version_positive"),
+        # The retired-era floor. Declared NOT VALID in the migration: the
+        # historical v2-v6 rows stay readable, queryable and byte-identical,
+        # while every INSERT and UPDATE from here on must be v7 or later. This
+        # is the guarantee that no application bug can score a retired era --
+        # see MIN_SCOREABLE_BENCH_VERSION.
+        CheckConstraint("bench_version >= 7", name="scores_bench_version_floor"),
         Index("scores_agent_id_idx", "agent_id"),
         # Dashboard/ledger reads select one benchmark era before grouping or
         # ranking scores.  Keep the aggregate columns in the index so the
@@ -1036,6 +1068,12 @@ class ConfirmationScore(Base):
         ),
         CheckConstraint(
             "bench_version > 0", name="confirmation_scores_bench_version_positive"
+        ),
+        # Same retired-era floor as ``scores``, and for the same reason: this is
+        # a score ledger too. Also NOT VALID, so the existing v6 confirmation
+        # rows survive untouched.
+        CheckConstraint(
+            "bench_version >= 7", name="confirmation_scores_bench_version_floor"
         ),
         CheckConstraint("seed >= 0", name="confirmation_scores_seed_check"),
         Index("confirmation_scores_agent_version_idx", "agent_id", "bench_version"),
@@ -1348,6 +1386,15 @@ class BenchmarkRollout(Base):
         CheckConstraint(
             "desired_version > from_version", name="benchmark_rollout_forward"
         ),
+        # No new rollout may ever target a retired era. Combined with
+        # ``benchmark_rollout_forward`` above (desired > from) this also pins
+        # ``from_version`` at 6 or higher for any NEW row, so the only rollout
+        # this table can still open is one that ends at v7 or later.
+        #
+        # NOT VALID in the migration: the six historical rows -- including the
+        # v6->v7 transition whose ``from_version`` is 6 -- stay exactly as they
+        # are, because they are the audit trail of how the fleet got here.
+        CheckConstraint("desired_version >= 7", name="benchmark_rollout_desired_floor"),
         CheckConstraint(
             # Retain the historical storage bound for rollout snapshots created
             # before new transitions were narrowed to ten members.
@@ -2010,7 +2057,12 @@ class ValidatorTicket(Base):
     deadline: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False)
     """When an unscored ticket expires and its slot re-opens (UTC)."""
 
-    bench_version: Mapped[int] = mapped_column(Integer, nullable=False, default=2)
+    # Defaulted to the floor for the same reason as ``Score.bench_version``: a
+    # default of 2 is a value this table's own
+    # ``validator_tickets_bench_version_floor`` trigger refuses, so it could
+    # only ever produce a runtime error at INSERT. Every production caller
+    # passes this explicitly.
+    bench_version: Mapped[int] = mapped_column(Integer, nullable=False, default=7)
     """Benchmark version whose retry budget this ticket consumes."""
 
     seed: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
@@ -3544,4 +3596,144 @@ class ArtifactFetchAudit(Base):
             "fetched_at",
             "seq",
         ),
+    )
+
+
+class OwnerAttestation(Base):
+    """One cryptographically-proven owner link.
+
+    Rows live on the ``owner_attestations`` table.
+
+    Two hotkeys declared to be the same operator, with **both** endpoints
+    having signed. Each half is proved by either that hotkey itself or the
+    coldkey bound to it by payment records; the key kind is recorded per side
+    so a reviewer can grade the evidence. Signatures are retained verbatim so
+    any reviewer -- or any miner disputing a hold -- can re-verify the claim
+    offline without trusting this table.
+
+    The pair is stored in canonical (sorted) order as ``hotkey_lo`` /
+    ``hotkey_hi``. The link is **symmetric**: it says one operator holds both
+    keys, and both key holders consented. Symmetry is safe precisely because
+    both halves are signed -- an attacker cannot mint an edge naming a hotkey
+    they do not control, in either direction. ``lo``/``hi`` carry no meaning
+    beyond giving the pair exactly one representation.
+
+    This table feeds **copy screening only**. It is deliberately absent from
+    :func:`ditto.db.queries.scores.emission_owner_key`, the single authority
+    for emission-slot partitioning, so an attestation can neither create nor
+    collapse an emission position.
+    """
+
+    __tablename__ = "owner_attestations"
+
+    attestation_id: Mapped[UUID] = mapped_column(
+        SaUUID(as_uuid=True), primary_key=True, default=uuid4
+    )
+    """Surrogate key."""
+
+    netuid: Mapped[int] = mapped_column(Integer, nullable=False)
+    """Subnet the attestation was minted for. Signed, so it cannot be replayed
+    onto another subnet running this software."""
+
+    hotkey_lo: Mapped[str] = mapped_column(Text, nullable=False)
+    """Lexicographically smaller of the two linked hotkeys."""
+
+    hotkey_hi: Mapped[str] = mapped_column(Text, nullable=False)
+    """Lexicographically larger of the two linked hotkeys."""
+
+    nonce: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), nullable=False)
+    """Single-use value bound into both signed payloads. Uniquely indexed: this
+    is the replay guard, so a captured attestation cannot be submitted twice."""
+
+    issued_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False
+    )
+    """Miner-supplied mint time, signed. Bounds the mint-to-submit window."""
+
+    lo_key_kind: Mapped[str] = mapped_column(Text, nullable=False)
+    """``hotkey`` or ``coldkey`` -- which key proved the ``lo`` half."""
+
+    lo_signer: Mapped[str] = mapped_column(Text, nullable=False)
+    """SS58 that actually signed the ``lo`` half. Equals ``hotkey_lo`` for a
+    hotkey proof, or the payment-bound coldkey for a coldkey proof."""
+
+    lo_signature: Mapped[str] = mapped_column(Text, nullable=False)
+    """sr25519 signature for the ``lo`` half, lowercase hex, 128 chars."""
+
+    hi_key_kind: Mapped[str] = mapped_column(Text, nullable=False)
+    """``hotkey`` or ``coldkey`` -- which key proved the ``hi`` half."""
+
+    hi_signer: Mapped[str] = mapped_column(Text, nullable=False)
+    """SS58 that actually signed the ``hi`` half."""
+
+    hi_signature: Mapped[str] = mapped_column(Text, nullable=False)
+    """sr25519 signature for the ``hi`` half, lowercase hex, 128 chars."""
+
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+    """Row insertion time. The authoritative "link became active" instant --
+    ``issued_at`` is miner-supplied and only loosely trusted."""
+
+    revoked_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    """When the link stopped counting, or ``NULL`` while active.
+
+    Revocation is **prospective**. Submissions already screened under an active
+    link keep their decision: screening is a point-in-time adjudication, and
+    re-holding already-scored agents on a later revocation would punish
+    reliance and destabilise the ledger. The row is never deleted, so the
+    window during which the link was live stays auditable.
+    """
+
+    revoked_by: Mapped[str | None] = mapped_column(Text, nullable=True)
+    """Who revoked: an operator actor, or the endpoint that withdrew."""
+
+    revoked_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    """Free-text rationale recorded at revocation."""
+
+    __table_args__ = (
+        UniqueConstraint("nonce", name="owner_attestations_nonce_key"),
+        CheckConstraint(
+            "hotkey_lo < hotkey_hi",
+            name="owner_attestations_canonical_order",
+        ),
+        CheckConstraint(
+            "lo_key_kind IN ('hotkey', 'coldkey')",
+            name="owner_attestations_lo_key_kind_check",
+        ),
+        CheckConstraint(
+            "hi_key_kind IN ('hotkey', 'coldkey')",
+            name="owner_attestations_hi_key_kind_check",
+        ),
+        CheckConstraint(
+            "length(lo_signature) = 128",
+            name="owner_attestations_lo_signature_check",
+        ),
+        CheckConstraint(
+            "length(hi_signature) = 128",
+            name="owner_attestations_hi_signature_check",
+        ),
+        CheckConstraint(
+            "(revoked_at IS NULL) = (revoked_by IS NULL)",
+            name="owner_attestations_revocation_pair",
+        ),
+        # At most one *active* link per pair. Canonical ordering means this
+        # constrains the unordered pair, not one arrangement of it. A revoked
+        # link can be re-established with a fresh nonce.
+        Index(
+            "owner_attestations_active_pair_idx",
+            "netuid",
+            "hotkey_lo",
+            "hotkey_hi",
+            unique=True,
+            postgresql_where=text("revoked_at IS NULL"),
+        ),
+        # The screening-time resolution reads both columns; the link is
+        # symmetric so neither side is privileged.
+        Index("owner_attestations_lo_idx", "netuid", "hotkey_lo"),
+        Index("owner_attestations_hi_idx", "netuid", "hotkey_hi"),
     )

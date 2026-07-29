@@ -1,6 +1,7 @@
 """Regression coverage for audited validator-infrastructure recovery."""
 
 from collections.abc import AsyncIterator
+from contextlib import AsyncExitStack
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -22,6 +23,8 @@ from ditto.api_models.ticket_status import TicketPurpose, TicketStatus
 from ditto.api_server.dependencies import get_session
 from ditto.db.models import (
     Agent,
+    BenchmarkDataset,
+    BenchmarkRollout,
     Score,
     ScoreAuditEntry,
     ValidatorHeartbeat,
@@ -38,13 +41,14 @@ from ditto.db.queries.audit import (
     EVENT_SCORE_RETEST_REQUESTED,
     append_audit_entry,
 )
-from ditto.db.queries.benchmark_rollout import DEFAULT_BENCH_VERSION
+from ditto.db.queries.benchmark_rollout import MIN_SCOREABLE_BENCH_VERSION
 from ditto.db.queries.score_retests import activate_next_score_retest
 from ditto.db.queries.tickets import (
     MAX_ATTEMPTS_PER_VERSION,
     issue_ticket,
     ticket_attempt_cap,
 )
+from ditto.tests.legacy_era import retired_era_writes_allowed
 
 _TOKEN = "test-admin-token-at-least-32-characters"
 _HEADERS = {"Authorization": f"Bearer {_TOKEN}", "X-Admin-Actor": "operator"}
@@ -53,6 +57,16 @@ _T0 = datetime(2026, 7, 18, 12, tzinfo=UTC)
 # _PAST is always behind it, _FUTURE always ahead.
 _PAST = _T0 - timedelta(hours=1)
 _FUTURE = datetime(2099, 1, 1, tzinfo=UTC)
+# The era the queue serves throughout this file. It used to be
+# ``DEFAULT_BENCH_VERSION`` (2), which was never a statement about v2 -- it was
+# "whatever era this fleet is on", and on an empty database that constant is
+# also what ``active_bench_version`` answers, so the two lined up for free.
+#
+# They no longer can: v2 is retired, so no ticket may be issued and no score
+# recorded under it. Every fixture here moves to the floor instead, and
+# ``_activate_current_era`` below records the activation that makes the ledger
+# agree -- the same pairing production has, just stated explicitly.
+_BENCH_VERSION = MIN_SCOREABLE_BENCH_VERSION
 
 
 @pytest.fixture
@@ -78,11 +92,45 @@ def _install(app: FastAPI, maker: async_sessionmaker[AsyncSession]) -> None:
     app.dependency_overrides[get_session] = _session
 
 
+async def _activate_current_era(session: AsyncSession) -> None:
+    """Record the activation that puts the ledger's authority at ``_BENCH_VERSION``.
+
+    With no rollout row at all, ``active_bench_version`` falls back to
+    ``DEFAULT_BENCH_VERSION`` (2) -- an era nothing may be written under any
+    more. Several answers here are computed against that authority: the
+    reinstatement gate refuses a ticket whose era is no longer active, and the
+    score-outlier scan reports only the era it scanned. Without this row those
+    would compare live v7 fixtures against a v2 authority and refuse work that
+    is in fact current.
+
+    Idempotent, because a test seeds several submissions and only one rollout
+    row may hold a given transition.
+    """
+    existing = await session.scalar(
+        select(BenchmarkRollout.rollout_id).where(
+            BenchmarkRollout.desired_version == _BENCH_VERSION
+        )
+    )
+    if existing is not None:
+        return
+    session.add(
+        BenchmarkRollout(
+            rollout_id=uuid4(),
+            from_version=_BENCH_VERSION - 1,
+            desired_version=_BENCH_VERSION,
+            status="activated",
+            cohort_size=5,
+            created_at=_T0 - timedelta(days=7),
+            activated_at=_T0 - timedelta(days=6),
+        )
+    )
+
+
 async def _seed(
     maker: async_sessionmaker[AsyncSession],
     *,
     score_count: int = 0,
-    bench_version: int = DEFAULT_BENCH_VERSION,
+    bench_version: int = _BENCH_VERSION,
     composites: list[float] | None = None,
     ticket_count: int = 4,
     miner_hotkey: str = "5Miner",
@@ -95,69 +143,109 @@ async def _seed(
     # used to carry ``.ddl_if(dialect="postgresql")`` in ditto/db/models.py and
     # so was never created under SQLite's ``create_all``. No assertion in this
     # file reads the name this helper generates.
-    async with maker() as session, session.begin():
-        session.add(
-            Agent(
-                agent_id=agent_id,
-                miner_hotkey=miner_hotkey,
-                name=f"valid-agent-{agent_id.hex[:8]}",
-                version=1,
-                sha256=agent_id.hex * 2,
-                status=AgentStatus.EVALUATING,
-                screening_policy_version=SCREENING_POLICY_VERSION,
-                created_at=_T0 - timedelta(days=1),
-            )
-        )
-        for index in range(ticket_count):
-            hotkey = f"validator-{index}"
-            status = (
-                TicketStatus.SCORED if index < score_count else TicketStatus.EXPIRED
+    #
+    # A ``bench_version`` under the floor is only ever asked for by the two
+    # tests whose subject IS a closed era, and those rows are the grandfathered
+    # kind production still holds, so the floor is lifted just long enough to
+    # write them and restored immediately.
+    async with maker() as session, AsyncExitStack() as stack:
+        if bench_version < MIN_SCOREABLE_BENCH_VERSION:
+            await stack.enter_async_context(retired_era_writes_allowed(session))
+        async with session.begin():
+            await _activate_current_era(session)
+            session.add(
+                Agent(
+                    agent_id=agent_id,
+                    miner_hotkey=miner_hotkey,
+                    name=f"valid-agent-{agent_id.hex[:8]}",
+                    version=1,
+                    sha256=agent_id.hex * 2,
+                    status=AgentStatus.EVALUATING,
+                    screening_policy_version=SCREENING_POLICY_VERSION,
+                    created_at=_T0 - timedelta(days=1),
+                    # A leasable submission in the current era is a screened one.
+                    # The v2 contract this file used to run under required neither a
+                    # verified image nor a versioned dataset, so a bare agent row was
+                    # enough; every contract from v3 on requires both, and without
+                    # them ``issue_ticket`` correctly answers "no job for you" and
+                    # the eviction/reinstatement tests below lose their subject.
+                    screened_image_sha256="a" * 64,
+                    screened_image_size_bytes=1024,
+                    screened_image_id="sha256:" + "b" * 64,
+                    screened_image_ref=f"ditto-screen/{agent_id}:latest",
+                    screened_image_upload_id=uuid4(),
+                    screened_image_verified_at=_T0 - timedelta(hours=6),
+                )
             )
             session.add(
-                ValidatorTicket(
+                BenchmarkDataset(
                     agent_id=agent_id,
-                    validator_hotkey=hotkey,
-                    status=status,
-                    issued_at=_T0 - timedelta(hours=3 - index / 10),
-                    deadline=_T0 - timedelta(hours=2 - index / 10),
                     bench_version=bench_version,
-                    attempt_count=1 if status == TicketStatus.SCORED else 2,
-                    manual_retry_grants=0,
-                    retry_after=_T0 - timedelta(hours=1),
+                    seed=7,
+                    sha256="d" * 64,
+                    run_size="full",
                 )
             )
-            if status == TicketStatus.SCORED:
+            for index in range(ticket_count):
+                hotkey = f"validator-{index}"
+                status = (
+                    TicketStatus.SCORED if index < score_count else TicketStatus.EXPIRED
+                )
                 session.add(
-                    Score(
+                    ValidatorTicket(
                         agent_id=agent_id,
-                        bench_version=bench_version,
                         validator_hotkey=hotkey,
-                        run_id=f"run-{index}",
-                        seed=7,
-                        composite=(composites or [0.7] * score_count)[index],
-                        tool_mean=0.7,
-                        memory_mean=0.7,
-                        median_ms=100,
-                        n=114,
-                        generated_at=_T0 - timedelta(hours=1),
+                        status=status,
+                        issued_at=_T0 - timedelta(hours=3 - index / 10),
+                        deadline=_T0 - timedelta(hours=2 - index / 10),
+                        bench_version=bench_version,
+                        attempt_count=1 if status == TicketStatus.SCORED else 2,
+                        manual_retry_grants=0,
+                        retry_after=_T0 - timedelta(hours=1),
                     )
                 )
+                if status == TicketStatus.SCORED:
+                    session.add(
+                        Score(
+                            agent_id=agent_id,
+                            bench_version=bench_version,
+                            validator_hotkey=hotkey,
+                            run_id=f"run-{index}",
+                            seed=7,
+                            composite=(composites or [0.7] * score_count)[index],
+                            tool_mean=0.7,
+                            memory_mean=0.7,
+                            median_ms=100,
+                            n=114,
+                            generated_at=_T0 - timedelta(hours=1),
+                        )
+                    )
     return agent_id
 
 
-async def test_retry_is_bound_to_v3_ticket_and_score_epoch(
+async def test_retry_is_bound_to_the_ticket_and_score_epoch(
     app: FastAPI,
     client: httpx.AsyncClient,
     retry_maker: async_sessionmaker[AsyncSession],
 ) -> None:
-    agent_id = await _seed(retry_maker, score_count=1, bench_version=3)
+    """The recovery reports the ticket's era, not the ledger's active one.
+
+    Stated with an era one ahead of the ledger authority, which is the shape a
+    fleet has mid-rollout: the desired version is already being scored while
+    ``from_version`` still holds authority. It used to be stated with v3, one
+    era BEHIND -- the same property, read from the other side -- but no ticket
+    or score may exist below the retired-era floor any more, so the only way to
+    keep the two eras genuinely distinct is to look forward instead of back.
+    """
+    era = _BENCH_VERSION + 1
+    agent_id = await _seed(retry_maker, score_count=1, bench_version=era)
     _install(app, retry_maker)
 
     detail = await client.get(
         f"/api/v1/admin/validation-retries/{agent_id}", headers=_HEADERS
     )
     assert detail.status_code == 200, detail.text
-    assert {ticket["bench_version"] for ticket in detail.json()["tickets"]} == {3}
+    assert {ticket["bench_version"] for ticket in detail.json()["tickets"]} == {era}
 
     response = await client.post(
         f"/api/v1/admin/validation-retries/{agent_id}/retry",
@@ -165,11 +253,11 @@ async def test_retry_is_bound_to_v3_ticket_and_score_epoch(
         json={
             "request_id": str(uuid4()),
             "expected_snapshot": detail.json()["snapshot"],
-            "reason": "v3 validator infrastructure recovery",
+            "reason": f"v{era} validator infrastructure recovery",
         },
     )
     assert response.status_code == 200, response.text
-    assert response.json()["recovery"]["bench_version"] == 3
+    assert response.json()["recovery"]["bench_version"] == era
 
 
 async def test_retry_grants_only_minimum_quorum_slots_and_preserves_history(
@@ -292,7 +380,9 @@ async def test_stale_snapshot_and_active_or_natural_retry_fail_closed(
     assert stale.status_code == 409
 
     async with retry_maker() as session, session.begin():
-        ticket = await session.get(ValidatorTicket, (agent_id, 2, "validator-0"))
+        ticket = await session.get(
+            ValidatorTicket, (agent_id, _BENCH_VERSION, "validator-0")
+        )
         assert ticket is not None
         ticket.attempt_count = 1
     changed = await client.get(
@@ -337,7 +427,7 @@ async def test_manual_grant_allows_exactly_one_more_same_version_issue(
             validator_hotkey="validator-0",
             now=datetime.now(UTC) + timedelta(seconds=1),
             ttl=timedelta(minutes=90),
-            bench_version=DEFAULT_BENCH_VERSION,
+            bench_version=_BENCH_VERSION,
         )
     assert ticket is not None and ticket.agent_id == agent_id
     assert ticket.attempt_count == 3
@@ -390,7 +480,7 @@ async def test_withdraw_failed_submission_preserves_history_and_stops_assignment
             validator_hotkey="validator-0",
             now=datetime.now(UTC) + timedelta(seconds=1),
             ttl=timedelta(minutes=90),
-            bench_version=DEFAULT_BENCH_VERSION,
+            bench_version=_BENCH_VERSION,
         )
     assert issued is None
 
@@ -429,7 +519,9 @@ async def test_withdraw_fails_closed_when_snapshot_moves_or_ticket_is_active(
     assert stale.status_code == 409
 
     async with retry_maker() as session, session.begin():
-        ticket = await session.get(ValidatorTicket, (agent_id, 2, "validator-0"))
+        ticket = await session.get(
+            ValidatorTicket, (agent_id, _BENCH_VERSION, "validator-0")
+        )
         assert ticket is not None
         ticket.status = TicketStatus.ISSUED
         ticket.deadline = _FUTURE
@@ -466,7 +558,7 @@ async def test_withdraw_remains_available_after_operator_retry_limit(
                     reason="Prior validator infrastructure recovery",
                     expected_snapshot=str(index) * 64,
                     score_count=0,
-                    bench_version=DEFAULT_BENCH_VERSION,
+                    bench_version=_BENCH_VERSION,
                     ticket_snapshot=[],
                     granted_validator_hotkeys=[f"validator-{index}"],
                     created_at=_T0 + timedelta(minutes=index),
@@ -491,7 +583,7 @@ async def _seed_live_lease(
     *,
     validator_hotkey: str = "validator-0",
     slot_id: str = "slot-0",
-    bench_version: int = DEFAULT_BENCH_VERSION,
+    bench_version: int = _BENCH_VERSION,
 ) -> datetime:
     """Seat the 2026-07-27 signature: a live 90-minute lease that never reported.
 
@@ -501,21 +593,29 @@ async def _seed_live_lease(
     """
     issued_at = datetime.now(UTC) - timedelta(minutes=20)
     deadline = issued_at + timedelta(minutes=90)
-    async with maker() as session, session.begin():
-        session.add(
-            ValidatorTicket(
-                agent_id=agent_id,
-                validator_hotkey=validator_hotkey,
-                slot_id=slot_id,
-                status=TicketStatus.ISSUED,
-                purpose=TicketPurpose.CANONICAL_QUORUM,
-                purpose_revision=1,
-                issued_at=issued_at,
-                deadline=deadline,
-                bench_version=bench_version,
-                attempt_count=1,
+    async with maker() as session, AsyncExitStack() as stack:
+        # A lease in a closed era can no longer be created -- that is the whole
+        # point of the ticket trigger. One test below needs exactly that lease
+        # to have existed before the floor landed, so it is written the same way
+        # production's in-flight sub-v7 leases were: with the floor lifted, and
+        # restored before anything under test runs.
+        if bench_version < MIN_SCOREABLE_BENCH_VERSION:
+            await stack.enter_async_context(retired_era_writes_allowed(session))
+        async with session.begin():
+            session.add(
+                ValidatorTicket(
+                    agent_id=agent_id,
+                    validator_hotkey=validator_hotkey,
+                    slot_id=slot_id,
+                    status=TicketStatus.ISSUED,
+                    purpose=TicketPurpose.CANONICAL_QUORUM,
+                    purpose_revision=1,
+                    issued_at=issued_at,
+                    deadline=deadline,
+                    bench_version=bench_version,
+                    attempt_count=1,
+                )
             )
-        )
     return deadline
 
 
@@ -537,7 +637,7 @@ async def test_evict_frees_the_live_slot_and_preserves_every_source_record(
             validator_hotkey="validator-0",
             now=datetime.now(UTC),
             ttl=timedelta(minutes=90),
-            bench_version=DEFAULT_BENCH_VERSION,
+            bench_version=_BENCH_VERSION,
         )
     assert held is not None and held.agent_id == burner
 
@@ -578,7 +678,7 @@ async def test_evict_frees_the_live_slot_and_preserves_every_source_record(
             validator_hotkey="validator-0",
             now=datetime.now(UTC) + timedelta(seconds=1),
             ttl=timedelta(minutes=90),
-            bench_version=DEFAULT_BENCH_VERSION,
+            bench_version=_BENCH_VERSION,
         )
     assert reissued is not None and reissued.agent_id == waiting
 
@@ -672,7 +772,7 @@ async def _seed_capacity_heartbeat(
                         {
                             "slot_id": slot_id,
                             "agent_id": str(agent_id),
-                            "bench_version": DEFAULT_BENCH_VERSION,
+                            "bench_version": _BENCH_VERSION,
                             "progress": progress,
                             "healthy": True,
                         }
@@ -711,7 +811,7 @@ async def test_evict_never_mints_a_no_fault_retry_grant(
     # Automatic revocation on a proven-idle lease: the miner IS compensated.
     async with retry_maker() as session, session.begin():
         ticket = await session.get(
-            ValidatorTicket, (automatic, DEFAULT_BENCH_VERSION, "validator-0")
+            ValidatorTicket, (automatic, _BENCH_VERSION, "validator-0")
         )
         assert ticket is not None
         await force_expire_lease(
@@ -725,7 +825,7 @@ async def test_evict_never_mints_a_no_fault_retry_grant(
         )
     async with retry_maker() as session:
         compensated = await session.get(
-            ValidatorTicket, (automatic, DEFAULT_BENCH_VERSION, "validator-0")
+            ValidatorTicket, (automatic, _BENCH_VERSION, "validator-0")
         )
     assert compensated is not None and compensated.infra_retry_grants == 1
 
@@ -747,7 +847,7 @@ async def test_evict_never_mints_a_no_fault_retry_grant(
     assert response.status_code == 200, response.text
     async with retry_maker() as session:
         uncompensated = await session.get(
-            ValidatorTicket, (evicted, DEFAULT_BENCH_VERSION, "validator-1")
+            ValidatorTicket, (evicted, _BENCH_VERSION, "validator-1")
         )
     assert uncompensated is not None
     assert uncompensated.infra_retry_grants == 0
@@ -962,7 +1062,7 @@ async def test_evict_interlocks_reject_a_mismatched_or_malformed_call(
     # Nothing above may have touched the lease.
     async with retry_maker() as session:
         ticket = await session.get(
-            ValidatorTicket, (agent_id, DEFAULT_BENCH_VERSION, "validator-0")
+            ValidatorTicket, (agent_id, _BENCH_VERSION, "validator-0")
         )
     assert ticket is not None and ticket.status == TicketStatus.ISSUED
 
@@ -1093,7 +1193,7 @@ async def test_reinstatement_returns_an_evicted_submission_to_the_queue(
     eviction_id = evicted.json()["eviction"]["eviction_id"]
     async with retry_maker() as session:
         assert not await agent_is_admitted(
-            session, bench_version=DEFAULT_BENCH_VERSION, agent_id=agent_id
+            session, bench_version=_BENCH_VERSION, agent_id=agent_id
         )
 
     body = await _detail(client, agent_id)
@@ -1106,7 +1206,7 @@ async def test_reinstatement_returns_an_evicted_submission_to_the_queue(
     assert response.status_code == 200, response.text
     reinstated = response.json()
     assert reinstated["idempotent"] is False
-    assert reinstated["restored_bench_version"] == DEFAULT_BENCH_VERSION
+    assert reinstated["restored_bench_version"] == _BENCH_VERSION
     assert reinstated["eviction"]["eviction_id"] == eviction_id
     assert reinstated["eviction"]["evicted_validator_hotkeys"] == ["validator-0"]
     assert reinstated["eviction"]["reinstated_at"] is not None
@@ -1118,7 +1218,7 @@ async def test_reinstatement_returns_an_evicted_submission_to_the_queue(
     # an actual validator claim all agree.
     async with retry_maker() as session:
         assert await agent_is_admitted(
-            session, bench_version=DEFAULT_BENCH_VERSION, agent_id=agent_id
+            session, bench_version=_BENCH_VERSION, agent_id=agent_id
         )
     triage = await client.get("/api/v1/admin/validation-retries", headers=_HEADERS)
     assert any(row["agent_id"] == str(agent_id) for row in triage.json()["submissions"])
@@ -1128,7 +1228,7 @@ async def test_reinstatement_returns_an_evicted_submission_to_the_queue(
             validator_hotkey="validator-0",
             now=datetime.now(UTC) + timedelta(minutes=5),
             ttl=timedelta(minutes=90),
-            bench_version=DEFAULT_BENCH_VERSION,
+            bench_version=_BENCH_VERSION,
         )
     assert reissued is not None and reissued.agent_id == agent_id
 
@@ -1340,7 +1440,7 @@ async def test_reinstatement_refuses_a_withdrawal_and_a_closed_benchmark_era(
 
     # An eviction taken in a superseded era: the queue has moved on, so there is
     # nothing to come back to.
-    old_era = DEFAULT_BENCH_VERSION - 1
+    old_era = _BENCH_VERSION - 1
     stale = await _seed(
         retry_maker, ticket_count=0, bench_version=old_era, miner_hotkey="5StaleMiner"
     )
@@ -1350,7 +1450,7 @@ async def test_reinstatement_refuses_a_withdrawal_and_a_closed_benchmark_era(
     assert body["reinstatement_allowed"] is False
     assert body["reinstatement_blocking_reason"] == (
         f"benchmark era v{old_era} is no longer active "
-        f"(the queue is now serving v{DEFAULT_BENCH_VERSION})"
+        f"(the queue is now serving v{_BENCH_VERSION})"
     )
     closed = await _reinstate(client, stale)
     assert closed.status_code == 409
@@ -1392,7 +1492,7 @@ async def test_reinstatement_cannot_launder_the_retry_budget(
                 reason="Prior validator infrastructure recovery",
                 expected_snapshot="a" * 64,
                 score_count=0,
-                bench_version=DEFAULT_BENCH_VERSION,
+                bench_version=_BENCH_VERSION,
                 ticket_snapshot=[],
                 granted_validator_hotkeys=["validator-0"],
                 created_at=_T0,
@@ -1479,13 +1579,13 @@ async def test_triage_tells_a_silent_expiry_apart_from_a_reported_failure(
     agent_id = await _seed(retry_maker, ticket_count=3)
     async with retry_maker() as session, session.begin():
         reported = await session.get(
-            ValidatorTicket, (agent_id, DEFAULT_BENCH_VERSION, "validator-0")
+            ValidatorTicket, (agent_id, _BENCH_VERSION, "validator-0")
         )
         assert reported is not None
         reported.failure_reason = "scoring_error"
         reported.failed_at = reported.issued_at + timedelta(minutes=5)
         superseded = await session.get(
-            ValidatorTicket, (agent_id, DEFAULT_BENCH_VERSION, "validator-1")
+            ValidatorTicket, (agent_id, _BENCH_VERSION, "validator-1")
         )
         assert superseded is not None
         # A failure kept from a lease that has since been re-leased is history,
@@ -1529,7 +1629,7 @@ async def test_replace_one_validators_score_and_reissue_same_ticket(
         assert agent is not None
         agent.status = AgentStatus.SCORED
         ticket = await session.get(
-            ValidatorTicket, (agent_id, DEFAULT_BENCH_VERSION, "validator-1")
+            ValidatorTicket, (agent_id, _BENCH_VERSION, "validator-1")
         )
         assert ticket is not None
         ticket.purpose = TicketPurpose.CONTINUAL_RETEST
@@ -1572,7 +1672,7 @@ async def test_replace_one_validators_score_and_reissue_same_ticket(
             ).all()
         )
         ticket = await session.get(
-            ValidatorTicket, (agent_id, DEFAULT_BENCH_VERSION, "validator-1")
+            ValidatorTicket, (agent_id, _BENCH_VERSION, "validator-1")
         )
         audit = await session.scalar(
             select(ScoreAuditEntry).where(
@@ -1594,7 +1694,7 @@ async def test_replace_one_validators_score_and_reissue_same_ticket(
     assert audit.payload["reason"] == payload["reason"]
     assert audit.payload["run_id"] == "run-1"
     assert audit.payload["preserved_score"]["composite"] == 0.7
-    assert audit.payload["preserved_score"]["bench_version"] == (DEFAULT_BENCH_VERSION)
+    assert audit.payload["preserved_score"]["bench_version"] == (_BENCH_VERSION)
 
     pending = await client.get(
         f"/api/v1/admin/validation-retries/{agent_id}/validators/validator-1",
@@ -1617,7 +1717,7 @@ async def test_replace_one_validators_score_and_reissue_same_ticket(
     assert release.json()["status"] == "scored"
     async with retry_maker() as session:
         ticket = await session.get(
-            ValidatorTicket, (agent_id, DEFAULT_BENCH_VERSION, "validator-1")
+            ValidatorTicket, (agent_id, _BENCH_VERSION, "validator-1")
         )
         released = await session.scalar(
             select(ScoreAuditEntry).where(
@@ -1656,7 +1756,7 @@ async def test_replace_score_fails_closed_on_run_change_or_busy_validator(
     async with retry_maker() as session, session.begin():
         other = await session.get(
             ValidatorTicket,
-            (other_agent_id, DEFAULT_BENCH_VERSION, "validator-0"),
+            (other_agent_id, _BENCH_VERSION, "validator-0"),
         )
         assert other is not None
         other.status = TicketStatus.ISSUED
@@ -1717,7 +1817,7 @@ async def test_score_outliers_cover_only_the_active_benchmark_era(
         retry_maker,
         score_count=3,
         composites=[0.14, 0.79, 0.82],
-        bench_version=DEFAULT_BENCH_VERSION - 1,
+        bench_version=_BENCH_VERSION - 1,
     )
     async with retry_maker() as session, session.begin():
         for agent_id in (current_id, previous_id):
@@ -1729,7 +1829,7 @@ async def test_score_outliers_cover_only_the_active_benchmark_era(
     response = await client.get("/api/v1/admin/score-outliers", headers=_HEADERS)
     assert response.status_code == 200, response.text
     body = response.json()
-    assert body["bench_version"] == DEFAULT_BENCH_VERSION
+    assert body["bench_version"] == _BENCH_VERSION
     assert [item["agent_id"] for item in body["items"]] == [str(current_id)]
     assert body["count"] == 1
 
@@ -1842,7 +1942,7 @@ async def _seed_capable_heartbeat(
                     "executor_isolation": "privileged_dind",
                     "scorer_benchmarks": {
                         "status": "fresh_verified",
-                        "supported_bench_versions": [DEFAULT_BENCH_VERSION],
+                        "supported_bench_versions": [_BENCH_VERSION],
                         "observed_at": int(now.timestamp()),
                         "software_version": "1.3.0",
                         "source_revision": revision,
@@ -1873,7 +1973,7 @@ async def test_bulk_outlier_queue_waits_behind_validator_and_promotes_serially(
             agent.status = AgentStatus.SCORED
         busy = await session.get(
             ValidatorTicket,
-            (busy_agent, DEFAULT_BENCH_VERSION, "validator-0"),
+            (busy_agent, _BENCH_VERSION, "validator-0"),
         )
         assert busy is not None
         busy.status = TicketStatus.ISSUED
@@ -1908,7 +2008,7 @@ async def test_bulk_outlier_queue_waits_behind_validator_and_promotes_serially(
     async with retry_maker() as session, session.begin():
         busy = await session.get(
             ValidatorTicket,
-            (busy_agent, DEFAULT_BENCH_VERSION, "validator-0"),
+            (busy_agent, _BENCH_VERSION, "validator-0"),
         )
         assert busy is not None
         busy.status = TicketStatus.SCORED
@@ -1916,7 +2016,7 @@ async def test_bulk_outlier_queue_waits_behind_validator_and_promotes_serially(
             session,
             validator_hotkey="validator-0",
             now=datetime.now(UTC),
-            supports_version=lambda version: version == DEFAULT_BENCH_VERSION,
+            supports_version=lambda version: version == _BENCH_VERSION,
         )
         assert promoted is not None and promoted.agent_id == first
         first_request = await session.scalar(
@@ -1941,7 +2041,7 @@ async def test_bulk_outlier_queue_waits_behind_validator_and_promotes_serially(
             session,
             validator_hotkey="validator-0",
             now=datetime.now(UTC),
-            supports_version=lambda version: version == DEFAULT_BENCH_VERSION,
+            supports_version=lambda version: version == _BENCH_VERSION,
         )
         assert next_ticket is not None and next_ticket.agent_id == second
         queued_count = len(
@@ -1968,7 +2068,7 @@ async def _seed_states(
     tickets: list[tuple[str, TicketStatus, int, datetime | None]],
     created_offset_hours: float = 24.0,
     agent_status: AgentStatus = AgentStatus.EVALUATING,
-    bench_version: int = DEFAULT_BENCH_VERSION,
+    bench_version: int = _BENCH_VERSION,
 ) -> UUID:
     """Seed one agent with explicit (hotkey, status, attempt_count, retry_after)
     tickets; a SCORED ticket gets a matching score row."""
@@ -2276,7 +2376,7 @@ async def test_infra_grant_lifts_a_would_be_exhausted_ticket(
                 status=TicketStatus.EXPIRED,
                 issued_at=_T0 - timedelta(hours=3),
                 deadline=_T0 - timedelta(hours=2),
-                bench_version=DEFAULT_BENCH_VERSION,
+                bench_version=_BENCH_VERSION,
                 attempt_count=2,
                 manual_retry_grants=0,
                 infra_retry_grants=1,

@@ -29,6 +29,12 @@ from ditto.db.queries.screening import (
 )
 
 _SCREENER = "5GScreenerHotkeyForClaimTests000000000000000000000"
+# The era that has activated, and the one a rollout would be collecting toward.
+# Screening only cares that an agent holds a dataset for whichever era is
+# authoritative, so these were the arbitrary v4 and v6. The floor pins them to
+# real ones: nothing at or below v6 can be a rollout target any more.
+_ACTIVE_VERSION = 7
+_DESIRED_VERSION = 8
 
 
 async def _seed_failed_agent(session: AsyncSession) -> Agent:
@@ -653,14 +659,21 @@ async def test_appealed_agent_in_screening_failed_is_claimable(session: AsyncSes
     assert refreshed.status == AgentStatus.SCREENING
 
 
-async def _activate_v4(session: AsyncSession) -> None:
+async def _activate_current_era(session: AsyncSession) -> None:
+    """The durable authority: the era screening asks agents to hold a dataset for.
+
+    Nothing below is about a particular benchmark -- these tests ask whether a
+    stuck EVALUATING agent is re-claimed -- so the transition used to be the
+    arbitrary v2 -> v4. ``benchmark_rollout_desired_floor`` refuses a rollout
+    aimed under MIN_SCOREABLE_BENCH_VERSION now, so it is the real v6 -> v7 one.
+    """
     now = datetime.now(UTC)
     async with session.begin():
         session.add(
             BenchmarkRollout(
                 rollout_id=uuid4(),
-                from_version=2,
-                desired_version=4,
+                from_version=_ACTIVE_VERSION - 1,
+                desired_version=_ACTIVE_VERSION,
                 status="activated",
                 cohort_size=5,
                 created_at=now - timedelta(hours=1),
@@ -681,11 +694,11 @@ def _complete_screened_image(agent: Agent) -> None:
 async def test_evaluating_agent_missing_screened_image_is_reclaimed(
     session: AsyncSession,
 ) -> None:
-    # v4 (which requires a screened image) is active. An agent released from an
+    # v7 (which requires a screened image) is active. An agent released from an
     # anti-cheat quarantine back to EVALUATING on the current policy, but whose
     # screened image was never uploaded+verified, is otherwise stuck forever:
     # validators skip it and nothing re-screens it. It must be re-claimed.
-    await _activate_v4(session)
+    await _activate_current_era(session)
     agent = Agent(
         agent_id=uuid4(),
         miner_hotkey="5HK-no-image",
@@ -740,7 +753,7 @@ async def test_evaluating_agent_with_complete_prereqs_is_not_reclaimed(
     # The mirror: a current-policy EVALUATING agent that HAS a complete screened
     # image and the active-version dataset needs no re-screen — it must not be
     # dragged back through screening by either predicate.
-    await _activate_v4(session)
+    await _activate_current_era(session)
     agent = Agent(
         agent_id=uuid4(),
         miner_hotkey="5HK-complete",
@@ -755,7 +768,7 @@ async def test_evaluating_agent_with_complete_prereqs_is_not_reclaimed(
         session.add(
             BenchmarkDataset(
                 agent_id=agent.agent_id,
-                bench_version=4,
+                bench_version=_ACTIVE_VERSION,
                 seed=7,
                 sha256="ef" * 32,
                 run_size="full",
@@ -772,16 +785,17 @@ async def test_evaluating_agent_with_complete_prereqs_is_not_reclaimed(
 async def test_effective_rollout_authority_dataset_is_not_reclaimed(
     session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # The rollout start guard can make v6 the effective authority while the
-    # durable activated row remains v4. Backroom and ticketing correctly report
-    # v6 in that state; screening must use the same authority instead of asking
-    # this already-complete agent for an obsolete v4 dataset.
-    await _activate_v4(session)
+    # The rollout start guard can make the DESIRED version the effective
+    # authority while the durable activated row still names the active one.
+    # Backroom and ticketing correctly report v8 in that state; screening must
+    # use the same authority instead of asking this already-complete agent for
+    # an obsolete v7 dataset.
+    await _activate_current_era(session)
     now = datetime.now(UTC)
     agent = Agent(
         agent_id=uuid4(),
-        miner_hotkey="5HK-effective-v6",
-        name="effective-v6-complete",
+        miner_hotkey="5HK-effective-desired",
+        name="effective-desired-complete",
         sha256=uuid4().hex * 2,
         status=AgentStatus.EVALUATING,
         created_at=now - timedelta(days=1),
@@ -792,8 +806,8 @@ async def test_effective_rollout_authority_dataset_is_not_reclaimed(
         session.add(
             BenchmarkRollout(
                 rollout_id=uuid4(),
-                from_version=4,
-                desired_version=6,
+                from_version=_ACTIVE_VERSION,
+                desired_version=_DESIRED_VERSION,
                 status="collecting",
                 cohort_size=5,
                 created_at=now - timedelta(minutes=5),
@@ -803,7 +817,7 @@ async def test_effective_rollout_authority_dataset_is_not_reclaimed(
         session.add(
             BenchmarkDataset(
                 agent_id=agent.agent_id,
-                bench_version=6,
+                bench_version=_DESIRED_VERSION,
                 seed=7,
                 sha256="ef" * 32,
                 run_size="full",
@@ -812,10 +826,12 @@ async def test_effective_rollout_authority_dataset_is_not_reclaimed(
             )
         )
 
-    async def effective_v6(_session: AsyncSession) -> int:
-        return 6
+    async def effective_desired(_session: AsyncSession) -> int:
+        return _DESIRED_VERSION
 
-    monkeypatch.setattr("ditto.db.queries.screening.active_bench_version", effective_v6)
+    monkeypatch.setattr(
+        "ditto.db.queries.screening.active_bench_version", effective_desired
+    )
 
     claimed = await _claim(session)
 

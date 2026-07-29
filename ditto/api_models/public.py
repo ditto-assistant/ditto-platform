@@ -15,6 +15,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from ditto.api_models.benchmark_capacity import BenchmarkAdmission
 from ditto.api_models.benchmark_progress import BenchmarkProgressStage
 from ditto.api_models.retry_state import RetryState
 from ditto.api_models.screener import ScreenerProgressStage, ScreenerRuntimeState
@@ -212,6 +213,34 @@ class PublicTokenUsage(BaseModel):
     usage_unavailable: Annotated[int, Field(ge=0)]
     provider_latency_ms: Annotated[int, Field(ge=0)]
     ttft_status: str
+
+
+class PublicModelUse(BaseModel):
+    """Whether a scored run actually used the language model, and why.
+
+    Published to every miner. Deliberately an allowlist of counts, ratios and
+    the verdict -- no prompts, no completions, no case content, no source.
+    Nothing here can be inverted toward another miner's implementation, which
+    is what makes across-the-board observability compatible with the anti-copy
+    posture in ditto-platform#375.
+
+    The thresholds ride along with the verdict on purpose: a miner must be able
+    to read the bar off the same payload that reports their standing against
+    it, so the published rule and the enforced rule can never drift.
+    """
+
+    verdict: Annotated[str, Field(pattern=r"^(unmeasured|used|not_used)$")]
+    calls: Annotated[int | None, Field(default=None, ge=0)]
+    prompt_tokens: Annotated[int | None, Field(default=None, ge=0)]
+    completion_tokens: Annotated[int | None, Field(default=None, ge=0)]
+    cases: Annotated[int | None, Field(default=None, ge=0)]
+    prompt_tokens_per_case: Annotated[float | None, Field(default=None, ge=0.0)]
+    calls_per_case: Annotated[float | None, Field(default=None, ge=0.0)]
+    prompt_tokens_per_call: Annotated[float | None, Field(default=None, ge=0.0)]
+    reason: str | None = None
+    min_prompt_tokens_per_case: Annotated[float | None, Field(default=None, ge=0.0)]
+    min_calls_per_case: Annotated[float | None, Field(default=None, ge=0.0)]
+    min_prompt_tokens_per_call: Annotated[float | None, Field(default=None, ge=0.0)]
 
 
 class PublicTokenEfficiency(BaseModel):
@@ -741,6 +770,16 @@ class PublicLeaderboardEntry(BaseModel):
     token_usage: Annotated[
         PublicTokenUsage | None,
         Field(default=None, description="Validator-proxy token accounting."),
+    ] = None
+    model_use: Annotated[
+        PublicModelUse | None,
+        Field(
+            default=None,
+            description=(
+                "Whether this run actually used the language model, with the "
+                "measured ratios and the published thresholds behind the verdict."
+            ),
+        ),
     ] = None
     token_efficiency: Annotated[
         PublicTokenEfficiency | None,
@@ -1337,6 +1376,7 @@ class PublicValidatorScore(BaseModel):
         Field(default=None, ge=0.0, le=1.0, description="Pre-token composite."),
     ] = None
     token_usage: PublicTokenUsage | None = None
+    model_use: PublicModelUse | None = None
     token_efficiency: PublicTokenEfficiency | None = None
     composite_breakdown: PublicCompositeBreakdown | None = None
     median_ms: Annotated[int, Field(ge=0, description="Median per-case latency (ms).")]
@@ -1741,7 +1781,13 @@ class PublicActivityEntry(BaseModel):
         ),
     ]
     validator_queue_gate: Annotated[
-        Literal["previous_generation", "owner_serialized", "not_leasable"] | None,
+        Literal[
+            "previous_generation",
+            "owner_serialized",
+            "similarity_serialized",
+            "not_leasable",
+        ]
+        | None,
         Field(
             default=None,
             description=(
@@ -1754,6 +1800,11 @@ class PublicActivityEntry(BaseModel):
                 "hotkeys does not buy a second slot, though a validator that "
                 "finds nothing else eligible anywhere may still lease it rather "
                 "than idle, up to the operator's per-owner limit; "
+                "'similarity_serialized' means a near-identical submission is "
+                "already using this one's share of fleet capacity, whichever "
+                "key paid for it -- a queue-fairness wait and nothing more, "
+                "carrying no claim that either submission is illegitimate, and "
+                "it clears on its own when the other lease ends; "
                 "'not_leasable' means the allocator's candidate filter excludes "
                 "it (no versioned dataset, no eligible screened image, "
                 "withdrawn, not admitted to this era, or every quorum slot "
@@ -1761,6 +1812,23 @@ class PublicActivityEntry(BaseModel):
             ),
         ),
     ]
+    validator_queue_gate_detail: Annotated[
+        str | None,
+        Field(
+            default=None,
+            description=(
+                "Human-readable evidence behind validator_queue_gate, or null "
+                "when the reason code says everything. Populated for "
+                "'similarity_serialized', which is the one gate a miner cannot "
+                "reconstruct from their own submission: it names the "
+                "near-identical submissions currently holding the shared "
+                "concurrency budget and the measured overlap that grouped them, "
+                "so the wait is checkable rather than mysterious. It is a "
+                "capacity statement and carries no claim about the legitimacy "
+                "of any submission named in it."
+            ),
+        ),
+    ] = None
     previous_generation: Annotated[
         bool,
         Field(
@@ -1992,6 +2060,7 @@ class PublicProvisionalScore(BaseModel):
         Field(default=None, ge=0.0, le=1.0, description="Pre-efficiency v5 score."),
     ] = None
     token_usage: PublicTokenUsage | None = None
+    model_use: PublicModelUse | None = None
     token_efficiency: PublicTokenEfficiency | None = None
     composite_breakdown: PublicCompositeBreakdown | None = None
     seed: Annotated[
@@ -2135,10 +2204,51 @@ class PublicSubmissionPipeline(BaseModel):
             le=1.0,
             description=(
                 "Current finalized fifth-place score used for safe continuation "
-                "after two scores; 0 when fewer than five ranked miners exist."
+                "after two scores; 0 when fewer than five ranked miners exist.\n\n"
+                "This is the fifth-highest finalized ``official_composite`` in "
+                "``active_bench_version`` -- the same score, in the same order, "
+                "that the public leaderboard's ``rank`` and the validator "
+                "weight fold read, so it IS the score of the finalized row the "
+                "board ranks fifth. ``score_floor_agent_id`` names that row. "
+                "(The board interleaves pre-quorum provisional entries, which "
+                "hold no floor, so the fifth row *displayed* need not be the "
+                "fifth finalized one.)"
             ),
         ),
     ]
+    score_floor_agent_id: Annotated[
+        UUID | None,
+        Field(
+            default=None,
+            description=(
+                "The agent whose ``official_composite`` IS ``score_floor``, so the "
+                "quoted number can be checked against "
+                "/public/agent/{id}/scores. Null when the era has fewer than "
+                "five ranked agents and no floor applies."
+            ),
+        ),
+    ] = None
+    score_floor_agent_name: Annotated[
+        str | None,
+        Field(
+            default=None,
+            description=(
+                "Human-friendly name of the agent holding ``score_floor``. Null "
+                "whenever ``score_floor_agent_id`` is null."
+            ),
+        ),
+    ] = None
+    score_floor_agent_version: Annotated[
+        int | None,
+        Field(
+            default=None,
+            ge=1,
+            description=(
+                "Submission version of the agent holding ``score_floor``; null "
+                "for a legacy upload with no version, or when no floor applies."
+            ),
+        ),
+    ] = None
     provisional_scores: list[PublicProvisionalScore] = Field(default_factory=list)
     confirmation_scores: list[PublicConfirmationScore] = Field(default_factory=list)
     final_composite: Annotated[
@@ -2524,6 +2634,38 @@ class PublicOrphanedSlot(BaseModel):
     ]
 
 
+class PublicValidatorSlotPolicy(BaseModel):
+    """The operator slot policy ticket dispatch is applying to the fleet.
+
+    Reported alongside the heartbeats so a fleet view can say why a validator
+    advertising eight slots is only ever handed six, instead of presenting
+    advertised capacity as if it were available capacity.
+    """
+
+    max_concurrent_slots: Annotated[
+        int,
+        Field(
+            ge=1,
+            le=8,
+            description=(
+                "Most benchmark slots the platform will hold live tickets on for "
+                "any ONE validator, whatever it advertises."
+            ),
+        ),
+    ]
+    disk_percent_ceiling: Annotated[
+        int,
+        Field(
+            ge=50,
+            le=100,
+            description=(
+                "Host disk utilization at or above which a validator is held to a "
+                "single slot until a fresh heartbeat reports headroom."
+            ),
+        ),
+    ]
+
+
 class PublicValidatorHeartbeat(BaseModel):
     """Latest signed software report from one permitted validator."""
 
@@ -2540,8 +2682,21 @@ class PublicValidatorHeartbeat(BaseModel):
     active_agent_id: UUID | None = None
     active_benchmark: PublicBenchmarkProgress | None = None
     configured_slots: Annotated[int, Field(ge=1, le=8)] = 1
+    allowed_slots: Annotated[
+        int,
+        Field(
+            ge=0,
+            le=8,
+            description=(
+                "How many of the advertised slots dispatch will actually fund "
+                "right now: the operator cap narrowing `configured_slots`, "
+                "clamped to one while this validator's disk ceiling is tripped. "
+                "Advertised capacity above this never receives a ticket."
+            ),
+        ),
+    ] = 1
     healthy_slots: list[str] = Field(default_factory=lambda: ["slot-0"])
-    admission: Literal["accepting", "draining", "paused"] = "accepting"
+    admission: BenchmarkAdmission = "accepting"
     active_benchmarks: list[PublicBenchmarkProgress] = Field(default_factory=list)
     assigned_benchmarks: list[PublicBenchmarkProgress] = Field(default_factory=list)
     orphaned_slots: Annotated[
@@ -2623,6 +2778,10 @@ class PublicValidatorHeartbeatsResponse(BaseModel):
     # is readable on its own: a client polling only this route can say which
     # benchmark a validator is being judged against.
     active_bench_version: Annotated[int, Field(ge=1)]
+    # Fleet-wide, so a reader can tell an idle slot ("nothing to run") from a
+    # slot the operator has capped ("nothing will be run here") without
+    # reimplementing the policy from the per-validator numbers.
+    slot_policy: PublicValidatorSlotPolicy
     reported_count: Annotated[int, Field(ge=0)]
     online_count: Annotated[int, Field(ge=0)]
     validators: list[PublicValidatorHeartbeat] = Field(default_factory=list)
