@@ -104,7 +104,7 @@ async def _seed(
                 bench_version=_BENCH,
                 seed=1,
                 sha256="cd" * 32,
-                run_size="small",
+                run_size="full",
             )
         )
         session.add(
