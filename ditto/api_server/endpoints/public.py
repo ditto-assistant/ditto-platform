@@ -1046,7 +1046,9 @@ def _stack_component_issues(stack_health: ValidatorStackHealth | None) -> list[s
         f"{name}: {component.health}"
         for name in type(stack_health).model_fields
         for component in (getattr(stack_health, name),)
-        if component.required and component.health in _STACK_HEALTH_WARNING_STATES
+        if component is not None
+        and component.required
+        and component.health in _STACK_HEALTH_WARNING_STATES
     ]
 
 

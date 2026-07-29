@@ -304,8 +304,14 @@ def test_scorer_benchmark_capability_is_conservative_unless_fresh_verified() -> 
         status="legacy_v2", supported_bench_versions=(2,)
     )
     assert legacy.supported_bench_versions == (2,)
+    unavailable = ScorerBenchmarkCapability(
+        status="unreachable", supported_bench_versions=()
+    )
+    assert unavailable.supported_bench_versions == ()
 
-    with pytest.raises(ValueError, match="may advertise only benchmark v2"):
+    with pytest.raises(
+        ValueError, match="may advertise no work or legacy benchmark v2"
+    ):
         ScorerBenchmarkCapability(
             status="identity_mismatch", supported_bench_versions=(2, 3)
         )
