@@ -2600,7 +2600,7 @@
             <th scope="col" class="sortable" data-sort="name"><span class="tip" tabindex="0" data-tooltip="The miner's best-scoring agent, with its current SN118 UID and on-chain hotkey below. Open either identity for details, or copy the hotkey.">Best-scoring agent</span><span class="sarrow" aria-hidden="true">▲</span></th>
             <th scope="col" style="width:128px"><span class="tip" id="emissions-col-tip" tabindex="0" data-tooltip="Current KOTH role. The incumbent champion takes a fixed share of the miner pool; a participation tail splits the remainder.">Emissions</span></th>
             <th scope="col" class="hide-md sortable" data-sort="bench" style="width:180px"><span class="tip" tabindex="0" data-tooltip="The model the harness was scored on (Qwen3-32B, locked for every run) and the benchmark version the run was scored under. Sort to group runs by benchmark version.">Model</span><span class="sarrow" aria-hidden="true">▲</span></th>
-            <th scope="col" style="width:230px" class="sortable" data-sort="composite"><span class="tip" tabindex="0" data-tooltip="Current leaderboard score in [0,1]. It starts as the median of the first three accepted validator scores. After each full top-five cohort wave completes, it becomes the arithmetic mean of those original three scores plus one aggregate per completed wave, so continual retests can move it up or down. Partial waves never count.">Current score</span><span class="sarrow" aria-hidden="true">▲</span></th>
+            <th scope="col" style="width:230px" class="sortable" data-sort="composite"><span class="tip" tabindex="0" data-tooltip="Current leaderboard score in [0,1]. It starts as the median of the first three accepted validator scores. After each full top-five cohort wave completes, it becomes the arithmetic mean of those original three scores plus one aggregate per eligible shared wave, so continual retests can move it up or down. Retained confirmation seeds stay in the append-only audit ledger even when the current cohort cannot aggregate them.">Current score</span><span class="sarrow" aria-hidden="true">▲</span></th>
             <th scope="col" class="hide-sm sortable" data-sort="tool" style="width:140px"><span class="tip" tabindex="0" data-tooltip="Mean score across the tool-use cases. Did the agent call the right tools, ground its arguments, and choose memory versus the web correctly?">Tool</span><span class="sarrow" aria-hidden="true">▲</span></th>
             <th scope="col" class="hide-sm sortable" data-sort="memory" style="width:140px"><span class="tip" tabindex="0" data-tooltip="Memory subscore, not the overall composite used for rank. It is the mean across memory cases: did the agent recall and reason over stored facts across sessions, over time, and while resisting injected instructions?">Memory</span><span class="sarrow" aria-hidden="true">▲</span></th>
             <th scope="col" class="num hide-sm sortable" data-sort="latency" style="width:96px"><span class="tip" tabindex="0" data-tooltip="Median per-case response time for the run, and how many cases were scored (a full benchmark is ~114 cases).">Latency</span><span class="sarrow" aria-hidden="true">▲</span></th>
@@ -5387,12 +5387,17 @@
           esc(pending + (pending === 1 ? " retest seed" : " retest seeds") + " · wave pending") + '</span>';
       }
       var waves = Number(e.completed_wave_count) || 0;
+      var retained = Number(e.confirmation_seed_depth) || 0;
+      var excluded = Math.max(0, retained - waves);
       var samples = Number(e.aggregate_sample_count) || (3 + waves);
       var title = "Current leaderboard score: arithmetic mean of the original three validator scores plus " +
-        waves + " completed cohort " + (waves === 1 ? "wave" : "waves") +
-        ". Partial waves do not count.";
+        waves + " aggregate-eligible shared " + (waves === 1 ? "wave" : "waves") +
+        ". The append-only audit ledger retains " + retained + " confirmation " +
+        (retained === 1 ? "seed" : "seeds") + "; " + excluded + " are not currently fold-eligible.";
       return '<span class="rollout-chip settled tip" tabindex="0" data-tooltip="' + esc(title) + '">' +
-        esc(samples + "-sample mean · " + waves + (waves === 1 ? " wave" : " waves")) + '</span>';
+        esc(samples + "-sample mean · " + waves + " eligible shared " +
+          (waves === 1 ? "wave" : "waves") + " · " + retained + " retained " +
+          (retained === 1 ? "seed" : "seeds")) + '</span>';
     }
     // Why the composite is not simply the tool/memory average: the base IS that
     // average (½·tool + ½·memory), and the benchmark quality gates (chiefly the
@@ -7155,6 +7160,8 @@
         Number(boardEntry && boardEntry.confirmation_seed_depth) || 0,
         pendingSeeds.length
       );
+      var aggregateDepth = Number(boardEntry && boardEntry.completed_wave_count) || 0;
+      var excludedDepth = Math.max(0, pendingDepth - aggregateDepth);
       if (
         !completedWaves.length && !pendingDepth &&
         !counts.running && !counts.assigned && !counts.expired
@@ -7168,7 +7175,7 @@
           '<div><span class="accepted-score-value">' + fx(score) + '</span>' +
             '<span class="accepted-score-label"><span class="bench-version-badge">' +
               esc(benchmarkVersionLabel(benchmarkVersionKey(activeVersion))) +
-            '</span>Completed cohort wave ' + esc(index + 1) + ' · consensus aggregate</span></div>' +
+            '</span>Aggregate-eligible shared wave ' + esc(index + 1) + ' · consensus aggregate</span></div>' +
         '</div>';
       }).join("");
       var pendingRows = completedWaves.length ? "" : pendingSeeds.map(function (score, index) {
@@ -7182,8 +7189,11 @@
       var aggregate = boardEntry && boardEntry.aggregate_method === "continual_mean"
         ? '<p class="accepted-score-final">Current leaderboard score: ' + fx(boardEntry.official_composite) +
           ' · arithmetic mean of the initial three scores plus ' + esc(boardEntry.completed_wave_count) +
-          ' completed cohort ' + (boardEntry.completed_wave_count === 1 ? "wave" : "waves") +
-          ' (' + esc(boardEntry.aggregate_sample_count) + ' samples total).</p>'
+          ' aggregate-eligible shared ' + (boardEntry.completed_wave_count === 1 ? "wave" : "waves") +
+          ' (' + esc(boardEntry.aggregate_sample_count) + ' samples total). ' + esc(pendingDepth) +
+          ' retained confirmation ' + (pendingDepth === 1 ? 'seed remains' : 'seeds remain') +
+          ' in the append-only audit ledger; ' + esc(excludedDepth) +
+          ' are not currently fold-eligible.</p>'
         : completedWaves.length
         ? '<p class="accepted-score-note">' + esc(completedWaves.length) + ' full cohort ' +
           (completedWaves.length === 1 ? 'wave is' : 'waves are') +
@@ -7199,7 +7209,7 @@
         '</div>' +
         aggregate +
         '<p class="accepted-score-note">The initial quorum remains immutable provenance. The current leaderboard score continually adjusts up or down as full cohort waves complete.</p>' +
-        '<p class="accepted-score-note">Only completed cohort-wave aggregates are shown here. Partial, legacy, and superseded raw retest rows remain in the audit ledger but are omitted from the score list.</p>' +
+        '<p class="accepted-score-note">Only aggregate-eligible shared-wave averages are shown here. Partial, legacy, and superseded confirmation seeds remain in the append-only audit ledger but are omitted from the score list.</p>' +
         (rows
           ? '<div class="accepted-score-list">' + rows + '</div>'
           : pendingRows

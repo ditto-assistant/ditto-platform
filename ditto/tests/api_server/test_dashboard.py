@@ -332,9 +332,13 @@ class TestDashboard:
         assert 'retestState(retests.assigned, "assigned")' in body
         assert "function renderConfirmationScores(pipeline)" in body
         assert "Continual top-five retests" in body
-        assert "Completed cohort wave" in body
-        assert "Only completed cohort-wave aggregates are shown here" in body
-        assert "Partial, legacy, and superseded raw retest rows" in body
+        assert "Aggregate-eligible shared wave" in body
+        assert "eligible shared " in body
+        assert "retained confirmation " in body
+        assert "retained " in body
+        assert "are not currently fold-eligible" in body
+        assert "Only aggregate-eligible shared-wave averages are shown here" in body
+        assert "Partial, legacy, and superseded confirmation seeds" in body
         assert "Accepted shared seed" not in body
         assert "function confirmationCohorts(pipeline)" not in body
         assert "Accepted validator scores" in body
