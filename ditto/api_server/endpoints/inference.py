@@ -101,6 +101,7 @@ _PROXY_MAX_AGE = timedelta(seconds=30)
 _EMBEDDING_MAX_INPUTS = 256
 _PPLX_EMBED_CONTRACT_MODEL = "perplexity/pplx-embed-v1-0.6b"
 _PPLX_EMBED_RESPONSE_MODEL = "pplx-embed-v1-0.6b"
+_HOSTED_EMBEDDING_BENCH_VERSIONS = frozenset({7, 8})
 _PROVIDER_MAX_ATTEMPTS = 3
 _PROVIDER_RETRY_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
 
@@ -1476,7 +1477,7 @@ async def proxy_embeddings(
         grant = await session.get(InferenceGrant, x_ditto_grant)
         if (
             grant is None
-            or grant.bench_version != 7
+            or grant.bench_version not in _HOSTED_EMBEDDING_BENCH_VERSIONS
             or grant.broker_public_key is None
             or grant.generation != x_ditto_generation
             or grant.embedding_model != config.embedding_model
