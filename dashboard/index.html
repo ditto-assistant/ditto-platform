@@ -643,6 +643,9 @@
     .stage.good { color: var(--good); border-color: color-mix(in oklab, var(--good) 38%, transparent); background: color-mix(in oklab, var(--good) 10%, transparent); }
     .stage.warn { color: var(--warn); border-color: color-mix(in oklab, var(--warn) 40%, transparent); background: color-mix(in oklab, var(--warn) 10%, transparent); }
     .stage.bad { color: var(--danger); border-color: color-mix(in oklab, var(--danger) 40%, transparent); background: color-mix(in oklab, var(--danger) 10%, transparent); }
+    /* A capped slot is a deliberate operator setting, not a fault: dimmer than
+       idle so it reads as "switched off", never as an alert. */
+    .stage.capped { border-style: dashed; opacity: .7; }
     .stage-cell { min-width: 230px; }
     .stage-note { display: block; margin-top: 6px; max-width: 54ch; color: var(--text-dim); font-size: 11.5px; line-height: 1.45; overflow-wrap: anywhere; }
     .stage-note b { color: var(--text); font-weight: 650; }
@@ -7762,6 +7765,70 @@
         entityAnchor("agent", orphan.agent_id, agent) + '</span>';
     }
 
+    // Slots the operator cap will not hand a ticket to, keyed by slot id.
+    //
+    // A validator advertises its own capacity; `allowed_slots` is how much of it
+    // the platform funds. Rendering the difference as "Idle" claimed capacity no
+    // ticket would ever reach — a validator advertising eight under a cap of six
+    // read as six idle slots plus two more going spare.
+    //
+    // The cap counts concurrent LEASES, not slot ordinals, so this charges the
+    // running slots first and marks the leftover idle ones from the highest
+    // ordinal down. Live work is never marked: lowering the cap costs the fleet
+    // new leases only, never one already in flight. An unhealthy slot is left
+    // alone as well — it has its own state, and it is not the cap that is
+    // keeping work off it.
+    function cappedSlotIds(entry) {
+      var allowed = Number(entry.allowed_slots);
+      // A payload without the field predates it; saying nothing beats guessing.
+      if (!isFinite(allowed)) return {};
+      var busy = {};
+      [entry.active_benchmarks || [], entry.assigned_benchmarks || []].forEach(function (list) {
+        list.forEach(function (benchmark) {
+          if (benchmark && benchmark.slot_id) busy[benchmark.slot_id] = true;
+        });
+      });
+      var healthy = {};
+      (entry.healthy_slots || []).forEach(function (slotId) {
+        if (slotId) healthy[slotId] = true;
+      });
+      var budget = Math.max(0, allowed - Object.keys(busy).length);
+      var capped = {};
+      validatorSlotIds(entry).forEach(function (slotId) {
+        if (busy[slotId] || !healthy[slotId]) return;
+        if (budget > 0) {
+          budget -= 1;
+          return;
+        }
+        capped[slotId] = true;
+      });
+      return capped;
+    }
+
+    // Slots that can take work right now: the operator cap and the validator's
+    // own health, whichever binds first. Shown as the numerator so the fleet
+    // table stops reporting advertised capacity as if it were available.
+    function fundedSlotCount(entry) {
+      var healthy = (entry.healthy_slots || []).length;
+      var allowed = Number(entry.allowed_slots);
+      return isFinite(allowed) ? Math.min(allowed, healthy) : healthy;
+    }
+
+    // Why the numerator is what it is, spelled out for the cell's tooltip.
+    function slotCapacityTitle(entry, slotPolicy) {
+      var parts = [
+        String(entry.configured_slots || 1) + " advertised",
+        String((entry.healthy_slots || []).length) + " healthy"
+      ];
+      if (isFinite(Number(entry.allowed_slots))) {
+        parts.push(String(entry.allowed_slots) + " funded by the operator cap");
+      }
+      if (slotPolicy && isFinite(Number(slotPolicy.max_concurrent_slots))) {
+        parts.push("fleet cap " + String(slotPolicy.max_concurrent_slots) + " per validator");
+      }
+      return parts.join(" · ");
+    }
+
     // True when any slot is reporting a stage, not just the lowest one. Keying
     // this off a single slot hid live progress whenever slot zero was idle.
     function anyBenchmarkStage(entry) {
@@ -7953,9 +8020,15 @@
       report += vstat("Platform received", isoTimeHtml(entry.seen_at));
       var assignment = renderValidatorAssignment(entry);
       if (assignment) report += vstat("Assignment", assignment);
+      // Advertised, healthy and funded are three different numbers, and the one
+      // that decides whether a slot gets work is the last of them.
+      var slotSummary = String((entry.healthy_slots || []).length) + " healthy of " +
+        String(entry.configured_slots || 1);
+      if (isFinite(Number(entry.allowed_slots))) {
+        slotSummary += " · " + String(entry.allowed_slots) + " funded by the operator cap";
+      }
       report += vstat("Slots", esc(
-        String((entry.healthy_slots || []).length) + " healthy of " +
-        String(entry.configured_slots || 1) + " · " + String(entry.admission || "accepting")));
+        slotSummary + " · " + String(entry.admission || "accepting")));
       // Above the running slots deliberately: an operator opening this modal is
       // usually asking "does this host have room", and the answer is no while
       // any of these are listed.
@@ -8216,6 +8289,9 @@
       document.getElementById("fleet-retired-title").textContent = showScreeners
         ? "Recently offline"
         : "Inoperative validators";
+      // Fleet-wide policy, carried on the snapshot rather than per row: it is
+      // what turns "this slot is idle" into "this slot is capped".
+      var slotPolicy = singular === "validator" ? data.slot_policy : null;
       var benchVersion = activeBenchVersion();
       document.getElementById("fleet-retired-note").textContent = showScreeners
         ? "Heartbeat history remains visible for 24 hours, then expires automatically."
@@ -8279,6 +8355,10 @@
             if (orphan && orphan.slot_id) orphanBySlot[orphan.slot_id] = orphan;
           });
           var healthySlots = entry.healthy_slots || [];
+          var cappedSlots = cappedSlotIds(entry);
+          var cappedTitle = slotPolicy && isFinite(Number(slotPolicy.max_concurrent_slots))
+            ? "Operator cap: " + String(slotPolicy.max_concurrent_slots) + " concurrent slots per validator. No ticket is issued here."
+            : "Held back by the operator slot cap. No ticket is issued here.";
           var slotRows = validatorSlotIds(entry).map(function (slotId) {
             var benchmark = activeBySlot[slotId] || assignedBySlot[slotId];
             var orphan = orphanBySlot[slotId];
@@ -8292,9 +8372,11 @@
                 ? orphanedSlotLabel(orphan)
                 : (entry.admission !== "accepting"
                 ? '<span class="stage warn">' + esc(entry.admission) + '</span>'
-                : (healthySlots.indexOf(slotId) >= 0
-                  ? '<span class="stage success">Idle</span>'
-                  : '<span class="stage warn">Unavailable</span>')));
+                : (healthySlots.indexOf(slotId) < 0
+                  ? '<span class="stage warn">Unavailable</span>'
+                  : (cappedSlots[slotId]
+                    ? '<span class="stage capped" title="' + esc(cappedTitle) + '">Capped</span>'
+                    : '<span class="stage success">Idle</span>'))));
             return '<div class="fleet-slot" title="' + esc(slotId) + '"><span class="fleet-protocol">' + esc(slotId) + '</span> ' + slotState + '</div>';
           });
           slotWork = slotRows.join("");
@@ -8309,12 +8391,18 @@
         var workStatus = hasGranularProgress
           ? ""
           : '<span class="stage ' + work[1] + '">' + esc(work[0]) + '</span>';
+        // Slots read "funded of advertised", not "healthy of advertised": the
+        // operator cap is the number that decides whether a slot can be given
+        // work, and the tooltip carries the full breakdown behind it.
         var protocol = singular === "screener"
           ? "Protocol " + entry.protocol_version + " · Policy " + entry.policy_version
           : "Protocol " + entry.protocol_version + " · " +
-            String((entry.healthy_slots || []).length) + "/" +
+            String(fundedSlotCount(entry)) + " of " +
             String(entry.configured_slots || 1) + " slots · " +
             String(entry.admission || "accepting");
+        var protocolTitle = singular === "validator"
+          ? slotCapacityTitle(entry, slotPolicy)
+          : "";
         // Validators are keyed by a distinct hotkey; the screener fleet shares
         // one hotkey, so each worker is distinguished by its instance_id.
         var displayName = singular === "validator" ? validatorNames[hotkey] : (entry.instance_id || "");
@@ -8328,7 +8416,7 @@
           '<td><span class="fleet-time" title="' + esc(entry.first_seen_at || "") + '">' + esc(firstSeen) + '</span></td>' +
           '<td><span class="fleet-time" title="' + esc(reportedAt) + '">' + relTime(reportedAt) + '</span></td>' +
           '<td class="fleet-work-col">' + workStatus + currentWork + '</td>' +
-          '<td><span class="fleet-version">' + esc(version) + '</span><span class="fleet-protocol">' + esc(protocol) + '</span></td>' +
+          '<td><span class="fleet-version">' + esc(version) + '</span><span class="fleet-protocol" title="' + esc(protocolTitle) + '">' + esc(protocol) + '</span></td>' +
           renderFleetMetricCells(entry.system_metrics) +
           '</tr>';
       }).join("");
