@@ -237,9 +237,14 @@ from ditto.db.queries.scores import (
     quorum_composites,
     upsert_score,
 )
+from ditto.db.queries.similarity_grouping import (
+    SimilarityBudgetPolicy,
+    policy_from_settings,
+)
 from ditto.db.queries.tickets import (
     OWNER_CONCURRENT_SUBMISSION_LIMIT_DEFAULT,
     RETRY_COOLDOWN,
+    SIMILARITY_CONCURRENT_SUBMISSION_LIMIT_DEFAULT,
     get_live_slot_ticket,
     get_open_ticket,
     issue_confirmation_ticket,
@@ -749,6 +754,10 @@ async def _issue_source_backfill_ticket(
     slot_settings: ValidatorSlotSettings = SLOT_SETTINGS_DEFAULT,
     carryover_settings: PrevGenCarryoverSettings = PREV_GEN_CARRYOVER_DEFAULTS,
     owner_concurrent_submission_limit: int = OWNER_CONCURRENT_SUBMISSION_LIMIT_DEFAULT,
+    similarity_policy: SimilarityBudgetPolicy | None = None,
+    similarity_concurrent_submission_limit: int = (
+        SIMILARITY_CONCURRENT_SUBMISSION_LIMIT_DEFAULT
+    ),
     resume_only: bool = False,
 ) -> ValidatorTicket | None:
     """Use otherwise-idle capacity after the desired era has nothing to give.
@@ -832,6 +841,10 @@ async def _issue_source_backfill_ticket(
             validator_running_benchmark=validator_running_benchmark,
             slot_id=slot_id,
             owner_concurrent_submission_limit=owner_concurrent_submission_limit,
+            similarity_policy=similarity_policy,
+            similarity_concurrent_submission_limit=(
+                similarity_concurrent_submission_limit
+            ),
         )
     if resume_only:
         return None
@@ -931,6 +944,8 @@ async def _issue_source_backfill_ticket(
         validator_running_benchmark=validator_running_benchmark,
         slot_id=slot_id,
         owner_concurrent_submission_limit=owner_concurrent_submission_limit,
+        similarity_policy=similarity_policy,
+        similarity_concurrent_submission_limit=(similarity_concurrent_submission_limit),
     )
 
 
@@ -946,6 +961,10 @@ async def _issue_prev_gen_carryover_ticket(
     validator_running_benchmark: bool,
     slot_id: str,
     owner_concurrent_submission_limit: int = OWNER_CONCURRENT_SUBMISSION_LIMIT_DEFAULT,
+    similarity_policy: SimilarityBudgetPolicy | None = None,
+    similarity_concurrent_submission_limit: int = (
+        SIMILARITY_CONCURRENT_SUBMISSION_LIMIT_DEFAULT
+    ),
 ) -> ValidatorTicket | None:
     """Lease an adopted previous-generation submission in the new era.
 
@@ -1000,6 +1019,8 @@ async def _issue_prev_gen_carryover_ticket(
         slot_id=slot_id,
         only_agent_ids=adopted,
         owner_concurrent_submission_limit=owner_concurrent_submission_limit,
+        similarity_policy=similarity_policy,
+        similarity_concurrent_submission_limit=(similarity_concurrent_submission_limit),
     )
 
 
@@ -2261,6 +2282,12 @@ async def request_job(
                     owner_concurrent_submission_limit=(
                         queue_policy.owner_concurrent_submission_limit
                     ),
+                    similarity_policy=policy_from_settings(
+                        queue_policy.similarity_budget
+                    ),
+                    similarity_concurrent_submission_limit=(
+                        queue_policy.similarity_budget.concurrent_submission_limit
+                    ),
                 )
                 if fresh_lane_due
                 else None
@@ -2295,6 +2322,12 @@ async def request_job(
                     owner_concurrent_submission_limit=(
                         queue_policy.owner_concurrent_submission_limit
                     ),
+                    similarity_policy=policy_from_settings(
+                        queue_policy.similarity_budget
+                    ),
+                    similarity_concurrent_submission_limit=(
+                        queue_policy.similarity_budget.concurrent_submission_limit
+                    ),
                 )
             if ticket is None and not fresh_lane_due:
                 ticket = await _issue_prev_gen_carryover_ticket(
@@ -2309,6 +2342,12 @@ async def request_job(
                     slot_id=slot_id,
                     owner_concurrent_submission_limit=(
                         queue_policy.owner_concurrent_submission_limit
+                    ),
+                    similarity_policy=policy_from_settings(
+                        queue_policy.similarity_budget
+                    ),
+                    similarity_concurrent_submission_limit=(
+                        queue_policy.similarity_budget.concurrent_submission_limit
                     ),
                 )
         else:
@@ -2362,6 +2401,12 @@ async def request_job(
                     slot_id=slot_id,
                     slot_settings=slot_settings,
                     resume_only=True,
+                    similarity_policy=policy_from_settings(
+                        queue_policy.similarity_budget
+                    ),
+                    similarity_concurrent_submission_limit=(
+                        queue_policy.similarity_budget.concurrent_submission_limit
+                    ),
                 )
             if ticket is None and rollout is None:
                 stale_ticket = await session.scalar(
@@ -2425,6 +2470,12 @@ async def request_job(
                         owner_concurrent_submission_limit=(
                             queue_policy.owner_concurrent_submission_limit
                         ),
+                        similarity_policy=policy_from_settings(
+                            queue_policy.similarity_budget
+                        ),
+                        similarity_concurrent_submission_limit=(
+                            queue_policy.similarity_budget.concurrent_submission_limit
+                        ),
                     )
                 )
             if ticket is None and rollout is None:
@@ -2469,6 +2520,12 @@ async def request_job(
                     carryover_settings=queue_policy.prev_gen_carryover,
                     owner_concurrent_submission_limit=(
                         queue_policy.owner_concurrent_submission_limit
+                    ),
+                    similarity_policy=policy_from_settings(
+                        queue_policy.similarity_budget
+                    ),
+                    similarity_concurrent_submission_limit=(
+                        queue_policy.similarity_budget.concurrent_submission_limit
                     ),
                 )
             if ticket is None and rollout is not None:

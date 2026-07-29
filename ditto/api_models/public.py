@@ -1812,6 +1812,23 @@ class PublicActivityEntry(BaseModel):
             ),
         ),
     ]
+    validator_queue_gate_detail: Annotated[
+        str | None,
+        Field(
+            default=None,
+            description=(
+                "Human-readable evidence behind validator_queue_gate, or null "
+                "when the reason code says everything. Populated for "
+                "'similarity_serialized', which is the one gate a miner cannot "
+                "reconstruct from their own submission: it names the "
+                "near-identical submissions currently holding the shared "
+                "concurrency budget and the measured overlap that grouped them, "
+                "so the wait is checkable rather than mysterious. It is a "
+                "capacity statement and carries no claim about the legitimacy "
+                "of any submission named in it."
+            ),
+        ),
+    ] = None
     previous_generation: Annotated[
         bool,
         Field(

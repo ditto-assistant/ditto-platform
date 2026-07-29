@@ -3794,6 +3794,7 @@ class TestPublicActivity:
             "provisional_composite",
             "validator_queue_rank",
             "validator_queue_gate",
+            "validator_queue_gate_detail",
             "previous_generation",
             "quorum",
             "retry_state",

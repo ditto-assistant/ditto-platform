@@ -3331,6 +3331,20 @@ def _queue_gate(
     return None if entry is None else entry.gate
 
 
+def _queue_gate_detail(
+    preview: dict[UUID, QueuePreviewEntry], agent_id: UUID
+) -> str | None:
+    """The evidence behind the gate, when the gate has any worth naming.
+
+    Read off the same preview entry as :func:`_queue_gate` rather than
+    recomputed, so the badge and its explanation cannot describe different
+    rows -- which is the entire reason the gate and its reason live in one
+    expression upstream.
+    """
+    entry = preview.get(agent_id)
+    return None if entry is None else entry.gate_detail
+
+
 def _public_activity_statuses(
     rows: list[Any],
     *,
@@ -3504,6 +3518,9 @@ def _public_activity_response(
                 provisional_composite=row.provisional_composite,
                 validator_queue_rank=_queue_rank(queue_preview, row.agent.agent_id),
                 validator_queue_gate=_queue_gate(queue_preview, row.agent.agent_id),
+                validator_queue_gate_detail=_queue_gate_detail(
+                    queue_preview, row.agent.agent_id
+                ),
                 # #458's flag, now read off the shared preview rather than
                 # recomputed here: it is exactly the ``previous_generation``
                 # case of ``validator_queue_gate``. Kept as its own boolean

@@ -4292,6 +4292,12 @@ class TestRequestJob:
             # The retired-era lane answers to the same operator ceiling as the
             # desired-era one; a backfill slot is still fleet capacity.
             owner_concurrent_submission_limit=2,
+            # And to the same similarity budget, for the same reason: a family
+            # that can spill onto the retired-era lane has simply moved the
+            # monopoly rather than lost it. This call site names no policy, so
+            # the helper's default (the rail off) is what reaches the allocator.
+            similarity_policy=None,
+            similarity_concurrent_submission_limit=1,
         )
 
     async def test_activated_v7_retires_v6_permanently(
