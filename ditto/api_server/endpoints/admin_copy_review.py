@@ -9,7 +9,7 @@ from typing import Annotated, Literal, cast
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
-from sqlalchemy import func, select
+from sqlalchemy import exists, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Load, undefer_group
 
@@ -48,6 +48,7 @@ from ditto.db.queries.artifact_fetch_audit import (
     ENDPOINT_ADMIN_COPY_REVIEW_DIFF_FILE,
     record_artifact_fetch,
 )
+from ditto.db.queries.benchmark_rollout import active_bench_version
 from ditto.db.queries.payments import (
     get_miner_coldkey_for_agent,
     get_miner_coldkeys_for_agents,
@@ -389,8 +390,20 @@ async def list_copy_reviews(
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
     include: Literal["current_comparison"] | None = None,
+    generation: Literal["active", "history", "all"] = "active",
 ) -> AdminCopyReviewList:
+    active_version = await active_bench_version(session)
+    has_active_score = exists(
+        select(Score.agent_id).where(
+            Score.agent_id == AthReview.agent_id,
+            Score.bench_version == active_version,
+        )
+    )
     where = [] if status == "all" else [AthReview.status == status]
+    if generation == "active":
+        where.append(has_active_score)
+    elif generation == "history":
+        where.append(~has_active_score)
     count = await session.scalar(
         select(func.count()).select_from(AthReview).where(*where)
     )
@@ -445,6 +458,8 @@ async def list_copy_reviews(
         count=count or 0,
         limit=limit,
         offset=offset,
+        generation=generation,
+        active_bench_version=active_version,
     )
 
 

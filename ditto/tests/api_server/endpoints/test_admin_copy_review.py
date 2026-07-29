@@ -109,6 +109,49 @@ async def _seed(
     return agent_id, original_id
 
 
+async def _score_review_for_generation(
+    maker: async_sessionmaker[AsyncSession],
+    *,
+    agent_id: UUID,
+    bench_version: int,
+) -> None:
+    async with maker() as session, session.begin():
+        session.add(
+            Score(
+                agent_id=agent_id,
+                validator_hotkey=f"validator-v{bench_version}",
+                run_id=f"generation-{bench_version}",
+                signature=None,
+                seed=bench_version,
+                bench_version=bench_version,
+                composite=0.8,
+                tool_mean=0.8,
+                memory_mean=0.8,
+                median_ms=100,
+                n=114,
+                details={"bench_version": bench_version},
+                generated_at=_T0,
+            )
+        )
+
+
+async def _activate_generation(
+    maker: async_sessionmaker[AsyncSession], *, bench_version: int
+) -> None:
+    async with maker() as session, session.begin():
+        session.add(
+            BenchmarkRollout(
+                rollout_id=uuid4(),
+                from_version=bench_version - 1,
+                desired_version=bench_version,
+                status="activated",
+                cohort_size=5,
+                created_at=_T0 - timedelta(hours=2),
+                activated_at=_T0 - timedelta(hours=1),
+            )
+        )
+
+
 def _fingerprint(prefix: str, *, corpus: str = _CORPUS_ID) -> dict:
     values = [f"{prefix}{i:015x}" for i in range(12)]
     return {"v": 2, "corpus": corpus, "k": 256, "card": 12, "m": values}
@@ -485,7 +528,8 @@ async def test_list_is_bounded_oldest_first_and_private(
     oldest, _ = await _seed(maker, opened_at=_T0)
     _install(app, maker)
     response = await client.get(
-        "/api/v1/admin/copy-reviews?limit=1&offset=0", headers=_HEADERS
+        "/api/v1/admin/copy-reviews?generation=all&limit=1&offset=0",
+        headers=_HEADERS,
     )
     assert response.status_code == 200
     body = response.json()
@@ -495,12 +539,85 @@ async def test_list_is_bounded_oldest_first_and_private(
     assert "sha256" not in serialized and '"m":' not in serialized
 
 
+async def test_list_defaults_to_active_generation_and_filters_count_and_pages(
+    app: FastAPI, client: httpx.AsyncClient, maker: async_sessionmaker[AsyncSession]
+) -> None:
+    historical, _ = await _seed(maker, opened_at=_T0 - timedelta(hours=1))
+    active_oldest, _ = await _seed(maker, opened_at=_T0)
+    active_newest, _ = await _seed(maker, opened_at=_T0 + timedelta(hours=1))
+    await _score_review_for_generation(
+        maker, agent_id=historical, bench_version=MIN_SCOREABLE_BENCH_VERSION
+    )
+    await _score_review_for_generation(
+        maker, agent_id=active_oldest, bench_version=MIN_SCOREABLE_BENCH_VERSION + 1
+    )
+    await _score_review_for_generation(
+        maker, agent_id=active_newest, bench_version=MIN_SCOREABLE_BENCH_VERSION + 1
+    )
+    await _activate_generation(maker, bench_version=MIN_SCOREABLE_BENCH_VERSION + 1)
+    _install(app, maker)
+
+    first = await client.get(
+        "/api/v1/admin/copy-reviews?limit=1&offset=0", headers=_HEADERS
+    )
+    second = await client.get(
+        "/api/v1/admin/copy-reviews?limit=1&offset=1", headers=_HEADERS
+    )
+    history = await client.get(
+        "/api/v1/admin/copy-reviews?generation=history", headers=_HEADERS
+    )
+    all_generations = await client.get(
+        "/api/v1/admin/copy-reviews?generation=all", headers=_HEADERS
+    )
+
+    assert first.status_code == second.status_code == history.status_code == 200
+    assert first.json()["generation"] == "active"
+    assert first.json()["active_bench_version"] == MIN_SCOREABLE_BENCH_VERSION + 1
+    assert first.json()["count"] == second.json()["count"] == 2
+    page_ids = [
+        first.json()["items"][0]["agent_id"],
+        second.json()["items"][0]["agent_id"],
+    ]
+    assert page_ids == [
+        str(active_oldest),
+        str(active_newest),
+    ]
+    assert history.json()["generation"] == "history"
+    assert history.json()["count"] == 1
+    assert history.json()["items"][0]["agent_id"] == str(historical)
+    assert all_generations.json()["count"] == 3
+
+
+async def test_default_generation_tracks_a_benchmark_authority_bump(
+    app: FastAPI, client: httpx.AsyncClient, maker: async_sessionmaker[AsyncSession]
+) -> None:
+    prior, _ = await _seed(maker)
+    current, _ = await _seed(maker, opened_at=_T0 + timedelta(hours=1))
+    await _score_review_for_generation(
+        maker, agent_id=prior, bench_version=MIN_SCOREABLE_BENCH_VERSION
+    )
+    await _score_review_for_generation(
+        maker, agent_id=current, bench_version=MIN_SCOREABLE_BENCH_VERSION + 1
+    )
+    await _activate_generation(maker, bench_version=MIN_SCOREABLE_BENCH_VERSION + 1)
+    _install(app, maker)
+
+    response = await client.get("/api/v1/admin/copy-reviews", headers=_HEADERS)
+
+    assert response.status_code == 200
+    assert response.json()["active_bench_version"] == MIN_SCOREABLE_BENCH_VERSION + 1
+    assert response.json()["count"] == 1
+    assert response.json()["items"][0]["agent_id"] == str(current)
+
+
 async def test_original_evidence_names_the_matched_submission(
     app: FastAPI, client: httpx.AsyncClient, maker: async_sessionmaker[AsyncSession]
 ) -> None:
     agent_id, original_id = await _seed(maker)
     _install(app, maker)
-    listing = await client.get("/api/v1/admin/copy-reviews", headers=_HEADERS)
+    listing = await client.get(
+        "/api/v1/admin/copy-reviews?generation=all", headers=_HEADERS
+    )
     assert listing.status_code == 200
     original = listing.json()["items"][0]["original"]
     assert original["duplicate_of"] == str(original_id)
@@ -543,7 +660,8 @@ async def test_list_can_embed_current_comparisons_in_one_request(
     scoreless, _ = await _seed(maker, opened_at=_T0 + timedelta(hours=1))
     _install(app, maker)
     response = await client.get(
-        "/api/v1/admin/copy-reviews?include=current_comparison", headers=_HEADERS
+        "/api/v1/admin/copy-reviews?generation=all&include=current_comparison",
+        headers=_HEADERS,
     )
     assert response.status_code == 200
     by_agent = {item["agent_id"]: item for item in response.json()["items"]}
