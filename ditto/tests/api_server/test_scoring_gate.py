@@ -982,15 +982,8 @@ class TestAttestedOwnerLink:
         assert decision.held is True
         assert decision.duplicate_of == incumbent.agent_id
 
-    def test_attestation_does_not_exempt_byte_identical_resubmission(self) -> None:
-        """Scope guard: rule 1 is not covered.
-
-        Byte-identical resubmission under a new key is the shape of
-        emission-slot farming, so it still reaches an operator even with a
-        valid owner link. Unchanged by how strong the proof behind the link is
-        -- a better answer to "who" does not make an identical re-upload more
-        meritorious. Deliberately narrower than the same-coldkey exemption.
-        """
+    def test_attestation_exempts_byte_identical_resubmission(self) -> None:
+        """Exact generations within a proven owner pair are not plagiarism."""
         incumbent = _entry(
             composite=0.70, miner="5OldHotkey", sha256="cc" * 32, size_bytes=500000
         )
@@ -1003,11 +996,10 @@ class TestAttestedOwnerLink:
             eligible=[incumbent],
             linked_owner_hotkeys=frozenset({"5OldHotkey"}),
         )
-        assert decision.held is True
-        assert "sha256" in (decision.reason or "")
+        assert decision.held is False
 
-    def test_attestation_does_not_exempt_repack(self) -> None:
-        """Scope guard: rule 1b is not covered either."""
+    def test_attestation_exempts_repack(self) -> None:
+        """Canonicalized-source equality is also exempt for the direct pair."""
         incumbent = _entry(
             composite=0.60,
             miner="5OldHotkey",
@@ -1024,8 +1016,7 @@ class TestAttestedOwnerLink:
             eligible=[incumbent],
             linked_owner_hotkeys=frozenset({"5OldHotkey"}),
         )
-        assert decision.held is True
-        assert "repack" in (decision.reason or "")
+        assert decision.held is False
 
     def test_attestation_does_not_shield_a_third_partys_work(self) -> None:
         """A link exempts only its counterparty.

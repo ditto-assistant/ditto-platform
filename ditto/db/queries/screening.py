@@ -20,6 +20,7 @@ from ditto.db.models import (
     BenchmarkRollout,
     BenchmarkRolloutMember,
     EvaluationPayment,
+    OwnerAttestation,
     Score,
     ScreeningAttempt,
     ScreeningQuarantine,
@@ -327,6 +328,7 @@ async def claim_screening_attempts(
     now: datetime,
     ttl: timedelta,
     limit: int,
+    netuid: int = 118,
 ) -> list[tuple[Agent, ScreeningAttempt, UUID | None]]:
     """Claim completion-lane contenders, then least-scored eligible work."""
     # Claiming is already a short transaction. Serialize it in Postgres so two
@@ -396,8 +398,25 @@ async def claim_screening_attempts(
     candidate_payment = aliased(EvaluationPayment)
     earlier = aliased(Agent)
     earlier_payment = aliased(EvaluationPayment)
+    direct_owner_link = exists(
+        select(OwnerAttestation.attestation_id).where(
+            OwnerAttestation.netuid == netuid,
+            OwnerAttestation.revoked_at.is_(None),
+            or_(
+                and_(
+                    OwnerAttestation.hotkey_lo == Agent.miner_hotkey,
+                    OwnerAttestation.hotkey_hi == earlier.miner_hotkey,
+                ),
+                and_(
+                    OwnerAttestation.hotkey_lo == earlier.miner_hotkey,
+                    OwnerAttestation.hotkey_hi == Agent.miner_hotkey,
+                ),
+            ),
+        )
+    )
     earlier_is_different_owner = and_(
         earlier.miner_hotkey != Agent.miner_hotkey,
+        ~direct_owner_link,
         or_(
             candidate_payment.miner_coldkey.is_(None),
             earlier_payment.miner_coldkey.is_(None),
@@ -461,7 +480,26 @@ async def claim_screening_attempts(
                 EvaluationPayment.agent_id == agent.agent_id
             )
         )
-        owner_is_different = owner.miner_hotkey != agent.miner_hotkey
+        owner_has_direct_link = exists(
+            select(OwnerAttestation.attestation_id).where(
+                OwnerAttestation.netuid == netuid,
+                OwnerAttestation.revoked_at.is_(None),
+                or_(
+                    and_(
+                        OwnerAttestation.hotkey_lo == agent.miner_hotkey,
+                        OwnerAttestation.hotkey_hi == owner.miner_hotkey,
+                    ),
+                    and_(
+                        OwnerAttestation.hotkey_lo == owner.miner_hotkey,
+                        OwnerAttestation.hotkey_hi == agent.miner_hotkey,
+                    ),
+                ),
+            )
+        )
+        owner_is_different = and_(
+            owner.miner_hotkey != agent.miner_hotkey,
+            ~owner_has_direct_link,
+        )
         if candidate_coldkey is not None:
             owner_is_different = and_(
                 owner_is_different,

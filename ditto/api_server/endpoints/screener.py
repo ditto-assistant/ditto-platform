@@ -69,6 +69,7 @@ from ditto.api_models.screener_review_settings import (
 )
 from ditto.api_models.system_health import system_metrics_signing_token
 from ditto.api_server.artifact_audit import client_ip, request_detail
+from ditto.api_server.attestation import expected_netuid
 from ditto.api_server.benchmark_rollout import refresh_rolling_qualification
 from ditto.api_server.datapipeline import DatasetGenerator
 from ditto.api_server.dependencies import (
@@ -644,6 +645,7 @@ async def claim(
                 now=now,
                 ttl=_SCREENING_LEASE_TTL,
                 limit=limit,
+                netuid=expected_netuid(),
             )
     else:
         # SQLite is used by local/test deployments and has no advisory locks.
@@ -656,6 +658,7 @@ async def claim(
                 now=now,
                 ttl=_SCREENING_LEASE_TTL,
                 limit=limit,
+                netuid=expected_netuid(),
             )
     items = [
         ScreenerQueueItem(

@@ -30,6 +30,7 @@ from ditto.api_server.attestation import (
 from ditto.api_server.dependencies import get_session
 from ditto.db.queries.attestation import (
     AttestationReplayedError,
+    clear_linked_pending_copy_reviews,
     get_bound_coldkey_for_hotkey,
     record_attestation,
 )
@@ -104,6 +105,13 @@ async def submit_owner_link(
             )
         except AttestationReplayedError as e:
             raise HTTPException(status_code=409, detail=str(e)) from e
+        cleared_review_ids = await clear_linked_pending_copy_reviews(
+            session,
+            hotkey_lo=hotkey_lo,
+            hotkey_hi=hotkey_hi,
+            attestation_id=row.attestation_id,
+            now=now,
+        )
         created_at = row.created_at or now
         attestation_id = row.attestation_id
 
@@ -114,4 +122,5 @@ async def submit_owner_link(
         hotkey_hi=hotkey_hi,
         evidence_grade=evidence_grade(lo_proof.key_kind, hi_proof.key_kind),
         created_at=created_at,
+        cleared_copy_review_count=len(cleared_review_ids),
     )

@@ -83,9 +83,10 @@ class AdminOwnerAttestationsResponse(BaseModel):
 
     scope_caveat: str = (
         "An owner-link attestation exempts each linked hotkey from "
-        "near-duplicate plagiarism screening against the other's earlier "
-        "submissions only. It does not exempt byte-identical or repacked "
-        "resubmission, and it is not an input to emission-slot allocation, "
+        "plagiarism screening against the other's submissions, including "
+        "byte-identical and repacked generations, and clears existing pending "
+        "copy holds for the direct pair. It is not an input to emission-slot "
+        "allocation, "
         "which remains partitioned by payment-time coldkey. The evidence grade "
         "is reviewer context and does not gate the exemption."
     )
