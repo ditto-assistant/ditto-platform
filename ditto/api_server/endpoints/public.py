@@ -153,7 +153,6 @@ from ditto.api_server.artifact_audit import client_ip, request_detail
 from ditto.api_server.bench import CURRENT_BENCH_VERSION, is_bench_version_retired
 from ditto.api_server.benchmark_rollout import rolling_qualification_blockers
 from ditto.api_server.continual_retest_settings import aggregate_is_active
-from ditto.api_server.crn import fold_seed_bound
 from ditto.api_server.datapipeline import DataPipelineError
 from ditto.api_server.efficiency import (
     EfficiencyBoardView,
@@ -235,7 +234,6 @@ from ditto.db.queries.confirmation_scores import (
     WaveMembership,
     confirmation_composites_by_seed,
     confirmation_depths,
-    fold_eligible_seeds_by_agent,
 )
 from ditto.db.queries.desired_era_backlog import prev_generation_agent_ids
 from ditto.db.queries.heartbeats import (
@@ -1661,6 +1659,7 @@ def _public_entry(
             else SCORING_QUORUM
         ),
         completed_wave_count=completed_wave_count,
+        retained_sample_count=completed_wave_count,
         initial_quorum_composites=list(initial_quorum_composites),
         completed_wave_composites=list(completed_wave_composites),
         confirmation_seed_depth=confirmation_seed_depth,
@@ -1720,95 +1719,6 @@ def _public_entry(
         history=trend,
         case_results=_safe_case_results(details),
     )
-
-
-def _completed_wave_data(
-    rows: list[LedgerRow],
-    *,
-    stderrs: dict[UUID, float | None],
-    confirmation_by_seed: dict[UUID, dict[int, float]] | None = None,
-    confirmation_depth: dict[UUID, int] | None = None,
-    wave_membership: WaveMembership = DEFAULT_WAVE_MEMBERSHIP,
-    anchor_version: int | None = None,
-) -> tuple[list[LedgerRow], dict[UUID, dict[int, float]], dict[UUID, int]]:
-    """Return canonical candidates plus only fully completed cohort-wave data.
-
-    ``anchor_version`` is the active benchmark version the reigning champion's
-    CRN anchor is derived on. Without it the fold intersects the raw append-only
-    trail, which spans every champion the board has had, and any member carrying
-    rows from an earlier reign collapses the wave to zero.
-    """
-    by_seed = confirmation_by_seed or {}
-    depths = confirmation_depth or {}
-    candidates = rank_submissions(
-        row for row in rows if row.eligible and row.composite > 0.0
-    )
-
-    raw_projection = project_koth(
-        [
-            KothEntry(
-                miner_hotkey=row.miner_hotkey,
-                agent_id=row.agent_id,
-                composite=row.composite,
-                first_seen=row.first_seen,
-                raw_rank=raw_rank,
-                bench_version=row.bench_version,
-                composite_stderr=stderrs.get(row.agent_id),
-            )
-            for raw_rank, row in enumerate(candidates, start=1)
-        ]
-    )
-    raw_members = (
-        (raw_projection.champion, *raw_projection.tail)
-        if raw_projection is not None
-        else ()
-    )
-    eligible_by_agent = fold_eligible_seeds_by_agent(
-        member_ids=[member.agent_id for member in raw_members],
-        seeds_by_agent={
-            agent_id: values.keys() for agent_id, values in by_seed.items()
-        },
-        mode=wave_membership,
-        anchored_seeds=(
-            fold_seed_bound(
-                champion_agent_id=raw_projection.champion.agent_id,
-                anchor_version=anchor_version,
-                seeds_by_agent={
-                    agent_id: values.keys() for agent_id, values in by_seed.items()
-                },
-            )
-            if raw_projection is not None and anchor_version is not None
-            else None
-        ),
-    )
-    by_seed = {
-        agent_id: {
-            seed: value
-            for seed, value in values.items()
-            if seed in eligible_by_agent.get(agent_id, frozenset())
-        }
-        for agent_id, values in by_seed.items()
-    }
-    # Depth is reported per agent from the seeds that actually entered that
-    # agent's aggregate. Under ``strict`` and ``participants`` every member
-    # shares one set, so this is the intersection size for all of them --
-    # identical to what the old shared counter produced. Under ``per_agent``
-    # the members genuinely differ and a single shared number would be a lie.
-    #
-    # Reported for EVERY agent that folded something, not only the emission-set
-    # members. ``by_seed`` above is filtered per agent and never restricted to
-    # members, so a non-member holding the shared seeds already receives a
-    # continual mean; zeroing its depth here only desynchronised the report from
-    # the arithmetic. The two projections that produce those two answers do not
-    # have to agree on membership -- the fold's intersection is taken over the
-    # RAW top five, while emissions are projected from effective composites, and
-    # an agent can be in one and not the other -- so a member-keyed depth was
-    # never a safe stand-in for "what did this agent actually average".
-    depths = dict.fromkeys(depths, 0)
-    depths.update(
-        {agent_id: len(seeds) for agent_id, seeds in eligible_by_agent.items()}
-    )
-    return candidates, by_seed, depths
 
 
 def _public_koth_emissions(

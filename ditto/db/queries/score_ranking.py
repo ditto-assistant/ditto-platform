@@ -19,8 +19,9 @@ readers of the same ledger never see two different fifth places.
 
 **The score it orders by** (:func:`official_composites`) -- the KOTH continual
 mean. An agent starts on the canonical k=3 quorum median and switches, once it
-has completed cohort waves, to the mean of its three signed quorum scores plus
-one score per completed wave. That is the estimator validators fold into
+has retained samples, to the mean of its three signed quorum scores plus one
+score per accepted seed. Scheduling membership never removes accepted evidence.
+That is the estimator validators fold into
 weights, so it is the estimator every ranking surface must cut on, including the
 queue floors. See :func:`ditto.api_server.koth.effective_composite` for the
 formula itself; this module is only about *who reads it*.
@@ -39,8 +40,6 @@ from ditto.api_models.continual_retest_settings import (
     ContinualRetestSettings,
     WaveMembership,
 )
-from ditto.api_server.crn import fold_seed_bound
-from ditto.db.queries.confirmation_scores import fold_eligible_seeds_by_agent
 from ditto.score_order import (
     F,
     FinalizedRow,
@@ -89,14 +88,15 @@ def completed_wave_data(
     wave_membership: WaveMembership = DEFAULT_WAVE_MEMBERSHIP,
     anchor_version: int | None = None,
 ) -> tuple[list[F], dict[UUID, dict[int, float]], dict[UUID, int]]:
-    """Return canonical candidates plus only fully completed cohort-wave data.
+    """Return candidates plus every accepted per-agent confirmation sample.
 
-    The raw projection is deliberately cut on the *raw* composite: it exists to
-    find the current emission set, and the seeds that set has completed are what
-    the continual mean is then allowed to average. Feeding the continual mean
-    back into the membership that defines it would be circular.
+    ``wave_membership`` and ``anchor_version`` remain accepted for wire/source
+    compatibility, but scheduling policy no longer filters score evidence. A
+    seed accepted for an agent remains in that agent's mean permanently. Shared
+    seed identity is still preserved in ``by_seed`` for the pairwise dethrone
+    statistic; it is not a global admission gate.
     """
-    from ditto.api_server.koth import KothEntry, project_koth
+    del stderrs, wave_membership, anchor_version
 
     by_seed: dict[UUID, dict[int, float]] = {
         agent_id: dict(values)
@@ -107,64 +107,8 @@ def completed_wave_data(
         row for row in rows if getattr(row, "eligible", True) and row.composite > 0.0
     )
 
-    raw_projection = project_koth(
-        [
-            KothEntry(
-                miner_hotkey=row.miner_hotkey,
-                agent_id=row.agent_id,
-                composite=row.composite,
-                first_seen=row.first_seen,
-                raw_rank=raw_rank,
-                bench_version=row.bench_version,
-                composite_stderr=stderrs.get(row.agent_id),
-            )
-            for raw_rank, row in enumerate(candidates, start=1)
-        ]
-    )
-    raw_members = (
-        (raw_projection.champion, *raw_projection.tail)
-        if raw_projection is not None
-        else ()
-    )
-    eligible_by_agent = fold_eligible_seeds_by_agent(
-        member_ids=[member.agent_id for member in raw_members],
-        seeds_by_agent={
-            agent_id: values.keys() for agent_id, values in by_seed.items()
-        },
-        mode=wave_membership,
-        anchored_seeds=(
-            fold_seed_bound(
-                champion_agent_id=raw_projection.champion.agent_id,
-                anchor_version=anchor_version,
-                seeds_by_agent={
-                    agent_id: values.keys() for agent_id, values in by_seed.items()
-                },
-            )
-            if raw_projection is not None and anchor_version is not None
-            else None
-        ),
-    )
-    by_seed = {
-        agent_id: {
-            seed: value
-            for seed, value in values.items()
-            if seed in eligible_by_agent.get(agent_id, frozenset())
-        }
-        for agent_id, values in by_seed.items()
-    }
     depths = dict.fromkeys(depths, 0)
-    # Depth is reported per agent from the seeds that actually entered that
-    # agent's aggregate. Under ``strict`` and ``participants`` every member
-    # shares one set, so this is the intersection size for all of them --
-    # identical to what the old shared counter produced. Under ``per_agent``
-    # the members genuinely differ and a single shared number would be a lie.
-    # ``by_seed`` is filtered per agent and is intentionally not restricted to
-    # emission-set members. A non-member that holds the shared eligible seeds
-    # therefore folds those samples too, so its reported depth must describe
-    # the same samples the aggregate consumed.
-    depths.update(
-        {agent_id: len(seeds) for agent_id, seeds in eligible_by_agent.items()}
-    )
+    depths.update({agent_id: len(seeds) for agent_id, seeds in by_seed.items()})
     return candidates, by_seed, depths
 
 
