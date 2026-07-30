@@ -9080,16 +9080,83 @@ class TestTop5ConfirmationLane:
             settings = settings_from_row(
                 await latest_continual_retest_settings_revision(session)
             )
-            emission, cohort = await _current_retest_cohort(
+            emission, wave_members, cohort = await _current_retest_cohort(
                 session, canonical_version=_BENCH_VERSION, settings=settings
             )
 
         assert len(emission) == 5
+        assert len(wave_members) == 5
         assert len(cohort) == 6
         assert agent_ids[5] in {member.agent_id for member in cohort}
         assert agent_ids[5] not in {member.agent_id for member in emission}
         # Rank seven is genuinely behind, so the band stops rather than running on.
         assert agent_ids[6] not in {member.agent_id for member in cohort}
+
+    async def test_raw_wave_gate_members_stay_in_the_retest_cohort(
+        self,
+        app: FastAPI,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """A folded-out raw member must still receive the work gating the fold.
+
+        Production reached exactly this fixed point: retained rows moved one
+        raw top-five member below the folded cutoff, the scheduler stopped
+        retesting it, and the shared-wave count stayed pinned to its shallow
+        depth while the visible leaders kept accumulating seeds.
+        """
+        from ditto.api_server.crn import champion_anchored_seeds
+
+        agent_ids = await _seed_top5_emission_set(
+            session_maker,
+            composites=[0.90, 0.89, 0.88, 0.87, 0.86, 0.85],
+        )
+        champion, *_, raw_cutoff, folded_entrant = agent_ids
+        seeds = champion_anchored_seeds(champion, version=_BENCH_VERSION, max_seeds=16)[
+            :3
+        ]
+        async with session_maker() as session, session.begin():
+            for agent_id in agent_ids:
+                wave_composite = 0.10 if agent_id == raw_cutoff else 0.90
+                for seed in seeds:
+                    session.add(
+                        ConfirmationScore(
+                            agent_id=agent_id,
+                            validator_hotkey=_VALIDATOR_HOTKEY,
+                            bench_version=_BENCH_VERSION,
+                            seed=seed,
+                            composite=wave_composite,
+                            run_id=f"gate-{agent_id}-{seed}",
+                            signature=None,
+                        )
+                    )
+        await _set_retest_cohort_size(session_maker, 5)
+        _install_db(app, session_maker)
+        app.state.session_maker = session_maker
+        app.state.continual_retest_settings.invalidate()
+
+        from ditto.api_server.continual_retest_settings import settings_from_row
+        from ditto.api_server.endpoints.validator import _current_retest_cohort
+        from ditto.db.queries.continual_retest_settings import (
+            latest_continual_retest_settings_revision,
+        )
+
+        async with session_maker() as session:
+            settings = settings_from_row(
+                await latest_continual_retest_settings_revision(session)
+            )
+            emission, wave_members, cohort = await _current_retest_cohort(
+                session, canonical_version=_BENCH_VERSION, settings=settings
+            )
+
+        emission_ids = {member.agent_id for member in emission}
+        wave_ids = {member.agent_id for member in wave_members}
+        cohort_ids = {member.agent_id for member in cohort}
+        assert folded_entrant in emission_ids
+        assert raw_cutoff not in emission_ids
+        assert raw_cutoff in wave_ids
+        assert folded_entrant not in wave_ids
+        assert {raw_cutoff, folded_entrant} <= cohort_ids
+        assert len(cohort) == 6
 
     async def test_emission_set_is_served_before_the_extended_cohort(
         self,

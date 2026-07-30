@@ -2825,8 +2825,8 @@ async def _current_retest_cohort(
     *,
     canonical_version: int,
     settings: ContinualRetestSettings,
-) -> tuple[tuple[KothEntry, ...], tuple[KothEntry, ...]]:
-    """Return ``(emission_set, retest_cohort)`` from one ledger read.
+) -> tuple[tuple[KothEntry, ...], tuple[KothEntry, ...], tuple[KothEntry, ...]]:
+    """Return ``(emission_set, wave_members, retest_cohort)`` from one read.
 
     Both are returned because the lane needs them for different jobs and must
     not disagree about the champion: the emission set decides when a wave is
@@ -2841,6 +2841,19 @@ async def _current_retest_cohort(
     because the champion it produces is the seed anchor. Two different answers
     here and on the leaderboard would derive two different seed families, and the
     validator's confirmation would be rejected as un-anchored.
+
+    Wave completion is deliberately keyed to the raw-score emission set inside
+    :func:`_current_koth_entries`: those are the members whose shared coverage
+    decides which confirmation rows enter the fold. Once the fold moves a raw
+    member below rank five, however, the ordinary retest cohort no longer
+    includes it. Without returning and serving those raw ``wave_members`` the
+    lane deadlocks permanently at that member's depth: the scheduler keeps
+    retesting the folded top five while the fold waits for somebody it will
+    never schedule.
+
+    The returned retest cohort is therefore the configured folded cohort plus
+    every raw wave member, in that order. This may add at most five gate
+    catch-up members; it changes neither emissions nor score arithmetic.
     """
     entries = await _current_koth_entries(
         session,
@@ -2848,17 +2861,32 @@ async def _current_retest_cohort(
         wave_membership=settings.wave_membership,
     )
     projection = project_koth(entries)
+    raw_entries = [
+        replace(
+            entry,
+            quorum_composites=None,
+            completed_wave_composites=None,
+            confirmation_composites=None,
+            confirmation_seeds=None,
+        )
+        for entry in entries
+    ]
+    wave_members = emission_set(project_koth(raw_entries))
     statistical = settings.retest_eligibility_mode == "statistical"
-    return (
-        emission_set(projection),
-        retest_cohort(
-            entries,
-            projection,
-            size=settings.retest_cohort_size,
-            max_size=settings.retest_cohort_max_size if statistical else None,
-            tolerance_z=settings.retest_eligibility_z if statistical else 0.0,
-        ),
+    emission_members = emission_set(projection)
+    configured_cohort = retest_cohort(
+        entries,
+        projection,
+        size=settings.retest_cohort_size,
+        max_size=settings.retest_cohort_max_size if statistical else None,
+        tolerance_z=settings.retest_eligibility_z if statistical else 0.0,
     )
+    seen = {member.agent_id for member in configured_cohort}
+    combined_cohort = (
+        *configured_cohort,
+        *(member for member in wave_members if member.agent_id not in seen),
+    )
+    return emission_members, wave_members, combined_cohort
 
 
 async def _confirm_king_onchain_weights(
@@ -3468,12 +3496,12 @@ async def request_top5_confirmation_job(
                     status_code=428,
                     detail="fresh benchmark v7 inference capability is required",
                 )
-        emission_members, members = await _current_retest_cohort(
+        emission_members, wave_members, members = await _current_retest_cohort(
             session,
             canonical_version=canonical_version,
             settings=continual_settings,
         )
-        emission_member_ids = frozenset(member.agent_id for member in emission_members)
+        wave_member_ids = frozenset(member.agent_id for member in wave_members)
         if not members or members[0].agent_id != payload.champion_agent_id:
             raise HTTPException(
                 status_code=409,
@@ -3531,7 +3559,7 @@ async def request_top5_confirmation_job(
             session,
             champion_agent_id=payload.champion_agent_id,
             member_agent_id=payload.member_agent_id,
-            wave_member_ids=tuple(member.agent_id for member in emission_members),
+            wave_member_ids=tuple(member.agent_id for member in wave_members),
             cohort_member_ids=tuple(member.agent_id for member in members),
             canonical_version=canonical_version,
         )
@@ -3582,13 +3610,11 @@ async def request_top5_confirmation_job(
         if not await _top5_member_is_least_covered(
             session,
             members=members,
-            emission_member_ids=emission_member_ids,
+            emission_member_ids=wave_member_ids,
             catchup_member_ids=await _unserved_catchup_members(
                 session,
                 champion_agent_id=payload.champion_agent_id,
-                emission_member_ids=tuple(
-                    member.agent_id for member in emission_members
-                ),
+                emission_member_ids=tuple(member.agent_id for member in wave_members),
                 canonical_version=canonical_version,
                 now=now,
             ),
