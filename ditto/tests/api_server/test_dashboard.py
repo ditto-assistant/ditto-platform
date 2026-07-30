@@ -349,8 +349,12 @@ class TestDashboard:
         assert "mean of the initial three scores" in body
         assert "full cohort wave" in body
         assert "continually adjusts up or down" in body
-        assert "function continualVarianceSvg(e)" in body
-        assert "Score observations: initial quorum" in body
+        # The per-sample dot plot was a debugging view; the row now carries the
+        # seed-round count and keeps the mean's composition in the tooltip.
+        assert "function continualVarianceSvg(e)" not in body
+        assert "Score observations: initial quorum" not in body
+        assert "continual-retest seed " in body
+        assert 'class="rollout-chip settled seed-rounds-chip tip"' in body
         assert "benchmarkVersionKey(pipeline.active_bench_version)" in body
         assert "cohortMedian(cohort.scores)" in body
         assert "pipeline.score_count) + ' of ' + esc(pipeline.quorum)" not in body

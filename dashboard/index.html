@@ -481,6 +481,11 @@
     .err { position: absolute; top: -2px; height: 11px; z-index: 2; background: color-mix(in oklch, var(--text) 16%, transparent); border-left: 1px solid color-mix(in oklch, var(--text) 48%, transparent); border-right: 1px solid color-mix(in oklch, var(--text) 48%, transparent); border-radius: 1px; pointer-events: none; }
     /* Composite cell = bar row + optional sparkline stacked. */
     .cwrap { display: flex; flex-direction: column; gap: 5px; }
+    /* The cell's second line: sparklines and score chips. Its layout lives
+       here rather than inline on the element so page-scoped rules can size
+       and hide what sits inside it — an inline `display` wins over any
+       stylesheet selector (see .overview-main). */
+    .cline2 { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-height: 16px; }
     .spark { display: block; }
     .spark path { fill: none; stroke: var(--accent-2); stroke-width: 1.5; }
     .spark .dot { fill: var(--accent-2); }
@@ -2406,11 +2411,15 @@
     .overview-main #board .chain-weight-note { white-space: normal; }
     .overview-main #board .emission-badge { white-space: normal; }
     /* No sideways scrolling on the compact board: the fixed layout already
-       pins the table to pane width, this clips any rounding remainder. The
-       composite cell keeps bar + score only; the sparkline and score chips
-       stay on the Leaderboard page and in row detail. */
+       pins the table to pane width, this clips any rounding remainder. */
     .overview-main .board { overflow-x: hidden; }
-    .overview-main #board .cline2 { display: none; }
+    /* The compact board keeps the composite trend graph and the gate chip —
+       both read at a glance in a narrow pane. The seed-round count needs its
+       tooltip to mean anything, so it stays on the Leaderboard page and in row
+       detail. Targeting that chip (rather than hiding .cline2 wholesale) is why
+       .cline2's own layout has to live in the stylesheet: an inline `display`
+       outranks every selector here. */
+    .overview-main #board .seed-rounds-chip { display: none; }
     /* The compact pane can't give the filter a 200px minimum next to three
        tab pills; let it shrink to share their row (placeholder may clip) and
        only wrap below ~84px of remaining space. Split widths only: below the
@@ -5537,43 +5546,19 @@
         '<div class="bar composite" style="width:' + w.toFixed(1) + '%"></div></div>' +
         '<span class="mval">' + fx(v) + '</span></div>';
       var spark = sparkSvg(e.history);
-      var variance = continualVarianceSvg(e);
       var chip = rolloutChip(e);
       var continualChip = continualScoreChip(e);
       var gateChip = qualityGateChip(e);
       var tokenChip = tokenPenaltyChip(e);
-      var line2 = (spark || variance || chip || continualChip || gateChip || tokenChip)
-        ? '<div class="cline2" style="display:flex;flex-wrap:wrap;align-items:center;gap:6px;min-height:16px">' + spark + variance + chip + continualChip + gateChip + tokenChip + '</div>' : "";
-      return '<td><div class="cwrap">' + row + line2 + '</div></td>';
+      var line2 = (spark || chip || continualChip || gateChip || tokenChip)
+        ? '<div class="cline2">' + spark + chip + continualChip + gateChip + tokenChip + '</div>' : "";
       return '<td><div class="cwrap">' + row + line2 + '</div></td>';
     }
 
-    function continualVarianceSvg(e) {
-      if (!e || e.aggregate_method !== "continual_mean") return "";
-      var initial = (e.initial_quorum_composites || []).map(Number).filter(Number.isFinite);
-      var waves = (e.completed_wave_composites || []).map(Number).filter(Number.isFinite);
-      var samples = initial.concat(waves);
-      if (samples.length < 4) return "";
-      var x = function (value) { return 3 + Math.max(0, Math.min(1, value)) * 94; };
-      var low = Math.min.apply(null, samples);
-      var high = Math.max.apply(null, samples);
-      var mean = Number(e.official_composite);
-      var dots = initial.map(function (value) {
-        return '<circle cx="' + x(value).toFixed(1) + '" cy="8" r="2.1" fill="var(--muted)" />';
-      }).join("") + waves.map(function (value) {
-        return '<circle cx="' + x(value).toFixed(1) + '" cy="8" r="2.3" fill="var(--gold)" />';
-      }).join("");
-      var title = "Score observations: initial quorum " + initial.map(fx).join(", ") +
-        "; retained samples " + waves.map(fx).join(", ") +
-        "; range " + fx(low) + "–" + fx(high) + "; current mean " + fx(mean) + ".";
-      return '<svg class="spark tip" tabindex="0" role="img" aria-label="' + esc(title) +
-        '" data-tooltip="' + esc(title) + '" viewBox="0 0 100 16">' +
-        '<line x1="' + x(low).toFixed(1) + '" y1="8" x2="' + x(high).toFixed(1) +
-        '" y2="8" stroke="var(--border)" stroke-width="2" />' + dots +
-        '<line x1="' + x(mean).toFixed(1) + '" y1="2" x2="' + x(mean).toFixed(1) +
-        '" y2="14" stroke="var(--accent)" stroke-width="1.5" /></svg>';
-    }
-
+    // The per-sample dot plot that used to sit here was a debugging view of the
+    // continual mean's spread. The seed-round count is the number a miner acts
+    // on, so the chip below carries it and the mean's full composition lives in
+    // the tooltip; per-score values remain in row detail.
     function continualScoreChip(e) {
       if (!e) return "";
       if (e.aggregate_method !== "continual_mean") {
@@ -5586,15 +5571,15 @@
           esc(pending + (pending === 1 ? " retained sample" : " retained samples") + " · activation pending") + '</span>';
       }
       var waves = Number(e.retained_sample_count == null ? e.completed_wave_count : e.retained_sample_count) || 0;
-      var retained = Number(e.confirmation_seed_depth) || 0;
+      var seeds = Number(e.confirmation_seed_depth) || 0;
       var samples = Number(e.aggregate_sample_count) || (3 + waves);
-      var title = "Current leaderboard score: arithmetic mean of the original three validator scores plus " +
-        waves + " retained per-seed " + (waves === 1 ? "sample" : "samples") +
-        ". Scheduling cohort changes never remove an accepted sample; KOTH comparisons " +
-        "pair agents only on seed identities they share.";
-      return '<span class="rollout-chip settled tip" tabindex="0" data-tooltip="' + esc(title) + '">' +
-        esc(samples + "-sample mean · " + retained + " retained " +
-          (retained === 1 ? "sample" : "samples")) + '</span>';
+      var title = "Current leaderboard score: arithmetic mean of " + samples + " scores — the " +
+        "original three validator scores plus " + waves + " retained per-seed " +
+        (waves === 1 ? "sample" : "samples") + " from " + seeds + " continual-retest seed " +
+        (seeds === 1 ? "round" : "rounds") + ". Scheduling cohort changes never remove an " +
+        "accepted sample; KOTH comparisons pair agents only on seed identities they share.";
+      return '<span class="rollout-chip settled seed-rounds-chip tip" tabindex="0" data-tooltip="' + esc(title) + '">' +
+        esc(seeds + (seeds === 1 ? " seed" : " seeds")) + '</span>';
     }
     // Why the composite is not simply the tool/memory average: the base IS that
     // average (½·tool + ½·memory), and the benchmark quality gates (chiefly the
