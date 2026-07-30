@@ -3543,6 +3543,13 @@ class TestPublicFleet:
 
         assert public_endpoint._stack_component_issues(None) == []
         assert public_endpoint._stack_component_issues(_stack()) == []
+        current = ValidatorStackHealth(
+            ditto_subnet=_component("healthy"),
+            dittobench_api=_component("healthy"),
+            sandbox_docker=_component("healthy"),
+            pylon=_component("healthy"),
+        )
+        assert public_endpoint._stack_component_issues(current) == []
         # A reachable-but-degraded required scorer (its relay path is down) is
         # named with its exact state, not collapsed into a bare flag.
         assert public_endpoint._stack_component_issues(
