@@ -183,6 +183,10 @@ class TestDashboard:
             'class="operations"'
         )
         assert 'id="leaderboard-title">Leaderboard' in body
+        assert "one rank per payment-owner family" in body
+        assert 'class="family-toggle"' in body
+        assert "Scored, but not independently ranked" in body
+        assert "function renderFamilyStanding(pipeline)" in body
         assert 'id="leaderboard-notice" role="status" aria-live="polite"' in body
         assert "Provisional standings." in body
         assert "not the required 3 of 3 scores" in body

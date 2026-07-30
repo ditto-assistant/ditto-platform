@@ -9,8 +9,12 @@ This is Surface 3 in [`docs/public-telemetry.md`](../docs/public-telemetry.md).
 
 - **Subnet snapshot** — total miners are the primary signal, with scored-miner,
   leaderboard, throughput, and latency metrics in one top-level panel.
-- **Leaderboard** — best eligible score per miner, ranked by raw finalized
-  composite, with a separate KOTH emissions projection that identifies the
+- **Leaderboard** — one ranked representative per payment-time ownership family,
+  selected by the best eligible canonical score. Other finalized generations
+  remain available in a collapsed family disclosure with their canonical scores,
+  but receive neither fake ranks nor extra emission positions. Submission detail
+  pages state when a scored generation is represented by another family member.
+  The ranked representative carries a separate KOTH emissions projection that identifies the
   first-seen incumbent champion and participation-tail recipients. The projection
   applies the validator's frozen 0.007 composite-point hysteresis, statistical
   dethrone band, and v6+ high-score decay, so raw rank #1 is never mislabeled as

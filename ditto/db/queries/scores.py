@@ -158,6 +158,92 @@ class LedgerRow:
 
 
 @dataclass(frozen=True)
+class SubmissionFamilyMemberRow:
+    """One finalized full-benchmark generation in an owner's ranking family."""
+
+    owner: str
+    agent_id: UUID
+    agent_name: str
+    agent_version: int | None
+    miner_hotkey: str
+    canonical_composite: float
+    submitted_at: datetime
+
+
+async def list_submission_family_members(
+    session: AsyncSession,
+    *,
+    bench_version: int,
+) -> dict[str, list[SubmissionFamilyMemberRow]]:
+    """Return every finalized ranked generation grouped by emission owner.
+
+    The leaderboard intentionally publishes one representative per payment-time
+    coldkey. This companion read keeps the other scored generations visible
+    without assigning them fake ranks or extra emission positions. It rebuilds
+    each agent's canonical quorum median from the same score rows used by the
+    ledger and applies the same full-run and positive-score gates.
+    """
+    rows = (
+        await session.execute(
+            select(
+                Agent.agent_id,
+                Agent.name,
+                Agent.version,
+                Agent.miner_hotkey,
+                Agent.created_at,
+                EvaluationPayment.miner_coldkey,
+                Score.validator_hotkey,
+                Score.composite,
+            )
+            .join(Score, Score.agent_id == Agent.agent_id)
+            .outerjoin(EvaluationPayment, EvaluationPayment.agent_id == Agent.agent_id)
+            .where(
+                Agent.status.in_((AgentStatus.SCORED, AgentStatus.LIVE)),
+                Score.bench_version == bench_version,
+                Score.n >= MIN_ELIGIBLE_CASES,
+                Score.composite > 0.0,
+            )
+            .order_by(Agent.created_at, Agent.agent_id, Score.validator_hotkey)
+        )
+    ).all()
+
+    by_agent: dict[UUID, list[Any]] = defaultdict(list)
+    for row in rows:
+        by_agent[row.agent_id].append(row)
+
+    families: dict[str, list[SubmissionFamilyMemberRow]] = defaultdict(list)
+    for agent_id, score_rows in by_agent.items():
+        if len({row.validator_hotkey for row in score_rows}) < SCORING_QUORUM:
+            continue
+        first = score_rows[0]
+        owner = emission_owner(
+            miner_hotkey=first.miner_hotkey,
+            miner_coldkey=first.miner_coldkey,
+        )
+        families[owner].append(
+            SubmissionFamilyMemberRow(
+                owner=owner,
+                agent_id=agent_id,
+                agent_name=first.name,
+                agent_version=first.version,
+                miner_hotkey=first.miner_hotkey,
+                canonical_composite=float(median(row.composite for row in score_rows)),
+                submitted_at=first.created_at,
+            )
+        )
+
+    for members in families.values():
+        members.sort(
+            key=lambda member: (
+                -member.canonical_composite,
+                member.submitted_at,
+                str(member.agent_id),
+            )
+        )
+    return dict(families)
+
+
+@dataclass(frozen=True)
 class MemoryLeaderTimelinePoint:
     """One new all-time-high finalized memory score inside a benchmark era."""
 
