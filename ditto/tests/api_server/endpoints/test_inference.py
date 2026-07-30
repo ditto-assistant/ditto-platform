@@ -1,5 +1,6 @@
 import base64
 from datetime import UTC, datetime
+from typing import Any
 from uuid import UUID, uuid4
 
 import bittensor
@@ -391,6 +392,66 @@ def test_proxy_schema_accepts_bounded_scalar_controls() -> None:
             },
         }
     )
+
+
+def test_tool_result_name_is_accepted_then_removed_from_provider_payload() -> None:
+    """Legacy-compatible tool annotations must not make a run unevaluable."""
+    payload: dict[str, Any] = {
+        "model": "openai/gpt-oss-20b",
+        "messages": [
+            {"role": "user", "content": "look it up"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{}"},
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call-1",
+                "name": "lookup",
+                "content": '{"result":"ok"}',
+            },
+        ],
+    }
+
+    _validate_request_schema(payload)
+    upstream = _locked_upstream_payload(
+        payload, model="openai/gpt-oss-20b", max_tokens=256
+    )
+
+    assert upstream["messages"][2] == {
+        "role": "tool",
+        "tool_call_id": "call-1",
+        "content": '{"result":"ok"}',
+    }
+    assert payload["messages"][2]["name"] == "lookup"
+
+
+@pytest.mark.parametrize("name", ["", None, 7])
+def test_tool_result_name_must_be_a_non_empty_string(name: object) -> None:
+    with pytest.raises(HTTPException) as raised:
+        _validate_request_schema(
+            {
+                "model": "openai/gpt-oss-20b",
+                "messages": [
+                    {
+                        "role": "tool",
+                        "tool_call_id": "call-1",
+                        "name": name,
+                        "content": "ok",
+                    }
+                ],
+            }
+        )
+
+    assert raised.value.status_code == 400
+    assert raised.value.detail == "invalid tool name"
 
 
 def test_aggregate_route_is_speed_sorted_private_and_fallback_enabled() -> None:
