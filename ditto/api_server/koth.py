@@ -35,12 +35,8 @@ KOTH_DETHRONE_Z = 1.64
 # a reign-backoff over the champion's crown (see ``top5_round_is_due``).
 BLOCKS_PER_TEMPO = 360
 
-# Ceiling on the champion-anchored confirmation-seed depth, mirroring the subnet's
-# ``TOP5_MAX_CONFIRMATION_SEEDS`` (ditto/validator/config.py).  The platform
-# derives ``crn_seed([champion], version, k)`` for ``k in range(this)`` to bound
-# the anti-grind check: a submitted confirmation seed only counts as
-# champion-anchored top-5 evidence if it lands in this set.  Must be >= the
-# subnet's cap so a legitimately-deep champion's newest seed is still recognised.
+# Backwards-compatible minimum champion-anchored planning horizon. The live
+# horizon extends from durable observed history; this is no longer a ceiling.
 TOP5_MAX_CONFIRMATION_SEEDS = 16
 
 

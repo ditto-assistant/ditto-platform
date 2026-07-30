@@ -83,6 +83,24 @@ def champion_anchored_seeds(
     )
 
 
+def continual_anchor_horizon(
+    seeds_by_agent: Mapping[UUID, Iterable[int]],
+    *,
+    minimum: int = TOP5_MAX_CONFIRMATION_SEEDS,
+) -> int:
+    """Enough deterministic anchor seeds to include one unseen growth seed.
+
+    The historical fixed horizon of sixteen exhausted permanently. A finite
+    durable history can contain at most ``N`` distinct seeds, so generating
+    ``N + 1`` anchor candidates guarantees at least one fresh seed without an
+    arbitrary new ceiling.
+    """
+    observed: set[int] = set()
+    for seeds in seeds_by_agent.values():
+        observed.update(int(seed) for seed in seeds)
+    return max(1, int(minimum), len(observed) + 1)
+
+
 def fold_seed_bound(
     *,
     champion_agent_id: UUID,
