@@ -77,6 +77,7 @@ async def reserve_upload_admission(
     miner_hotkey: str,
     sha256: str,
     settings: EffectiveSubmissionSettings,
+    replace_existing: bool = False,
     now: datetime | None = None,
 ) -> UploadAdmission:
     """Reserve one eligible coldkey slot so payment cannot lose a later race."""
@@ -96,16 +97,32 @@ async def reserve_upload_admission(
                 expires_at=_utc(existing.expires_at),
                 cooldown_seconds=existing.cooldown_seconds,
             )
+        if replace_existing and existing.miner_hotkey == miner_hotkey:
+            # A verified, still-unconsumed payment for this hotkey may fund a
+            # different archive. Rotate the opaque token while holding the
+            # coldkey lock so an in-flight request for the old bytes cannot win
+            # after reassignment.
+            existing.token = uuid.uuid4()
+            existing.sha256 = sha256
+            existing.created_at = current
+            existing.expires_at = current + UPLOAD_ADMISSION_TTL
+            await session.flush()
+            return UploadAdmission(
+                token=existing.token,
+                expires_at=_utc(existing.expires_at),
+                cooldown_seconds=existing.cooldown_seconds,
+            )
         raise SubmissionCooldownError(_utc(existing.expires_at))
 
-    retry_at = await get_submission_retry_at(
-        session,
-        miner_coldkey=miner_coldkey,
-        cooldown=timedelta(seconds=settings.cooldown_seconds),
-        now=current,
-    )
-    if retry_at is not None:
-        raise SubmissionCooldownError(retry_at)
+    if not replace_existing:
+        retry_at = await get_submission_retry_at(
+            session,
+            miner_coldkey=miner_coldkey,
+            cooldown=timedelta(seconds=settings.cooldown_seconds),
+            now=current,
+        )
+        if retry_at is not None:
+            raise SubmissionCooldownError(retry_at)
 
     row = UploadAdmissionReservation(
         miner_coldkey=miner_coldkey,

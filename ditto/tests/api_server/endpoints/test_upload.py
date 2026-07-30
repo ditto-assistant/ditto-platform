@@ -171,6 +171,7 @@ class TestUploadCheck:
     def _session(self, app: FastAPI) -> None:
         # /upload/check now reads the ban list, so it needs a session dep.
         override_get_session(app)
+        _override_payment_verifier(app)
 
     async def test_happy_path(self, app: FastAPI, client: httpx.AsyncClient):
         # is_registered=True by default in the fake chain client.
@@ -215,6 +216,66 @@ class TestUploadCheck:
         assert result["admission_expires_at"] == "2026-07-24T20:30:00Z"
         assert result["cooldown_seconds"] == 3600
         reserve.assert_awaited_once()
+
+    async def test_unconsumed_payment_reassigns_same_hotkey_reservation(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        override_get_chain_client(app)
+        token = uuid4()
+        reserve = AsyncMock(
+            return_value=SimpleNamespace(
+                token=token,
+                expires_at=datetime(2026, 7, 25, 20, 30, tzinfo=UTC),
+                cooldown_seconds=3600,
+            )
+        )
+        monkeypatch.setattr(
+            "ditto.api_server.endpoints.upload.reserve_upload_admission", reserve
+        )
+        monkeypatch.setattr(
+            "ditto.api_server.endpoints.upload.get_evaluation_payment_for_proof",
+            AsyncMock(
+                return_value=SimpleNamespace(
+                    agent_id=None,
+                    miner_hotkey=_make_keypair().ss58_address,
+                )
+            ),
+        )
+        response = await client.post(
+            "/api/v1/upload/check",
+            json={
+                **_signed_request_body(sha256="b" * 64),
+                "reserve_submission_slot": True,
+                "payment_block_hash": _GOOD_BLOCK_HASH,
+                "payment_block_number": 13579,
+                "payment_extrinsic_index": 7,
+            },
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["ok"] is True
+        assert response.json()["payment_required"] is False
+        assert response.json()["admission_token"] == str(token)
+        assert reserve.await_args is not None
+        assert reserve.await_args.kwargs["replace_existing"] is True
+
+    async def test_partial_recovery_payment_proof_is_rejected(
+        self, app: FastAPI, client: httpx.AsyncClient
+    ) -> None:
+        override_get_chain_client(app)
+        response = await client.post(
+            "/api/v1/upload/check",
+            json={
+                **_signed_request_body(),
+                "reserve_submission_slot": True,
+                "payment_block_hash": _GOOD_BLOCK_HASH,
+            },
+        )
+
+        assert response.status_code == 422
 
     async def test_identical_artifact_stops_payment_unless_rescore_is_explicit(
         self,
@@ -386,6 +447,7 @@ class TestUploadCheck:
         custom_app = create_api_server(cfg)
         custom_app.state.commit_hash = "test-commit"
         override_get_session(custom_app)  # /upload/check reads the ban list
+        _override_payment_verifier(custom_app)
 
         recorded: dict[str, int] = {}
 
