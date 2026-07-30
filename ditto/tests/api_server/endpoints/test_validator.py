@@ -8476,6 +8476,45 @@ class TestTop5ConfirmationLane:
             # sends every progress report to a slot with no matching lease.
             assert ticket.slot_id == "slot-1"
 
+    async def test_one_validator_fills_two_slots_with_distinct_members(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """A lease for member A must not veto member B on a free slot."""
+        agent_ids = await _seed_top5_emission_set(session_maker)
+        champion, first_member, second_member = agent_ids[:3]
+        await self._arm_idle_retest_lane(
+            app,
+            session_maker,
+            champion,
+            capacity={
+                "configured_slots": 4,
+                "healthy_slots": ["slot-0", "slot-1", "slot-2", "slot-3"],
+                "admission": "accepting",
+                "active": [],
+            },
+        )
+
+        first = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_AUTH_HEADER,
+            json=_top5_job_payload(champion, first_member),
+        )
+        second = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_AUTH_HEADER,
+            json=_top5_job_payload(champion, second_member),
+        )
+
+        assert first.status_code == 200, first.text
+        assert second.status_code == 200, second.text
+        assert {first.json()["slot_id"], second.json()["slot_id"]} == {
+            "slot-0",
+            "slot-1",
+        }
+
     async def test_operator_slot_cap_bounds_the_retest_lane(
         self,
         app: FastAPI,
@@ -9157,6 +9196,71 @@ class TestTop5ConfirmationLane:
         assert folded_entrant not in wave_ids
         assert {raw_cutoff, folded_entrant} <= cohort_ids
         assert len(cohort) == 6
+
+    async def test_folded_top_five_entrant_preempts_raw_member_for_catchup(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """Current top-five membership, not raw rank, owns catch-up priority.
+
+        This reproduces the production split where a folded rank-two member had
+        zero continual confirmations while a raw top-five member retained deep
+        history. The raw member must remain in the cohort so already-issued wave
+        work can finish, but it must not outrank the current emission member
+        that is missing the shared seed set.
+        """
+        from ditto.api_server.crn import champion_anchored_seeds
+
+        agent_ids = await _seed_top5_emission_set(
+            session_maker,
+            composites=[0.90, 0.89, 0.88, 0.87, 0.86, 0.85],
+        )
+        champion, *_, raw_cutoff, folded_entrant = agent_ids
+        seeds = champion_anchored_seeds(champion, version=_BENCH_VERSION, max_seeds=16)[
+            :3
+        ]
+        async with session_maker() as session, session.begin():
+            # Only the raw top five participated in the old wave. A very low
+            # retained aggregate moves its cutoff member below the newcomer,
+            # which enters the authoritative top five at depth zero.
+            for agent_id in agent_ids[:5]:
+                wave_composite = 0.10 if agent_id == raw_cutoff else 0.90
+                for seed in seeds:
+                    session.add(
+                        ConfirmationScore(
+                            agent_id=agent_id,
+                            validator_hotkey=_VALIDATOR_HOTKEY,
+                            bench_version=_BENCH_VERSION,
+                            seed=seed,
+                            composite=wave_composite,
+                            run_id=f"priority-{agent_id}-{seed}",
+                            signature=None,
+                        )
+                    )
+        await _set_retest_cohort_size(session_maker, 5, idle_retests_enabled=True)
+        _install_db(app, session_maker)
+        app.state.session_maker = session_maker
+        app.state.continual_retest_settings.invalidate()
+        _install_chain_with_block(app, block_number=1)
+
+        raw_claim = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_top5_auth_header(_KEYPAIRS[0]),
+            json=_top5_job_payload(champion, raw_cutoff, keypair=_KEYPAIRS[0]),
+        )
+        assert raw_claim.status_code == 409
+        assert "less confirmation coverage" in raw_claim.json()["message"]
+
+        entrant_claim = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_top5_auth_header(_KEYPAIRS[1]),
+            json=_top5_job_payload(champion, folded_entrant, keypair=_KEYPAIRS[1]),
+        )
+        assert entrant_claim.status_code == 200, entrant_claim.text
+        assert entrant_claim.json()["agent_id"] == str(folded_entrant)
+        assert entrant_claim.json()["confirmation_datasets"][0]["seed"] in seeds
 
     async def test_emission_set_is_served_before_the_extended_cohort(
         self,
