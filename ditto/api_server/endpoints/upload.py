@@ -175,7 +175,11 @@ async def eval_pricing(request: Request, oracle: OracleDep) -> EvalPricingRespon
 
 @router.post("/check", response_model=UploadCheckResponse)
 async def check(
-    request: Request, body: UploadCheckRequest, chain: ChainDep, session: SessionDep
+    request: Request,
+    body: UploadCheckRequest,
+    chain: ChainDep,
+    verifier: PaymentVerifierDep,
+    session: SessionDep,
 ) -> UploadCheckResponse:
     """Pre-payment dry-run validation.
 
@@ -240,9 +244,60 @@ async def check(
                 "Set allow_identical_rescore=true only to purchase another seed."
             )
 
+    recovery_payment_verified = False
+    if (
+        not codes
+        and body.payment_block_hash is not None
+        and body.payment_block_number is not None
+        and body.payment_extrinsic_index is not None
+    ):
+        payment_record = await get_evaluation_payment_for_proof(
+            session,
+            block_hash=body.payment_block_hash,
+            extrinsic_index=body.payment_extrinsic_index,
+        )
+        if payment_record is not None:
+            if payment_record.agent_id is not None:
+                raise PaymentReplayedError("payment proof already used")
+            if payment_record.miner_hotkey != body.hotkey:
+                raise PaymentReplayedError(
+                    "payment credit belongs to a different hotkey"
+                )
+            recovery_payment_verified = True
+        else:
+            # The replay lookup autobegins a read transaction. Do not hold a
+            # pooled connection across the recovery proof's chain reads.
+            if session.in_transaction():
+                rollback_result = session.rollback()
+                if inspect.isawaitable(rollback_result):
+                    await rollback_result
+            try:
+                verified = await verifier.verify_payment(
+                    PaymentProof(
+                        block_hash=body.payment_block_hash,
+                        block_number=body.payment_block_number,
+                        extrinsic_index=body.payment_extrinsic_index,
+                    ),
+                    expected_hotkey=body.hotkey,
+                )
+            except ChainError as e:
+                logger.warning(f"chain unreachable during /upload/check recovery: {e}")
+                raise HTTPException(
+                    status_code=503, detail="chain unavailable; retry shortly"
+                ) from e
+            recovery_payment_verified = True
+            if verified.miner_coldkey != owner_coldkey:
+                raise PaymentReplayedError(
+                    "payment owner no longer matches this admission reservation"
+                )
+
     retry_at = None
     settings = await effective_submission_settings(session)
-    if duplicate is None and owner_coldkey is not None:
+    if (
+        duplicate is None
+        and owner_coldkey is not None
+        and not recovery_payment_verified
+    ):
         retry_at = await get_submission_retry_at(
             session,
             miner_coldkey=owner_coldkey,
@@ -268,6 +323,7 @@ async def check(
                     miner_hotkey=body.hotkey,
                     sha256=body.sha256,
                     settings=settings,
+                    replace_existing=recovery_payment_verified,
                 )
         except SubmissionCooldownError as exc:
             retry_at = exc.retry_at
@@ -278,7 +334,7 @@ async def check(
         ok=not codes,
         error_codes=codes,
         messages=messages,
-        payment_required=not codes,
+        payment_required=not codes and not recovery_payment_verified,
         identical_agent_id=duplicate.agent_id if duplicate else None,
         identical_agent_status=duplicate.status if duplicate else None,
         retry_at=retry_at,

@@ -113,3 +113,79 @@ async def test_matching_token_is_consumed_and_legacy_upload_cannot_steal_slot(
             settings=settings,
             now=now + timedelta(seconds=2),
         )
+
+
+async def test_verified_payment_rotates_reservation_to_new_archive(
+    session: AsyncSession,
+) -> None:
+    now = datetime(2026, 7, 24, 20, 0, tzinfo=UTC)
+    settings = EffectiveSubmissionSettings(revision=4, cooldown_seconds=3600)
+    async with session.begin():
+        original = await reserve_upload_admission(
+            session,
+            miner_coldkey="coldkey",
+            miner_hotkey="hotkey",
+            sha256="a" * 64,
+            settings=settings,
+            now=now,
+        )
+    async with session.begin():
+        replacement = await reserve_upload_admission(
+            session,
+            miner_coldkey="coldkey",
+            miner_hotkey="hotkey",
+            sha256="b" * 64,
+            settings=settings,
+            replace_existing=True,
+            now=now + timedelta(minutes=5),
+        )
+
+    assert replacement.token != original.token
+    with pytest.raises(SubmissionCooldownError):
+        async with session.begin():
+            await consume_or_enforce_upload_admission(
+                session,
+                miner_coldkey="coldkey",
+                miner_hotkey="hotkey",
+                sha256="a" * 64,
+                admission_token=original.token,
+                settings=settings,
+                now=now + timedelta(minutes=6),
+            )
+    async with session.begin():
+        await consume_or_enforce_upload_admission(
+            session,
+            miner_coldkey="coldkey",
+            miner_hotkey="hotkey",
+            sha256="b" * 64,
+            admission_token=replacement.token,
+            settings=settings,
+            now=now + timedelta(minutes=6),
+        )
+
+
+async def test_verified_payment_cannot_move_reservation_to_different_hotkey(
+    session: AsyncSession,
+) -> None:
+    now = datetime(2026, 7, 24, 20, 0, tzinfo=UTC)
+    settings = EffectiveSubmissionSettings(revision=4, cooldown_seconds=3600)
+    async with session.begin():
+        await reserve_upload_admission(
+            session,
+            miner_coldkey="coldkey",
+            miner_hotkey="hotkey-a",
+            sha256="a" * 64,
+            settings=settings,
+            now=now,
+        )
+    with pytest.raises(SubmissionCooldownError):
+        async with session.begin():
+            await reserve_upload_admission(
+                session,
+                miner_coldkey="coldkey",
+                miner_hotkey="hotkey-b",
+                sha256="b" * 64,
+                settings=settings,
+                replace_existing=True,
+                now=now + timedelta(minutes=5),
+            )
