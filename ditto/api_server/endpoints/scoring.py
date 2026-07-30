@@ -35,7 +35,6 @@ from ditto.api_models import ConfirmationScoreRecord, LedgerEntry, LedgerRespons
 from ditto.api_models.upload import _SS58_PATTERN
 from ditto.api_models.validator import LedgerScoreProof
 from ditto.api_server.continual_retest_settings import aggregate_is_active
-from ditto.api_server.crn import fold_seed_bound
 from ditto.api_server.efficiency import effective_composite
 from ditto.api_server.endpoints.validator import (
     ChainDep,
@@ -44,17 +43,9 @@ from ditto.api_server.endpoints.validator import (
     _assert_validator_permitted,
     _verify_signature,
 )
-from ditto.api_server.koth import (
-    KothEntry,
-    emission_set,
-    project_koth,
-)
 from ditto.db.models import Score
 from ditto.db.queries.benchmark_rollout import active_bench_version
-from ditto.db.queries.confirmation_scores import (
-    confirmation_history_by_agent,
-    fold_eligible_seeds_by_agent,
-)
+from ditto.db.queries.confirmation_scores import confirmation_history_by_agent
 from ditto.db.queries.efficiency import get_bonus_rows
 from ditto.db.queries.heartbeats import live_validator_fleet_supports_protocol
 from ditto.db.queries.scores import (
@@ -66,7 +57,6 @@ from ditto.db.queries.validator_auth import (
     ValidatorRequestReplayError,
     consume_validator_nonce,
 )
-from ditto.score_order import rank_submissions
 
 logger = logging.getLogger(__name__)
 
@@ -347,51 +337,6 @@ async def scores(
     except SQLAlchemyError as e:
         return _serve_last_known(request, x_validator_hotkey, e)
 
-    raw_candidates = [row for row in rows if row.eligible and row.composite > 0.0]
-    raw_candidates = rank_submissions(raw_candidates)
-    raw_projection = project_koth(
-        [
-            KothEntry(
-                miner_hotkey=row.miner_hotkey,
-                agent_id=row.agent_id,
-                composite=row.composite,
-                first_seen=row.first_seen,
-                raw_rank=rank,
-                bench_version=row.bench_version,
-                composite_stderr=_ledger_stderr(
-                    row.details, quorum.get(row.agent_id, [])
-                ),
-            )
-            for rank, row in enumerate(raw_candidates, start=1)
-        ]
-    )
-    raw_member_ids = [member.agent_id for member in emission_set(raw_projection)]
-    # Per agent, because ``per_agent`` membership gives each agent a different
-    # eligible set. Under ``strict`` and ``participants`` every entry maps to the
-    # same intersection, so this is the previous single set spelled per row.
-    # Anchored on the reigning champion so the intersection is taken over the
-    # current wave's seeds rather than the whole cross-reign trail; this ledger
-    # is what validators fold, so it has to scope identically to the board.
-    eligible_seeds = fold_eligible_seeds_by_agent(
-        member_ids=raw_member_ids or history.keys(),
-        seeds_by_agent={
-            agent_id: tuple(row.seed for row in agent_history)
-            for agent_id, agent_history in history.items()
-        },
-        mode=continual_settings.wave_membership,
-        anchored_seeds=(
-            fold_seed_bound(
-                champion_agent_id=raw_member_ids[0],
-                anchor_version=canonical_version,
-                seeds_by_agent={
-                    agent_id: tuple(row.seed for row in agent_history)
-                    for agent_id, agent_history in history.items()
-                },
-            )
-            if raw_member_ids
-            else None
-        ),
-    )
     generated_at = datetime.now(UTC)
     entries = [
         LedgerEntry(
@@ -425,7 +370,6 @@ async def scores(
                         signature=row.signature,
                     )
                     for row in history[r.agent_id]
-                    if row.seed in eligible_seeds.get(r.agent_id, frozenset())
                 ]
                 if continual_mean_active and r.agent_id in history
                 else None

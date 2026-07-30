@@ -518,14 +518,35 @@ class PublicLeaderboardEntry(BaseModel):
             description=(
                 "Composite used for the current leaderboard and weight fold. It "
                 "starts as the canonical three-validator median, then becomes "
-                "the arithmetic mean of those three scores plus every completed "
-                "continual cohort-wave score. Partial waves never enter it."
+                "the arithmetic mean of those three scores plus every retained "
+                "per-seed sample accepted for this agent. Scheduling membership "
+                "never removes an accepted sample."
             ),
         ),
     ]
     aggregate_method: Literal["canonical_median", "continual_mean"] = "canonical_median"
     aggregate_sample_count: Annotated[int, Field(ge=3)] = 3
-    completed_wave_count: Annotated[int, Field(ge=0)] = 0
+    completed_wave_count: Annotated[
+        int,
+        Field(
+            ge=0,
+            description=(
+                "Compatibility alias for retained_sample_count. Historically "
+                "this was a current-cohort intersection; it now counts the "
+                "accepted per-seed samples actually used by this agent's mean."
+            ),
+        ),
+    ] = 0
+    retained_sample_count: Annotated[
+        int,
+        Field(
+            ge=0,
+            description=(
+                "Accepted per-seed samples permanently included in this "
+                "agent's continual mean."
+            ),
+        ),
+    ] = 0
     initial_quorum_composites: list[Annotated[float, Field(ge=0.0, le=1.0)]] = Field(
         default_factory=list
     )
@@ -538,12 +559,8 @@ class PublicLeaderboardEntry(BaseModel):
             ge=0,
             description=(
                 "Raw count of distinct seeds this submission has accepted "
-                "continual-retest evidence for, independent of whether the "
-                "cohort wave those seeds belong to is complete. A wave only "
-                "completes once every current emission-set member has a result "
-                "for the same seed, so a new entrant with no retests yet drops "
-                "``completed_wave_count`` to zero for the whole board while "
-                "this count -- the append-only audit trail -- keeps growing."
+                "continual-retest evidence for. This is append-only and equals "
+                "retained_sample_count while the continual aggregate is active."
             ),
         ),
     ] = 0

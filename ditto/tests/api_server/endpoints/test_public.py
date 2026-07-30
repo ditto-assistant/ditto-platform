@@ -1354,29 +1354,25 @@ class TestPublicLeaderboard:
         assert entries[tail_id]["composite"] == pytest.approx(0.80)
         assert entries[tail_id]["official_composite"] == pytest.approx(0.85)
 
-    async def test_new_entrant_resets_waves_but_keeps_confirmation_depth(
+    async def test_new_entrant_cannot_remove_retained_samples(
         self,
         app: FastAPI,
         client: httpx.AsyncClient,
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
-        """A fresh emission-set member must not look like retest data loss.
+        """A fresh emission-set member cannot rewrite accepted evidence.
 
         Regression for the 2026-07-26 incident: three completed waves vanished
         from the public board the moment a newly finalized agent entered the
         top five. ``completed_confirmation_wave_seeds`` intersects over the
         *current* members, so an entrant with no retests empties it board-wide.
-        Zeroing the fold-eligible count is correct -- the still-running leases
-        for the rest of the wave must not be invalidated -- but the accepted
-        rows are append-only and were never deleted, so the raw depth has to
-        survive the reset or the UI reads as though the data is gone.
+        The old global intersection made the entrant's scheduling membership
+        erase every sibling's aggregate. Membership now controls future work
+        only: each agent permanently averages every seed accepted for it, while
+        pairwise KOTH comparisons independently intersect seed identities.
 
-        This test now pins ``wave_membership="strict"`` EXPLICITLY. It used to
-        rely on that being the shipped default; the default is ``participants``
-        as of the fold change, so the revision below is what keeps #485's
-        original coverage meaningful. It doubles as the regression test for the
-        rollback path: if an operator returns the board to ``strict``, this is
-        the behaviour they get back, display half included.
+        ``strict`` is pinned to prove the old operator setting cannot restore
+        destructive score filtering.
         """
         from ditto.db.models import ContinualRetestSettingsRevision
         from ditto.db.queries.confirmation_scores import (
@@ -1476,11 +1472,14 @@ class TestPublicLeaderboard:
 
         after = (await client.get("/api/v1/public/leaderboard")).json()
         entries = {entry["agent_id"]: entry for entry in after["entries"]}
-        # The fold-eligible view collapses board-wide: that part is by design.
+        # The entrant starts from its quorum median, while existing agents keep
+        # every retained sample regardless of the new scheduling membership.
         assert entries[entrant_id]["completed_wave_count"] == 0
-        assert entries[champion_id]["completed_wave_count"] == 0
-        assert entries[champion_id]["completed_wave_composites"] == []
-        assert entries[champion_id]["aggregate_method"] == "canonical_median"
+        assert entries[champion_id]["completed_wave_count"] == 3
+        assert entries[champion_id]["completed_wave_composites"] == pytest.approx(
+            [0.90, 0.90, 0.90]
+        )
+        assert entries[champion_id]["aggregate_method"] == "continual_mean"
         assert entries[champion_id]["official_composite"] == pytest.approx(0.90)
         # ...but the append-only audit trail must still be visible.
         assert entries[champion_id]["confirmation_seed_depth"] == 3
@@ -1607,13 +1606,13 @@ class TestPublicLeaderboard:
         assert entries[champion_id]["completed_wave_count"] == 3
         assert entries[rest[0]]["completed_wave_count"] == 3
 
-    async def test_stale_anchor_history_does_not_empty_the_current_wave(
+    async def test_cross_reign_history_remains_per_agent_evidence(
         self,
         app: FastAPI,
         client: httpx.AsyncClient,
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
-        """A member's rows from a PREVIOUS reign must not erase the live wave.
+        """Rows from a previous reign remain evidence only for their owner.
 
         Production, 2026-07-27: the board showed every emission recipient at
         ``shared_seed_confirmations: 0`` and "wave pending" while the lane was
@@ -1746,11 +1745,15 @@ class TestPublicLeaderboard:
         assert entries[tail_id]["completed_wave_composites"] == pytest.approx(
             [0.60, 0.60, 0.60]
         )
-        # The stale-only member holds nothing on this anchor, so it stays on the
-        # quorum median -- its 0.10 rows never reach any aggregate.
-        assert entries[stale_only_id]["completed_wave_count"] == 0
-        assert entries[stale_only_id]["aggregate_method"] == "canonical_median"
-        assert entries[stale_only_id]["official_composite"] == pytest.approx(0.70)
+        # The stale-only member permanently retains its own accepted samples.
+        # They affect its mean but cannot become paired evidence against either
+        # live member because the seed identities do not intersect.
+        assert entries[stale_only_id]["completed_wave_count"] == 8
+        assert entries[stale_only_id]["retained_sample_count"] == 8
+        assert entries[stale_only_id]["aggregate_method"] == "continual_mean"
+        assert entries[stale_only_id]["official_composite"] == pytest.approx(
+            (0.70 * 3 + 0.10 * 8) / 11
+        )
         # ...but the append-only audit trail is still reported in full.
         assert entries[stale_only_id]["confirmation_seed_depth"] == 8
 

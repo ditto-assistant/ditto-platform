@@ -5359,7 +5359,7 @@
         return '<circle cx="' + x(value).toFixed(1) + '" cy="8" r="2.3" fill="var(--gold)" />';
       }).join("");
       var title = "Score observations: initial quorum " + initial.map(fx).join(", ") +
-        "; completed waves " + waves.map(fx).join(", ") +
+        "; retained samples " + waves.map(fx).join(", ") +
         "; range " + fx(low) + "–" + fx(high) + "; current mean " + fx(mean) + ".";
       return '<svg class="spark tip" tabindex="0" role="img" aria-label="' + esc(title) +
         '" data-tooltip="' + esc(title) + '" viewBox="0 0 100 16">' +
@@ -5371,33 +5371,25 @@
 
     function continualScoreChip(e) {
       if (!e) return "";
-      // A wave completes only when every *current* emission-set member shares a
-      // seed, so one new entrant with no retests yet resets completed_wave_count
-      // to zero board-wide. The accepted retests are still on file, so show the
-      // pending state rather than letting the chip vanish and read as data loss.
       if (e.aggregate_method !== "continual_mean") {
         var pending = Number(e.confirmation_seed_depth) || 0;
         if (!pending) return "";
         var pendingTitle = "Recorded " + pending + " continual-retest " +
-          (pending === 1 ? "seed" : "seeds") + " for this agent, but no cohort wave " +
-          "is complete: a wave counts only once every current emission-set member " +
-          "has a result for the same seed, and that resets whenever the set changes. " +
-          "The initial three-score median stays authoritative meanwhile.";
+          (pending === 1 ? "seed" : "seeds") + " for this agent. The initial " +
+          "three-score median stays authoritative until continual aggregation activates.";
         return '<span class="rollout-chip tip" tabindex="0" data-tooltip="' + esc(pendingTitle) + '">' +
-          esc(pending + (pending === 1 ? " retest seed" : " retest seeds") + " · wave pending") + '</span>';
+          esc(pending + (pending === 1 ? " retained sample" : " retained samples") + " · activation pending") + '</span>';
       }
-      var waves = Number(e.completed_wave_count) || 0;
+      var waves = Number(e.retained_sample_count == null ? e.completed_wave_count : e.retained_sample_count) || 0;
       var retained = Number(e.confirmation_seed_depth) || 0;
-      var excluded = Math.max(0, retained - waves);
       var samples = Number(e.aggregate_sample_count) || (3 + waves);
       var title = "Current leaderboard score: arithmetic mean of the original three validator scores plus " +
-        waves + " aggregate-eligible shared " + (waves === 1 ? "wave" : "waves") +
-        ". The append-only audit ledger retains " + retained + " confirmation " +
-        (retained === 1 ? "seed" : "seeds") + "; " + excluded + " are not currently fold-eligible.";
+        waves + " retained per-seed " + (waves === 1 ? "sample" : "samples") +
+        ". Scheduling cohort changes never remove an accepted sample; KOTH comparisons " +
+        "pair agents only on seed identities they share.";
       return '<span class="rollout-chip settled tip" tabindex="0" data-tooltip="' + esc(title) + '">' +
-        esc(samples + "-sample mean · " + waves + " eligible shared " +
-          (waves === 1 ? "wave" : "waves") + " · " + retained + " retained " +
-          (retained === 1 ? "seed" : "seeds")) + '</span>';
+        esc(samples + "-sample mean · " + retained + " retained " +
+          (retained === 1 ? "sample" : "samples")) + '</span>';
     }
     // Why the composite is not simply the tool/memory average: the base IS that
     // average (½·tool + ½·memory), and the benchmark quality gates (chiefly the
@@ -5701,7 +5693,7 @@
         stat("Submission", agentVersionLabel(e.agent_version)) +
         stat("Current leaderboard score", fx(official) +
           (rolling
-            ? "  · mean of " + e.aggregate_sample_count + " scores (" + e.completed_wave_count + " completed " + (e.completed_wave_count === 1 ? "wave" : "waves") + ")"
+            ? "  · mean of " + e.aggregate_sample_count + " scores (" + e.retained_sample_count + " retained samples)"
             : (e.composite_stderr != null ? "  ± " + fx(e.composite_stderr) + " SE" : "") + "  · canonical quorum median")) +
         (rolling ? stat("Initial quorum median", fx(e.composite) + "  · first 3 accepted validator scores") : "") +
         stat("Tool mean", fx(e.tool_mean) + "  (" + pct(e.tool_mean) + ")") +
