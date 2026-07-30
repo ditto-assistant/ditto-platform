@@ -8116,6 +8116,28 @@ class TestPublicProgressResolution:
     resolution is now exact, *and* nothing per-case rode in alongside it.
     """
 
+    def test_operations_keeps_an_active_retest_beyond_terminal_history(self) -> None:
+        """A finalized top-five row remains visible while its retest runs."""
+        active_id = uuid4()
+        projected = [
+            (SimpleNamespace(agent=SimpleNamespace(agent_id=uuid4())), "scored")
+            for _ in range(51)
+        ]
+        active_row = (
+            SimpleNamespace(agent=SimpleNamespace(agent_id=active_id)),
+            "live",
+        )
+        rows = public_endpoint._operations_activity_rows(
+            [*projected, active_row],
+            board_statuses={"evaluating"},
+            board_active_agent_ids={active_id},
+            terminal_history_limit=50,
+        )
+
+        assert active_row in rows
+        assert len(rows) == 51
+        assert rows.count(active_row) == 1
+
     @staticmethod
     def _progress(
         stage: str, completed: int | None, total: int | None
