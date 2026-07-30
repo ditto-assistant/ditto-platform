@@ -83,6 +83,7 @@ from ditto.db.models import (
     ScreeningQuarantineResolution,
     ValidatorTicket,
 )
+from ditto.db.queries.screening import MAX_SCREENING_EXPIRIES
 from ditto.db.queries.tickets import issue_ticket
 from ditto.tests.legacy_era import retired_era_writes_allowed
 from ditto_screening_protocol import ScreenResultOutcome, verdict_signing_message
@@ -2172,6 +2173,26 @@ class TestQuarantineAdmin:
         )
         assert held.status_code == 200
 
+        # Historical infrastructure expiries must not override the operator's
+        # later release when this agent re-enters for its build-only image pass.
+        expired_base = datetime.now(UTC) - timedelta(hours=6)
+        async with session_maker() as session, session.begin():
+            for index in range(MAX_SCREENING_EXPIRIES):
+                started = expired_base + timedelta(minutes=45 * index)
+                session.add(
+                    ScreeningAttempt(
+                        attempt_id=uuid4(),
+                        agent_id=agent_id,
+                        screener_hotkey=_SCREENER_HOTKEY,
+                        policy_version=SCREENING_POLICY_VERSION,
+                        status="expired",
+                        started_at=started,
+                        deadline=started + timedelta(minutes=45),
+                        finished_at=started + timedelta(minutes=45),
+                        public_reason="Screening lease expired",
+                    )
+                )
+
         generator = _FakeGenerator(run_size="full", sha="be" * 32)
         _install_generator(app, generator)
         headers = {
@@ -2215,8 +2236,12 @@ class TestQuarantineAdmin:
         # build that image — otherwise validators would skip it forever.
         next_claim = await client.post(_CLAIM_URL)
         assert next_claim.status_code == 200
-        reclaimed = {item["agent_id"] for item in next_claim.json()["items"]}
-        assert str(agent_id) in reclaimed
+        reclaimed = next(
+            item
+            for item in next_claim.json()["items"]
+            if item["agent_id"] == str(agent_id)
+        )
+        assert reclaimed["build_only"] is True
 
     async def test_build_only_attempt_cannot_quarantine(
         self,
