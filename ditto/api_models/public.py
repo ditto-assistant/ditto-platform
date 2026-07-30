@@ -2007,6 +2007,17 @@ class PublicActivityResponse(BaseModel):
             ),
         ),
     ]
+    downloadable_count: Annotated[
+        int,
+        Field(
+            ge=0,
+            description=(
+                "Number of submissions whose source is currently available for "
+                "public download, before status filters are applied. Search filtering "
+                "is reflected when present."
+            ),
+        ),
+    ] = 0
     page: Annotated[int, Field(ge=1, description="Current one-based page number.")]
     page_size: Annotated[int, Field(ge=1, description="Maximum entries per page.")]
     total_pages: Annotated[

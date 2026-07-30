@@ -4743,6 +4743,53 @@ class TestPublicActivity:
         assert response.status_code == 422
         assert "unknown public activity status: obsolete" in response.text
 
+    async def test_filters_downloadable_agents_and_composes_with_search(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        now = datetime.now(UTC)
+        downloadable_id = await _seed_k3(
+            session_maker,
+            miner=_MINER_A,
+            composites=[0.61, 0.64, 0.67],
+            status=AgentStatus.LIVE,
+        )
+        await _crown(
+            session_maker,
+            agent_id=downloadable_id,
+            first_crowned_at=now - timedelta(hours=49),
+        )
+        await _seed_agent(
+            session_maker,
+            miner=_MINER_B,
+            status=AgentStatus.LIVE,
+            name="alpha private",
+        )
+        _install_db(app, session_maker)
+
+        response = await client.get(
+            "/api/v1/public/activity",
+            params={"downloadable": "true", "q": downloadable_id},
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["downloadable_count"] == 1
+        assert body["total"] == 1
+        assert [entry["agent_id"] for entry in body["entries"]] == [downloadable_id]
+        assert body["entries"][0]["artifact_release"]["download_available"] is True
+
+        no_matches = (
+            await client.get(
+                "/api/v1/public/activity",
+                params={"downloadable": "true", "status": "rejected"},
+            )
+        ).json()
+        assert no_matches["downloadable_count"] == 1
+        assert no_matches["total"] == 0
+
     async def test_exposes_latest_platform_score_time_for_finalized_agents(
         self,
         app: FastAPI,

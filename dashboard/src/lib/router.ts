@@ -84,7 +84,7 @@ export const ENTITY_PAGES: Record<string, PageName> = {
 
 // Per-page view state (submissions filters + either pager's "page"). It is
 // scoped to the page that owns it, so it must not ride along to another page.
-export const PAGE_SCOPED_PARAMS: string[] = ["status", "q", "page"];
+export const PAGE_SCOPED_PARAMS: string[] = ["status", "downloadable", "q", "page"];
 
 // The config knobs allowed to appear in the real query string.
 const CONFIG_KEYS = ["api", "wandb"] as const;

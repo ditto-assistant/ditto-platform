@@ -3471,6 +3471,7 @@ def _public_activity_response(
     page: int,
     limit: int,
     requested_statuses: set[str],
+    downloadable_only: bool,
     query: str | None,
     score_continuation_floor: float | None,
     active_assignment_agent_ids: set[UUID],
@@ -3536,11 +3537,22 @@ def _public_activity_response(
     status_counts: dict[str, int] = {}
     for _, row_status in projected:
         status_counts[row_status] = status_counts.get(row_status, 0) + 1
+    downloadable_count = sum(
+        1
+        for row, _ in projected
+        if artifact_releases[row.agent.agent_id].download_available
+    )
     if requested_statuses:
         projected = [
             (row, row_status)
             for row, row_status in projected
             if row_status in requested_statuses
+        ]
+    if downloadable_only:
+        projected = [
+            (row, row_status)
+            for row, row_status in projected
+            if artifact_releases[row.agent.agent_id].download_available
         ]
 
     total = len(projected)
@@ -3572,6 +3584,7 @@ def _public_activity_response(
         count=len(page_rows),
         total=total,
         status_counts=status_counts,
+        downloadable_count=downloadable_count,
         page=page,
         page_size=page_size,
         total_pages=max(1, math.ceil(total / limit)),
@@ -3839,6 +3852,7 @@ async def activity(
     page: int = Query(default=1, ge=1),
     limit: int = Query(default=50, ge=1, le=200),
     status: Annotated[list[str] | None, Query()] = None,
+    downloadable: bool = Query(default=False),
     review: Literal["ath"] | None = Query(default=None),
     q: str | None = Query(default=None, min_length=1, max_length=200),
 ) -> PublicActivityResponse:
@@ -3917,6 +3931,7 @@ async def activity(
         page=page,
         limit=limit,
         requested_statuses=requested_statuses,
+        downloadable_only=downloadable,
         query=q,
         score_continuation_floor=score_continuation_floor,
         active_assignment_agent_ids=active_assignment_agent_ids,
@@ -3990,6 +4005,7 @@ async def operations(
         page=1,
         limit=max(1, len(activity_rows)),
         requested_statuses=set(),
+        downloadable_only=False,
         query=None,
         score_continuation_floor=score_continuation_floor,
         active_assignment_agent_ids=active_assignment_agent_ids,

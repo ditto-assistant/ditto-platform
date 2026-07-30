@@ -31,6 +31,7 @@ export interface ActivityEntry {
 interface ActivityPayloadBase<E> {
   entries?: E[];
   status_counts?: Record<string, number>;
+  downloadable_count?: number;
   page?: number;
   total_pages?: number;
   total?: number;
