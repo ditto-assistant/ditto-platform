@@ -44,7 +44,6 @@ from ditto.db.queries.benchmark_rollout import (
     create_rollout_snapshot,
 )
 from ditto.tests.legacy_era import (
-    grandfather_active_era,
     retired_era_writes_allowed,
 )
 
@@ -52,12 +51,9 @@ pytestmark = pytest.mark.asyncio
 
 _TOKEN = "test-admin-token-at-least-32-characters"
 _HEADERS = {"Authorization": f"Bearer {_TOKEN}"}
-# The rollout these tests start. It has to be v7: the retired-era floor refuses
-# any rollout row whose target is below it, so v4 -- the version this scenario
-# was originally written against -- can no longer be opened at all. Nothing here
-# is about v4 specifically; it is the "some target ahead of the active version"
-# slot, and v7 is the only value that still fills it.
-_TARGET = 7
+# The rollout these tests start. V8 is shipped as a target while v7 remains the
+# active era; only the explicit guarded start below may open the transition.
+_TARGET = 8
 # The message the deployed generate-service actually returned when the rollout
 # was started from the operator console against a datagen release that only
 # ships v2 and v3. Quoted verbatim, so it keeps naming the versions it named.
@@ -164,7 +160,7 @@ def _capabilities(now: datetime) -> tuple[dict[str, Any], dict[str, Any]]:
         "executor_isolation": "privileged_dind",
         "scorer_benchmarks": {
             "status": "fresh_verified",
-            "supported_bench_versions": [2, 3, _TARGET],
+            "supported_bench_versions": [2, 3, 7, _TARGET],
             "observed_at": int(now.timestamp()),
             "software_version": "1.3.0",
             "source_revision": revision,
@@ -204,14 +200,17 @@ def _capabilities(now: datetime) -> tuple[dict[str, Any], dict[str, Any]]:
 
 
 def _add_cohort_agent(
-    session: AsyncSession, *, position: int, composite: float, now: datetime
+    session: AsyncSession,
+    *,
+    position: int,
+    composite: float,
+    now: datetime,
+    bench_version: int = 2,
 ) -> RolloutSnapshotMember:
-    """Add one SCORED agent with a full v2 quorum, top-five eligible.
+    """Add one SCORED agent with a full source-era quorum, top-five eligible.
 
-    The quorum is v2 because that is the era a rollout starts FROM here, and it
-    is below the retired-era floor. Callers must therefore seed inside
-    ``retired_era_writes_allowed``: these are the inherited rows production
-    grandfathered, and they are what the cohort is ranked out of.
+    Historical tests retain the v2 default and seed inside
+    ``retired_era_writes_allowed``. The v8 transition passes v7 explicitly.
     """
     agent_id = uuid4()
     miner = f"miner-{position}"
@@ -237,9 +236,9 @@ def _add_cohort_agent(
         session.add(
             Score(
                 agent_id=agent_id,
-                bench_version=2,
-                validator_hotkey=f"legacy-{validator}",
-                run_id=f"v2-{position}-{validator}",
+                bench_version=bench_version,
+                validator_hotkey=f"source-{validator}",
+                run_id=f"v{bench_version}-{position}-{validator}",
                 signature="aa",
                 seed=position,
                 composite=composite,
@@ -247,7 +246,7 @@ def _add_cohort_agent(
                 memory_mean=0.5,
                 median_ms=1,
                 n=114,
-                details={"bench_version": 2},
+                details={"bench_version": bench_version},
                 generated_at=now,
             )
         )
@@ -310,28 +309,31 @@ async def _seed_start_ready(
 ) -> list[RolloutSnapshotMember]:
     """Seed the five-miner cohort and just enough capable validators to start.
 
-    Also records the activation that makes v2 -- the era this cohort is ranked
-    out of -- the one actually in force. ``active_bench_version`` answers from
-    durable authority decisions and, with none on record, answers the FLOOR.
-    That is the honest reply for a ledger with no activation history, but it
-    leaves an operator start with nowhere to go: ``_TARGET`` is 7 and so is the
-    floor, so ``expected_active_version`` never matches and the forward-only
-    guard would refuse 7 -> 7 even if it did.
-
-    A grandfathered pre-floor rollout row is a state the database legitimately
-    holds -- the floor is ``NOT VALID`` precisely so production keeps its
-    activation history -- and it is the shape production was in before the v7
-    transition. Re-point this at the 7 -> 8 transition once the v8 contract
-    lands (ditto-assistant/ditto-platform#513); only then is there a legal
-    forward target above the floor.
+    Also records the v7 activation that is in force before the v8 transition.
+    This is the production-shaped forward transition and avoids reaching into
+    a retired era for a test that is not about retired history.
     """
     capabilities, stack = _capabilities(now)
-    async with maker() as session, retired_era_writes_allowed(session), session.begin():
-        await grandfather_active_era(session, version=2, now=now - timedelta(days=30))
+    async with maker() as session, session.begin():
+        session.add(
+            BenchmarkRollout(
+                rollout_id=uuid4(),
+                from_version=6,
+                desired_version=7,
+                status="activated",
+                cohort_size=5,
+                created_at=now - timedelta(days=30),
+                activated_at=now - timedelta(days=30),
+            )
+        )
         _add_ready_route(session, now)
         members = [
             _add_cohort_agent(
-                session, position=position, composite=0.5 + position / 100, now=now
+                session,
+                position=position,
+                composite=0.5 + position / 100,
+                now=now,
+                bench_version=7,
             )
             for position in range(1, 6)
         ]
@@ -361,8 +363,8 @@ async def _rollout_count(maker: async_sessionmaker[AsyncSession]) -> int:
     """How many rollouts exist for the transition under test.
 
     Scoped to ``_TARGET`` rather than counting the whole table: the fixture also
-    seeds the grandfathered activation that puts the ledger on v2, and "did the
-    start leave a rollout behind" is a question about the v7 transition, not
+    seeds the activation that puts the ledger on v7, and "did the start leave a
+    rollout behind" is a question about the v8 transition, not
     about the history it starts from.
     """
     async with maker() as session:
@@ -381,7 +383,7 @@ def _start_payload() -> dict[str, Any]:
         "reason": f"start the v{_TARGET} rollout",
         "actor": "backroom:test",
         "confirmation": f"START BENCHMARK V{_TARGET}",
-        "expected_active_version": 2,
+        "expected_active_version": 7,
     }
 
 
@@ -403,14 +405,20 @@ async def test_control_discovery_is_authenticated_read_only_and_dynamic(
     assert body["active_version"] == MIN_SCOREABLE_BENCH_VERSION
     assert body["status"] == "inactive"
     # Nothing is offered. A target must be both above the active version and at
-    # or above the floor, and with v7 shipped as the newest contract those two
-    # meet at exactly one era -- the one already in force. The console cannot
-    # suggest what ``start_rollout`` would refuse, and until the v8 contract
-    # lands (ditto-assistant/ditto-platform#513) there is nothing to suggest.
-    assert body["available_target_versions"] == []
+    # or above the floor. V8 is discoverable but remains inert until an
+    # authenticated operator starts it.
+    assert body["available_target_versions"] == [8]
     # Still derived from the shipped registry, which is what "dynamic" means
     # here: the floor filters what may be STARTED, not what exists.
-    assert [contract["version"] for contract in body["contracts"]] == [2, 3, 4, 5, 6, 7]
+    assert [contract["version"] for contract in body["contracts"]] == [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+    ]
     assert all(
         contract["capable_validator_count"] == 0 for contract in body["contracts"]
     )
@@ -498,17 +506,19 @@ async def test_control_degrades_the_slow_section_instead_of_hanging(
     # answers the floor -- that list is empty, the loop never runs and the stub
     # below is never called: the test would pass while proving nothing.
     #
-    # Putting the ledger on v6, through the grandfathered activation that put
-    # it there in production, leaves exactly one candidate (v7) to hang on.
-    async with (
-        session_maker() as session,
-        retired_era_writes_allowed(session),
-        session.begin(),
-    ):
-        await grandfather_active_era(
-            session,
-            version=_TARGET - 1,
-            now=datetime.now(UTC).replace(microsecond=0) - timedelta(days=30),
+    # Putting the ledger on v7 leaves exactly one candidate (v8) to hang on.
+    async with session_maker() as session, session.begin():
+        now = datetime.now(UTC).replace(microsecond=0) - timedelta(days=30)
+        session.add(
+            BenchmarkRollout(
+                rollout_id=uuid4(),
+                from_version=6,
+                desired_version=7,
+                status="activated",
+                cohort_size=5,
+                created_at=now,
+                activated_at=now,
+            )
         )
 
     async def _slow(*_args: object, **_kwargs: object) -> dict[str, object]:
@@ -527,7 +537,15 @@ async def test_control_degrades_the_slow_section_instead_of_hanging(
     # real rollout row: nothing is open, and the last transition finished.
     assert body["active_version"] == _TARGET - 1
     assert body["status"] == "activated"
-    assert [contract["version"] for contract in body["contracts"]] == [2, 3, 4, 5, 6, 7]
+    assert [contract["version"] for contract in body["contracts"]] == [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+    ]
     # Fail closed on what could not be proven: no candidate is offered for
     # activation, and the omission is named rather than mistaken for "none".
     assert body["active_contract_candidates"] == []
@@ -588,12 +606,12 @@ async def test_start_requires_full_guard_payload_and_exact_confirmation(
     assert "START BENCHMARK V4" in wrong.json()["message"]
 
     unsupported = await client.post(
-        "/api/v1/admin/benchmark-rollout/8",
+        "/api/v1/admin/benchmark-rollout/9",
         headers=_HEADERS,
         json={
             "reason": "attempt an unshipped contract",
             "actor": "backroom:test",
-            "confirmation": "START BENCHMARK V8",
+            "confirmation": "START BENCHMARK V9",
             "expected_active_version": 2,
         },
     )
@@ -707,7 +725,7 @@ async def test_start_still_succeeds_when_the_generator_ships_the_target(
     body = response.json()
     assert body["status"] == "collecting"
     assert body["desired_version"] == _TARGET
-    assert body["active_version"] == 2
+    assert body["active_version"] == 7
     assert [version for _seed, version in generator.calls] == [_TARGET] * len(members)
     assert {UUID(member["agent_id"]) for member in body["members"]} == {
         member.agent_id for member in members

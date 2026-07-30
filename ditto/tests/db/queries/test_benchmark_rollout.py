@@ -16,6 +16,10 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from ditto.api_models.admin_quarantine import AdminBenchmarkQualificationRequest
 from ditto.api_models.agent_status import AgentStatus
+from ditto.api_models.benchmark_contract import (
+    benchmark_contract,
+    latest_benchmark_contract,
+)
 from ditto.api_models.ticket_status import TicketPurpose, TicketStatus
 from ditto.api_server.benchmark_rollout import (
     ensure_rolling_qualification,
@@ -53,6 +57,7 @@ from ditto.db.queries.benchmark_rollout import (
     CANARY_BENCH_VERSION,
     DEFAULT_BENCH_VERSION,
     DEFAULT_RESCORE_COHORT_SIZE,
+    LEGACY_BENCH_VERSION,
     MIN_DESIRED_AUTHORITY_AGENTS,
     MIN_SCOREABLE_BENCH_VERSION,
     DatasetPin,
@@ -92,6 +97,16 @@ pytestmark = pytest.mark.asyncio
 _Seeded = TypeVar("_Seeded")
 
 
+async def test_v8_contract_is_a_target_not_an_activation() -> None:
+    contract = benchmark_contract(8)
+    assert contract.minimum_screening_policy_version == 9
+    assert contract.requires_screened_image is True
+    assert latest_benchmark_contract() == contract
+    assert CANARY_BENCH_VERSION == 8
+    assert DEFAULT_BENCH_VERSION == 2
+    assert LEGACY_BENCH_VERSION == 2
+
+
 async def test_admin_status_read_does_not_start_rollout(
     session_maker: async_sessionmaker[AsyncSession],
 ) -> None:
@@ -126,14 +141,12 @@ async def test_admin_status_read_does_not_start_rollout(
 
         control = await get_rollout_control(None, session)
         # A target must be both above the active version and at or above the
-        # floor; with v7 the newest shipped contract those meet at the era
-        # already in force, so nothing is offered. The console must not suggest
-        # what ``start_rollout`` would refuse. Becomes ``[8]`` when the v8
-        # contract lands (ditto-assistant/ditto-platform#513).
-        assert control["available_target_versions"] == []
+        # floor. Shipping v8 makes it discoverable as a target but does not
+        # create or activate a rollout.
+        assert control["available_target_versions"] == [8]
         contracts = control["contracts"]
         assert isinstance(contracts, list)
-        assert [item["version"] for item in contracts] == [2, 3, 4, 5, 6, 7]
+        assert [item["version"] for item in contracts] == [2, 3, 4, 5, 6, 7, 8]
         assert control["status"] == "inactive"
         count = await session.scalar(select(func.count(BenchmarkRollout.rollout_id)))
         assert count == 0
@@ -153,7 +166,10 @@ def _capabilities(now: datetime) -> tuple[dict, dict]:
         "executor_isolation": "privileged_dind",
         "scorer_benchmarks": {
             "status": "fresh_verified",
-            "supported_bench_versions": [2, CANARY_BENCH_VERSION],
+            # V8 uses the same hosted-inference identity as v7. A scorer that
+            # advertises v8 therefore continues to advertise the v7 contract
+            # whose calibration identity is carried below.
+            "supported_bench_versions": sorted({2, 7, CANARY_BENCH_VERSION}),
             "observed_at": int(now.timestamp()),
             "software_version": "1.3.0",
             "source_revision": revision,
@@ -2365,6 +2381,46 @@ async def test_supersede_frees_the_open_slot_for_the_next_rollout(
         assert fresh.desired_version == 9
         assert fresh.status == "collecting"
         await session.flush()
+
+
+async def test_superseding_v8_rolls_the_target_back_to_active_v7(
+    session_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    now = datetime.now(UTC).replace(microsecond=0)
+    async with session_maker() as session, session.begin():
+        session.add(
+            BenchmarkRollout(
+                rollout_id=uuid4(),
+                from_version=6,
+                desired_version=7,
+                status="activated",
+                cohort_size=5,
+                created_at=now - timedelta(days=1),
+                activated_at=now - timedelta(days=1),
+            )
+        )
+        members, pins = await _seed_members(session, now)
+        rollout = await create_rollout_snapshot(
+            session,
+            members=members,
+            datasets=pins,
+            now=now,
+            from_version=7,
+            desired_version=8,
+        )
+        assert await active_bench_version(session) == 7
+
+        superseded = await supersede_open_rollout(
+            session,
+            actor="backroom:test",
+            reason="roll back the unopened v8 target",
+            now=now + timedelta(seconds=1),
+        )
+        assert superseded is not None
+        assert superseded.rollout_id == rollout.rollout_id
+        assert superseded.status == "superseded"
+        assert await open_rollout(session) is None
+        assert await active_bench_version(session) == 7
 
 
 async def test_superseded_rollout_issues_no_tickets_and_never_activates(
