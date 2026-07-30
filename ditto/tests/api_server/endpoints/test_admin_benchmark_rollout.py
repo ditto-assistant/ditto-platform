@@ -157,7 +157,7 @@ def _capabilities(now: datetime) -> tuple[dict[str, Any], dict[str, Any]]:
         "sandbox_egress_restricted": True,
         "ticket_inference": True,
         "signed_score_quorum": True,
-        "executor_isolation": "privileged_dind",
+        "executor_isolation": "rootless_dind",
         "scorer_benchmarks": {
             "status": "fresh_verified",
             "supported_bench_versions": [2, 3, 7, _TARGET],
