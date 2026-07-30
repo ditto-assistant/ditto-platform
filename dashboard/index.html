@@ -284,7 +284,67 @@
        horizontal scrollbar. */
     .leaderboard-version-switch .activity-filter-list { flex: 0 1 auto; min-width: 0; justify-content: flex-end; }
     @media (max-width: 640px) {
-      .leaderboard-version-switch { align-items: flex-start; flex-direction: column; }
+      .leaderboard-version-switch { position: relative; align-items: flex-start; flex-direction: column; }
+      /* Stacked here, so the row reads left-to-right like the rest of the
+         column; keeping flex-end would strand a wrapped Archive on the right. */
+      .leaderboard-version-switch .activity-filter-list { justify-content: flex-start; }
+    }
+    /* Bench versions accumulate one pill per shipped benchmark and never
+       retire, so the row keeps the rollout plus the newest few and files the
+       rest behind one Archive trigger (the overflow-disclosure pattern). The
+       trigger is an .activity-filter like its neighbours — only the caret and
+       the popover are new — and whichever version is selected is promoted into
+       the visible row, so the pressed pill is never hidden inside a closed
+       menu. Disclosure semantics, not a menu: the options are ordinary buttons
+       reachable by Tab, with arrows and Escape as shortcuts. */
+    .version-archive { position: relative; display: inline-flex; }
+    /* Sized and dimmed like the table's sort arrow, the page's other glyph cue. */
+    .version-archive-caret { font-size: 11px; line-height: 1; opacity: .5; transition: transform 140ms ease; }
+    .version-archive-trigger[aria-expanded="true"] { border-color: var(--border-strong); color: var(--text); }
+    .version-archive-trigger[aria-expanded="true"] .version-archive-caret { transform: rotate(180deg); }
+    .version-archive-menu {
+      position: absolute;
+      z-index: 30;
+      top: calc(100% + 7px);
+      right: 0;
+      min-width: 152px;
+      max-width: min(240px, calc(100vw - 32px));
+      max-height: min(280px, 46vh);
+      overflow-y: auto;
+      padding: 4px;
+      border: 1px solid var(--border-strong);
+      border-radius: 6px;
+      background: var(--bg-elev);
+      box-shadow: 0 8px 8px color-mix(in oklch, var(--text) 16%, transparent);
+    }
+    .version-archive-menu[hidden] { display: none; }
+    .version-archive-option {
+      display: block;
+      width: 100%;
+      min-height: 32px;
+      padding: 7px 9px;
+      border: 0;
+      border-radius: 3px;
+      background: transparent;
+      /* Dim like an unpressed pill: full-strength ink would read as selected. */
+      color: var(--text-dim);
+      font: 650 11.5px/1.2 var(--sans);
+      text-align: left;
+      cursor: pointer;
+      transition: background 140ms ease, color 140ms ease;
+    }
+    .version-archive-option + .version-archive-option { margin-top: 2px; }
+    .version-archive-option:hover { background: var(--bg-elev-2); color: var(--text); }
+    /* The menu scrolls, so an outset ring would be clipped at its edges. */
+    .version-archive-option:focus-visible { outline-offset: -2px; }
+    /* Must follow the base rules above: same specificity, so source order is
+       what decides. Pills wrap on a phone and the trigger can end up far
+       enough right that a menu anchored to it leaves the viewport — so drop
+       the wrapper's positioning context and span the switch instead. */
+    @media (max-width: 640px) {
+      .version-archive { position: static; }
+      .version-archive-menu { top: calc(100% + 6px); right: 0; left: 0; min-width: 0; max-width: none; }
+      .version-archive-option { min-height: 44px; }
     }
     thead th.sortable { cursor: pointer; user-select: none; }
     thead th.sortable:hover { color: var(--text); }
@@ -5243,34 +5303,179 @@
     // the moment its first score lands, no dashboard change needed.
     var availableBenchVersions = [2];
 
+    // How many historical versions stay on the row beside "Current rollout".
+    // Everything older files under Archive, so the row's width stops growing
+    // with the benchmark's age instead of gaining a pill per release forever.
+    var VISIBLE_VERSION_PILLS = 2;
+    var versionArchiveOpen = false;
+    var versionArchivePointerDown = false;
+
     // The pills are data-driven, so clicks are delegated to the group container
     // rather than bound per button (rebuilt buttons keep working).
-    document.getElementById("leaderboard-version-pills").addEventListener("click", function (event) {
+    var versionPillGroup = document.getElementById("leaderboard-version-pills");
+    versionPillGroup.addEventListener("click", function (event) {
+      if (event.target.closest(".version-archive-trigger")) {
+        setVersionArchiveOpen(!versionArchiveOpen);
+        return;
+      }
       var btn = event.target.closest("[data-leaderboard-version]");
       if (!btn) return;
       var view = btn.getAttribute("data-leaderboard-version");
       if (!view || view === leaderboardVersionView) return;
+      var fromArchive = !!event.target.closest(".version-archive-menu");
       leaderboardVersionView = view;
       boardView.page = 1;
       renderVersionPills();
+      // Choosing from the archive destroys the button that had focus (the
+      // version is now a promoted pill), so hand focus to that pill rather than
+      // dropping the keyboard user back at the top of the document.
+      if (fromArchive) {
+        var promoted = versionPillGroup.querySelector('[data-leaderboard-version="' + view + '"]');
+        if (promoted) promoted.focus();
+      }
       load(true);
     });
 
-    // One pill per scored benchmark version, plus the authoritative rollout
-    // view. Rebuilt only when the version list or selection changes, so a
-    // background refresh never steals focus from a pill mid-click.
+    // Disclosure, not a menu widget: Tab already walks the options, so this
+    // only adds Escape (close, focus back to the trigger) and arrow stepping.
+    versionPillGroup.addEventListener("keydown", function (event) {
+      if (!versionArchiveOpen) return;
+      if (event.key === "Escape") {
+        event.stopPropagation();
+        setVersionArchiveOpen(false);
+        var trigger = versionPillGroup.querySelector(".version-archive-trigger");
+        if (trigger) trigger.focus();
+        return;
+      }
+      if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+      var options = Array.prototype.slice.call(
+        versionPillGroup.querySelectorAll(".version-archive-option"));
+      if (!options.length) return;
+      event.preventDefault();
+      var at = options.indexOf(document.activeElement);
+      var next = at < 0
+        ? (event.key === "ArrowDown" ? 0 : options.length - 1)
+        : (at + (event.key === "ArrowDown" ? 1 : -1) + options.length) % options.length;
+      options[next].focus();
+    });
+
+    // Same dismissal contract as the global search popover: a pointer down
+    // outside closes, and so does focus leaving the disclosure entirely. The
+    // pointerdown flag covers Safari/iOS, which blur on a tap without focusing
+    // the tapped button, so focusout would otherwise close before the click.
+    versionPillGroup.addEventListener("pointerdown", function (event) {
+      if (event.target.closest(".version-archive")) {
+        versionArchivePointerDown = true;
+        setTimeout(function () { versionArchivePointerDown = false; }, 0);
+      }
+    });
+    document.addEventListener("pointerdown", function (event) {
+      if (versionArchiveOpen && !event.target.closest(".version-archive")) setVersionArchiveOpen(false);
+    });
+    versionPillGroup.addEventListener("focusout", function (event) {
+      if (!versionArchiveOpen || versionArchivePointerDown) return;
+      var next = event.relatedTarget;
+      if (!next || !next.closest(".version-archive")) setVersionArchiveOpen(false);
+    });
+
+    function setVersionArchiveOpen(open) {
+      var trigger = versionPillGroup.querySelector(".version-archive-trigger");
+      var menu = document.getElementById("version-archive-menu");
+      versionArchiveOpen = !!(open && trigger && menu);
+      if (!trigger || !menu) return;
+      trigger.setAttribute("aria-expanded", String(versionArchiveOpen));
+      menu.hidden = !versionArchiveOpen;
+      // Measured only while visible; a hidden element has no box to clamp.
+      if (versionArchiveOpen) clampVersionArchiveMenu(menu);
+    }
+
+    // The overview pane scrolls, and `overflow-y: auto` clips horizontally too,
+    // so anything drawn outside its content box is cut off. Right-anchoring the
+    // menu to the trigger puts its left edge a menu-width further left, which
+    // crosses that boundary whenever the pills have wrapped and the trigger sits
+    // near the pane's left edge — the menu loses its left border and the start of
+    // its rows. Mirror the anchor when that happens, then nudge back inside if
+    // the mirror overflows the other way.
+    function clampVersionArchiveMenu(menu) {
+      menu.style.left = "";
+      menu.style.right = "";
+      menu.style.transform = "";
+      // Under 640px the menu already spans the switch, so it cannot overhang.
+      if (window.matchMedia && window.matchMedia("(max-width: 640px)").matches) return;
+      var clip = versionArchiveClipBox();
+      if (!clip) return;
+      var rect = menu.getBoundingClientRect();
+      if (rect.left >= clip.left && rect.right <= clip.right) return;
+      menu.style.right = "auto";
+      menu.style.left = "0";
+      rect = menu.getBoundingClientRect();
+      var shift = rect.right > clip.right
+        ? clip.right - rect.right
+        : rect.left < clip.left ? clip.left - rect.left : 0;
+      if (shift) menu.style.transform = "translateX(" + Math.round(shift) + "px)";
+    }
+
+    // Nearest scrolling ancestor's content box: the edges that actually clip.
+    // clientWidth excludes a vertical scrollbar, so subtract that gutter too.
+    function versionArchiveClipBox() {
+      var node = versionPillGroup.parentNode;
+      while (node && node.nodeType === 1) {
+        var style = getComputedStyle(node);
+        if (style.overflowX !== "visible" || style.overflowY !== "visible") {
+          var box = node.getBoundingClientRect();
+          return {
+            left: box.left + parseFloat(style.borderLeftWidth || 0),
+            right: box.right - parseFloat(style.borderRightWidth || 0) -
+              (node.offsetWidth - node.clientWidth),
+          };
+        }
+        node = node.parentNode;
+      }
+      return null;
+    }
+
+    // Resizing invalidates the clamp, and the pills may re-wrap underneath it.
+    window.addEventListener("resize", function () {
+      if (versionArchiveOpen) setVersionArchiveOpen(false);
+    });
+
+    // The rollout view, the newest VISIBLE_VERSION_PILLS versions, and an
+    // Archive disclosure for anything older. Rebuilt only when the version list
+    // or selection changes, so a background refresh never steals focus from a
+    // pill mid-click — and never closes the archive out from under a reader.
     function renderVersionPills() {
-      var group = document.getElementById("leaderboard-version-pills");
       var sig = leaderboardVersionView + "|" + availableBenchVersions.join(",");
-      if (group.getAttribute("data-sig") === sig) return;
-      group.setAttribute("data-sig", sig);
+      if (versionPillGroup.getAttribute("data-sig") === sig) return;
+      versionPillGroup.setAttribute("data-sig", sig);
+      var visible = availableBenchVersions.slice(0, VISIBLE_VERSION_PILLS);
+      var archived = availableBenchVersions.slice(VISIBLE_VERSION_PILLS);
+      // A selected archive version joins the visible row instead of staying
+      // behind the trigger: the row always shows what the board is showing, so
+      // there is exactly one pressed pill and it is never off-screen.
+      var selected = archived.indexOf(Number(leaderboardVersionView));
+      if (selected >= 0) visible.push(archived.splice(selected, 1)[0]);
       var html = '<button class="activity-filter" type="button" data-leaderboard-version="current" aria-pressed="' +
         (leaderboardVersionView === "current") + '">Current rollout</button>';
-      availableBenchVersions.forEach(function (version) {
+      visible.forEach(function (version) {
         html += '<button class="activity-filter" type="button" data-leaderboard-version="' + version +
           '" aria-pressed="' + (String(version) === leaderboardVersionView) + '">Bench v' + version + '</button>';
       });
-      group.innerHTML = html;
+      if (archived.length) {
+        html += '<div class="version-archive">' +
+          '<button class="activity-filter version-archive-trigger" type="button"' +
+          ' aria-expanded="false" aria-controls="version-archive-menu"' +
+          ' aria-label="Earlier benchmark versions">Archive' +
+          '<span class="activity-filter-count">' + archived.length + '</span>' +
+          '<span class="version-archive-caret" aria-hidden="true">▾</span></button>' +
+          '<div class="version-archive-menu" id="version-archive-menu" hidden>' +
+          archived.map(function (version) {
+            return '<button class="version-archive-option" type="button" data-leaderboard-version="' +
+              version + '">Bench v' + version + '</button>';
+          }).join("") +
+          '</div></div>';
+      }
+      versionPillGroup.innerHTML = html;
+      versionArchiveOpen = false;
     }
 
     function renderLeaderboardUnavailable() {
@@ -9527,6 +9732,9 @@
         renderVersionPills();
         load(true);
       }
+      // The switch is display:none on that page; an archive left open would
+      // reappear mid-air on the way back to the overview.
+      setVersionArchiveOpen(false);
       var items = document.querySelectorAll(".nav-item");
       for (var j = 0; j < items.length; j++) {
         var on = items[j].getAttribute("data-page") === page;
