@@ -26,13 +26,14 @@ adjudicating a dispute, and it is the handle an operator would use to find and
 revoke links resting on a key type later found to be compromised. Both are real
 value without gating behaviour.
 
-Not an emission input
----------------------
-Deliberately **not** wired into
-:func:`ditto.db.queries.scores.emission_owner_key`. That expression is the
-single authority for one-slot-per-owner partitioning, and an attestation must
-not be able to move a submission into or out of an emission position. See the
-module docstring of :mod:`ditto.api_server.attestation`.
+Owner identity input
+--------------------
+An active, mutually signed link is authoritative evidence that both hotkeys
+belong to one operator. Copy screening uses that fact as an exemption; queue
+allocation uses it to serialize the owner's submissions; and the score ledger
+uses it to collapse the linked component to one best emission position.
+Revocation is prospective and restores independent treatment on the next
+read. See the module docstring of :mod:`ditto.api_server.attestation`.
 """
 
 from __future__ import annotations
