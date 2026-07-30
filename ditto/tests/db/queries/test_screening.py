@@ -182,6 +182,51 @@ async def _add_quarantine(
         )
 
 
+async def _add_operator_clear(
+    session: AsyncSession,
+    agent: Agent,
+    *,
+    resolution: str,
+    resolved_at: datetime,
+) -> None:
+    """Record the successful operator decision that grants a fresh budget."""
+    async with session.begin():
+        attempt = ScreeningAttempt(
+            attempt_id=uuid4(),
+            agent_id=agent.agent_id,
+            screener_hotkey=_SCREENER,
+            policy_version=SCREENING_POLICY_VERSION,
+            status="quarantined",
+            started_at=resolved_at - timedelta(minutes=1),
+            deadline=resolved_at - timedelta(minutes=1),
+            finished_at=resolved_at - timedelta(minutes=1),
+            public_reason="Screening was inconclusive repeatedly",
+            reason_code="repeatedly-inconclusive",
+        )
+        session.add(attempt)
+        await session.flush()
+        session.add(
+            ScreeningQuarantine(
+                quarantine_id=uuid4(),
+                agent_id=agent.agent_id,
+                attempt_id=attempt.attempt_id,
+                screener_hotkey=_SCREENER,
+                policy_version=SCREENING_POLICY_VERSION,
+                manifest_digest="d" * 64,
+                finding_digest=None,
+                reason_code="repeatedly-inconclusive",
+                evidence=None,
+                finding=None,
+                status="resolved",
+                created_at=resolved_at - timedelta(minutes=1),
+                resolved_at=resolved_at,
+                resolved_by="operator",
+                resolution=resolution,
+                resolution_reason="operator cleared the hold",
+            )
+        )
+
+
 def _claimed_duplicate(
     claimed: list[tuple[Agent, ScreeningAttempt, object]], agent: Agent
 ) -> tuple[ScreeningAttempt, object]:
@@ -726,6 +771,88 @@ async def test_evaluating_agent_missing_screened_image_is_reclaimed(
     # It already cleared the anti-cheat review (it was EVALUATING on the current
     # policy), so this is a BUILD-ONLY pass — rebuild the image, do not re-review.
     assert attempt.build_only is True
+
+
+async def test_release_after_expiry_cap_gets_build_only_attempt(
+    session: AsyncSession,
+) -> None:
+    """A release supersedes old failures before prerequisite-only recovery.
+
+    Regression for affu-03: five historical HTTP failures survived an operator
+    release, so the platform re-parked the agent before it could issue the
+    build-only attempt needed to create its missing screened image.
+    """
+    await _activate_current_era(session)
+    agent = Agent(
+        agent_id=uuid4(),
+        miner_hotkey="5HK-release-after-expiries",
+        name="released-after-expiries",
+        sha256=uuid4().hex * 2,
+        status=AgentStatus.EVALUATING,
+    )
+    agent.screening_policy_version = SCREENING_POLICY_VERSION
+    async with session.begin():
+        session.add(agent)
+
+    base = datetime.now(UTC) - timedelta(hours=6)
+    await _add_expired_attempts(session, agent, MAX_SCREENING_EXPIRIES, base=base)
+    await _add_operator_clear(
+        session,
+        agent,
+        resolution="release",
+        resolved_at=datetime.now(UTC) - timedelta(minutes=30),
+    )
+
+    claimed = await _claim(session)
+
+    attempt, _ = _claimed_duplicate(claimed, agent)
+    assert attempt.build_only is True
+    refreshed = await session.get(Agent, agent.agent_id)
+    assert refreshed is not None and refreshed.status == AgentStatus.SCREENING
+    active_quarantine = await session.scalar(
+        select(ScreeningQuarantine).where(
+            ScreeningQuarantine.agent_id == agent.agent_id,
+            ScreeningQuarantine.status == "active",
+        )
+    )
+    assert active_quarantine is None
+
+
+async def test_expiries_after_release_still_exhaust(session: AsyncSession) -> None:
+    """Release resets historical failures, but it is not a permanent bypass."""
+    await _activate_current_era(session)
+    agent = Agent(
+        agent_id=uuid4(),
+        miner_hotkey="5HK-new-expiries-after-release",
+        name="new-expiries-after-release",
+        sha256=uuid4().hex * 2,
+        status=AgentStatus.EVALUATING,
+    )
+    agent.screening_policy_version = SCREENING_POLICY_VERSION
+    async with session.begin():
+        session.add(agent)
+
+    released_at = datetime.now(UTC) - timedelta(hours=5)
+    await _add_operator_clear(
+        session,
+        agent,
+        resolution="release",
+        resolved_at=released_at,
+    )
+    await _add_expired_attempts(
+        session,
+        agent,
+        MAX_SCREENING_EXPIRIES,
+        base=released_at + timedelta(minutes=5),
+    )
+
+    claimed = await _claim(session)
+
+    assert agent.agent_id not in {a.agent_id for a, _, _ in claimed}
+    refreshed = await session.get(Agent, agent.agent_id)
+    assert refreshed is not None
+    assert refreshed.status == AgentStatus.QUARANTINED
+    assert refreshed.screening_reason_code == "repeatedly-inconclusive"
 
 
 async def test_fresh_upload_claim_is_not_build_only(

@@ -238,21 +238,21 @@ async def expire_screening_attempts(session: AsyncSession, *, now: datetime) -> 
 
 async def _expired_attempt_count(session: AsyncSession, *, agent_id: UUID) -> int:
     """Count expired screening leases under the current policy **since the
-    agent's most recent operator rescreen**.
+    agent's most recent operator clear**.
 
-    An operator resolving a quarantine with ``rescreen`` explicitly grants a
-    fresh attempt budget. Without the lower bound, an agent whose expiries
-    came from a screener-fleet outage carries them forever: its next claim is
-    instantly re-parked as ``repeatedly-inconclusive`` (started_at ==
-    finished_at, no screening ever runs) and no number of operator rescreens
-    can break the loop — exactly what happened on 2026-07-16 when 12 freshly
-    rescreened agents were re-parked within seconds of each other.
+    Resolving a quarantine with ``release`` or ``rescreen`` explicitly lets the
+    submission move forward and therefore grants a fresh attempt budget.
+    Without the lower bound, an agent whose expiries came from a screener-fleet
+    outage carries them forever: its next claim is instantly re-parked as
+    ``repeatedly-inconclusive`` (started_at == finished_at, no screening ever
+    runs). This first affected rescreens on 2026-07-16 and later released agents
+    that needed a build-only pass for a missing screened image.
     """
-    last_rescreen = (
+    last_operator_clear = (
         select(func.max(ScreeningQuarantine.resolved_at))
         .where(
             ScreeningQuarantine.agent_id == agent_id,
-            ScreeningQuarantine.resolution == "rescreen",
+            ScreeningQuarantine.resolution.in_(("release", "rescreen")),
         )
         .scalar_subquery()
     )
@@ -264,7 +264,7 @@ async def _expired_attempt_count(session: AsyncSession, *, agent_id: UUID) -> in
             ScreeningAttempt.policy_version == SCREENING_POLICY_VERSION,
             ScreeningAttempt.status == "expired",
             ScreeningAttempt.started_at
-            > func.coalesce(last_rescreen, datetime(1970, 1, 1, tzinfo=UTC)),
+            > func.coalesce(last_operator_clear, datetime(1970, 1, 1, tzinfo=UTC)),
         )
     )
     return int(count or 0)
