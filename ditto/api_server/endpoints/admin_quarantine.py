@@ -51,6 +51,9 @@ from ditto.api_models.admin_quarantine import (
     AdminQuarantineResolutionEvent,
     AdminQuarantineResolveRequest,
     AdminQuarantineResolveResponse,
+    AdminScreenedImageRebuildDetail,
+    AdminScreenedImageRebuildRequest,
+    AdminScreenedImageRebuildResponse,
     AdminScreeningAttempt,
     AdminScreeningDisputeItem,
     AdminScreeningDisputeList,
@@ -70,7 +73,11 @@ from ditto.api_models.admin_quarantine import (
 )
 from ditto.api_models.agent_status import AgentStatus
 from ditto.api_models.benchmark_contract import benchmark_contract
-from ditto.api_models.screener import ScreenEvidenceItem, SourceReviewFinding
+from ditto.api_models.screener import (
+    SCREENING_POLICY_VERSION,
+    ScreenEvidenceItem,
+    SourceReviewFinding,
+)
 from ditto.api_models.ticket_status import TicketStatus
 from ditto.api_models.validator import ArtifactResponse
 from ditto.api_server.artifact_audit import client_ip, request_detail
@@ -129,6 +136,7 @@ from ditto.db.queries.artifact_fetch_audit import (
 from ditto.db.queries.audit import (
     append_audit_entry,
     benchmark_contract_refresh_event,
+    screened_image_rebuild_event,
 )
 from ditto.db.queries.benchmark_rollout import (
     DatasetPin as RolloutDatasetPin,
@@ -1663,6 +1671,182 @@ async def rescreen_rejected_submission(
     )
     return AdminScreeningRescreenResponse(
         agent_id=agent_id, agent_status=AgentStatus.SCREENING_FAILED
+    )
+
+
+async def _screened_image_rebuild_detail(
+    session: AsyncSession, *, agent_id: UUID
+) -> AdminScreenedImageRebuildDetail:
+    agent = await session.get(Agent, agent_id)
+    if agent is None:
+        raise HTTPException(status_code=404, detail="agent not found")
+    bench_version = await active_bench_version(session)
+    score_count = int(
+        await session.scalar(
+            select(func.count())
+            .select_from(Score)
+            .where(
+                Score.agent_id == agent_id,
+                Score.bench_version == bench_version,
+            )
+        )
+        or 0
+    )
+    screening_attempt_active = (
+        await session.scalar(
+            select(ScreeningAttempt.attempt_id).where(
+                ScreeningAttempt.agent_id == agent_id,
+                ScreeningAttempt.status == "running",
+            )
+        )
+        is not None
+    )
+    validator_ticket_active = (
+        await session.scalar(
+            select(ValidatorTicket.agent_id).where(
+                ValidatorTicket.agent_id == agent_id,
+                ValidatorTicket.bench_version == bench_version,
+                ValidatorTicket.status == TicketStatus.ISSUED,
+            )
+        )
+        is not None
+    )
+    blocking_reason: str | None = None
+    if bench_version <= 2:
+        blocking_reason = "active benchmark does not use screened images"
+    elif agent.status != AgentStatus.EVALUATING:
+        blocking_reason = "submission is not waiting for validator scores"
+    elif score_count != 0:
+        blocking_reason = "submission already has an accepted active-version score"
+    elif screening_attempt_active:
+        blocking_reason = "screening attempt is active"
+    elif agent.screening_policy_version < SCREENING_POLICY_VERSION:
+        blocking_reason = "submission is not on the current screening policy"
+    elif agent.screened_image_sha256 is None or agent.screened_image_upload_id is None:
+        blocking_reason = "submission has no complete screened image to replace"
+    return AdminScreenedImageRebuildDetail(
+        agent_id=agent.agent_id,
+        agent_name=agent.name,
+        agent_status=agent.status.value,
+        artifact_sha256=agent.sha256,
+        bench_version=bench_version,
+        score_count=score_count,
+        screened_image_sha256=agent.screened_image_sha256,
+        screened_image_upload_id=agent.screened_image_upload_id,
+        screening_attempt_active=screening_attempt_active,
+        validator_ticket_active=validator_ticket_active,
+        rebuild_allowed=blocking_reason is None,
+        blocking_reason=blocking_reason,
+    )
+
+
+@router.get(
+    "/screening-submissions/{agent_id}/rebuild-screened-image",
+    response_model=AdminScreenedImageRebuildDetail,
+)
+async def inspect_screened_image_rebuild(
+    agent_id: UUID,
+    _admin: AdminDep,
+    session: SessionDep,
+) -> AdminScreenedImageRebuildDetail:
+    """Return exact guards for a build-only screened-image repair."""
+    return await _screened_image_rebuild_detail(session, agent_id=agent_id)
+
+
+@router.post(
+    "/screening-submissions/{agent_id}/rebuild-screened-image",
+    response_model=AdminScreenedImageRebuildResponse,
+)
+async def rebuild_screened_image(
+    agent_id: UUID,
+    payload: AdminScreenedImageRebuildRequest,
+    _admin: AdminDep,
+    session: SessionDep,
+    x_admin_actor: Annotated[str | None, Header()] = None,
+) -> AdminScreenedImageRebuildResponse:
+    """Rebuild only an accepted submission's stale image transport.
+
+    Clearing the atomic image identity makes the existing screening queue claim
+    this current-policy EVALUATING submission in its fail-closed ``build_only``
+    mode. Source review and the accepted screening verdict are preserved.
+    """
+    if x_admin_actor is None or not 1 <= len(x_admin_actor) <= 120:
+        raise HTTPException(status_code=422, detail="X-Admin-Actor is required")
+    now = datetime.now(UTC)
+    async with session.begin():
+        agent = await session.scalar(
+            select(Agent).where(Agent.agent_id == agent_id).with_for_update()
+        )
+        if agent is None:
+            raise HTTPException(status_code=404, detail="agent not found")
+        detail = await _screened_image_rebuild_detail(session, agent_id=agent_id)
+        if not detail.rebuild_allowed:
+            raise HTTPException(status_code=409, detail=detail.blocking_reason)
+        if agent.sha256 != payload.expected_sha256:
+            raise HTTPException(status_code=409, detail="artifact identity changed")
+        if detail.bench_version != payload.expected_bench_version:
+            raise HTTPException(status_code=409, detail="active benchmark changed")
+        if detail.score_count != payload.expected_score_count:
+            raise HTTPException(status_code=409, detail="score count changed")
+        if agent.screened_image_sha256 != payload.expected_image_sha256:
+            raise HTTPException(status_code=409, detail="screened image changed")
+        if agent.screened_image_upload_id != payload.expected_image_upload_id:
+            raise HTTPException(status_code=409, detail="screened image upload changed")
+
+        tickets = list(
+            await session.scalars(
+                select(ValidatorTicket)
+                .where(
+                    ValidatorTicket.agent_id == agent_id,
+                    ValidatorTicket.bench_version == detail.bench_version,
+                    ValidatorTicket.status != TicketStatus.SCORED,
+                )
+                .with_for_update()
+            )
+        )
+        for ticket in tickets:
+            ticket.status = TicketStatus.EXPIRED
+            ticket.deadline = now
+            ticket.retry_after = now
+            ticket.manual_retry_grants += 1
+
+        old_image_sha256 = agent.screened_image_sha256
+        old_upload_id = agent.screened_image_upload_id
+        agent.screened_image_sha256 = None
+        agent.screened_image_size_bytes = None
+        agent.screened_image_id = None
+        agent.screened_image_ref = None
+        agent.screened_image_upload_id = None
+        agent.screened_image_verified_at = None
+        agent.screening_reason = "Operator requested screened image rebuild"
+        agent.screening_reason_code = None
+        await append_audit_entry(
+            session,
+            agent_id=agent_id,
+            validator_hotkey=None,
+            event=screened_image_rebuild_event(detail.bench_version),
+            payload={
+                "bench_version": detail.bench_version,
+                "prior_image_sha256": old_image_sha256,
+                "prior_image_upload_id": str(old_upload_id),
+            },
+            recorded_at=now,
+        )
+
+    logger.warning(
+        "admin_actor=%s requested screened-image rebuild agent_id=%s "
+        "bench_version=%s expired_tickets=%s reason=%s",
+        x_admin_actor,
+        agent_id,
+        detail.bench_version,
+        len(tickets),
+        payload.reason,
+    )
+    return AdminScreenedImageRebuildResponse(
+        agent_id=agent_id,
+        agent_status=AgentStatus.EVALUATING.value,
+        bench_version=detail.bench_version,
+        expired_ticket_count=len(tickets),
     )
 
 

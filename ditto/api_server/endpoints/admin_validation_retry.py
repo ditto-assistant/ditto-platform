@@ -105,6 +105,7 @@ from ditto.db.queries.retry_state import (
     reinstatement_gate,
     resolve_bench_version,
     withdrawal_gate,
+    work_available_validator_hotkeys,
 )
 from ditto.db.queries.score_retests import (
     REPLACEMENT_TICKET_TTL,
@@ -458,7 +459,12 @@ async def list_validation_retries(
     agents = await list_agents_by_status(
         session, statuses=[AgentStatus.EVALUATING], limit=_STUCK_SCAN_LIMIT
     )
-    classified = await classify_agent_retry_states(session, agents=agents, now=now)
+    classified = await classify_agent_retry_states(
+        session,
+        agents=agents,
+        now=now,
+        require_work_available_validator=True,
+    )
     agents_by_id = {agent.agent_id: agent for agent in agents}
 
     submissions: list[AdminStuckSubmission] = []
@@ -524,13 +530,15 @@ async def get_validation_retry(
     if agent is None:
         raise HTTPException(status_code=404, detail="agent not found")
     score_count = len(scores)
+    now = datetime.now(UTC)
     automatic, allowed, reason, _ = recovery_gate(
         agent=agent,
         scores=scores,
         tickets=tickets,
         recovery_count=len(recoveries),
-        now=datetime.now(UTC),
+        now=now,
         bench_version=bench_version,
+        work_available_hotkeys=await work_available_validator_hotkeys(session, now=now),
     )
     # The most recent removal, reversed or not: the operator surface has to be
     # able to show an eviction that was undone, while every gate below asks the
@@ -664,6 +672,7 @@ async def _apply_recovery(
         recovery_count=len(recoveries),
         now=now,
         bench_version=bench_version,
+        work_available_hotkeys=await work_available_validator_hotkeys(session, now=now),
     )
     if not allowed:
         return "skipped", gate_reason or "retry unavailable", None

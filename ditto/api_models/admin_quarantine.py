@@ -202,6 +202,43 @@ class AdminBenchmarkContractRefreshResponse(BaseModel):
     expired_ticket_count: int
 
 
+class AdminScreenedImageRebuildRequest(BaseModel):
+    """Compare-and-swap guard for rebuilding only the screened image."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    reason: Annotated[str, Field(min_length=8, max_length=500)]
+    expected_sha256: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+    expected_bench_version: Annotated[int, Field(gt=2)]
+    expected_score_count: Literal[0]
+    expected_image_sha256: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+    expected_image_upload_id: UUID
+
+
+class AdminScreenedImageRebuildDetail(BaseModel):
+    """Current guarded inputs for a build-only screened-image repair."""
+
+    agent_id: UUID
+    agent_name: str
+    agent_status: str
+    artifact_sha256: str
+    bench_version: int
+    score_count: int
+    screened_image_sha256: str | None
+    screened_image_upload_id: UUID | None
+    screening_attempt_active: bool
+    validator_ticket_active: bool
+    rebuild_allowed: bool
+    blocking_reason: str | None
+
+
+class AdminScreenedImageRebuildResponse(BaseModel):
+    agent_id: UUID
+    agent_status: str
+    bench_version: int
+    expired_ticket_count: int
+
+
 class AdminBenchmarkContractMigrationRequest(BaseModel):
     """Compare-and-swap guard for moving one zero-score v2 artifact to v3."""
 

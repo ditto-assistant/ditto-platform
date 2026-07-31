@@ -9,7 +9,7 @@ plus a bulk loader — so the two surfaces can never drift.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 from sqlalchemy import func, select
@@ -23,6 +23,7 @@ from ditto.db.models import (
     Agent,
     Score,
     SubmissionRetirement,
+    ValidatorHeartbeat,
     ValidatorQueueWithdrawal,
     ValidatorRetryRecovery,
     ValidatorTicket,
@@ -35,6 +36,29 @@ from ditto.db.queries.tickets import ticket_attempt_cap
 # Operators may hand-grant at most this many recoveries to one agent before the
 # stuck submission needs a harder look than another retry.
 MAX_OPERATOR_RECOVERIES_PER_AGENT = 4
+VALIDATOR_RETRY_ONLINE_WINDOW = timedelta(minutes=5)
+
+
+async def work_available_validator_hotkeys(
+    session: AsyncSession, *, now: datetime
+) -> set[str]:
+    """Validators that can consume an automatic retry right now.
+
+    A remaining attempt on an offline, paused, or erroring validator is ledger
+    capacity, not fleet capacity. It must stay preserved for that validator's
+    eventual return, but it must not prevent an operator from reviving exhausted
+    healthy siblings needed to reach quorum in the meantime.
+    """
+    return set(
+        (
+            await session.scalars(
+                select(ValidatorHeartbeat.validator_hotkey).where(
+                    ValidatorHeartbeat.seen_at >= now - VALIDATOR_RETRY_ONLINE_WINDOW,
+                    ValidatorHeartbeat.state.not_in(("paused", "error")),
+                )
+            )
+        ).all()
+    )
 
 
 def aware(value: datetime) -> datetime:
@@ -88,6 +112,7 @@ def recovery_gate(
     recovery_count: int,
     now: datetime,
     bench_version: int,
+    work_available_hotkeys: set[str] | None = None,
 ) -> tuple[bool, bool, str | None, list[ValidatorTicket]]:
     """Decide whether an automatic or operator retry is possible.
 
@@ -117,6 +142,10 @@ def recovery_gate(
         for ticket in non_scored
         if ticket.status == TicketStatus.EXPIRED
         and ticket.attempt_count < ticket_attempt_cap(ticket)
+        and (
+            work_available_hotkeys is None
+            or ticket.validator_hotkey in work_available_hotkeys
+        )
     ]
     if naturally_retryable:
         available = any(
@@ -141,7 +170,14 @@ def recovery_gate(
     needed = SCORING_QUORUM - score_count
     exhausted = sorted(
         (ticket for ticket in non_scored if is_exhausted(ticket)),
-        key=lambda ticket: (aware(ticket.deadline), ticket.validator_hotkey),
+        key=lambda ticket: (
+            0
+            if work_available_hotkeys is None
+            or ticket.validator_hotkey in work_available_hotkeys
+            else 1,
+            aware(ticket.deadline),
+            ticket.validator_hotkey,
+        ),
     )
     if len(exhausted) < needed:
         return False, False, "not enough expired tickets to restore quorum", []
@@ -355,6 +391,7 @@ async def classify_agent_retry_states(
     *,
     agents: list[Agent],
     now: datetime,
+    require_work_available_validator: bool = False,
 ) -> dict[UUID, AgentRetryState]:
     """Classify a batch of agents' retry state in three bulk statements.
 
@@ -437,6 +474,11 @@ async def classify_agent_retry_states(
         ).all()
     )
     canonical_version = await active_bench_version(session)
+    available_hotkeys = (
+        await work_available_validator_hotkeys(session, now=now)
+        if require_work_available_validator
+        else None
+    )
 
     result: dict[UUID, AgentRetryState] = {}
     for agent_id, agent in agent_by_id.items():
@@ -463,6 +505,7 @@ async def classify_agent_retry_states(
             recovery_count=recovery_counts.get((agent_id, bench_version), 0),
             now=now,
             bench_version=bench_version,
+            work_available_hotkeys=available_hotkeys,
         )
         state = classify_retry_state(
             automatic=automatic,
@@ -492,6 +535,10 @@ async def classify_agent_retry_states(
                     and t.retry_after is not None
                     and t.validator_hotkey not in scored_hotkeys
                     and not is_exhausted(t)
+                    and (
+                        available_hotkeys is None
+                        or t.validator_hotkey in available_hotkeys
+                    )
                 ),
                 default=None,
             ),

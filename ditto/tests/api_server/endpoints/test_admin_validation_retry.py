@@ -223,6 +223,26 @@ async def _seed(
     return agent_id
 
 
+async def _seed_online_heartbeat(
+    maker: async_sessionmaker[AsyncSession], *, hotkey: str
+) -> None:
+    now = datetime.now(UTC)
+    async with maker() as session, session.begin():
+        session.add(
+            ValidatorHeartbeat(
+                validator_hotkey=hotkey,
+                software_version="0.42.15",
+                protocol_version=16,
+                code_digest="d" * 64,
+                state="polling",
+                first_seen_at=now,
+                reported_at=now,
+                seen_at=now,
+                signature="ab" * 64,
+            )
+        )
+
+
 async def test_retry_is_bound_to_the_ticket_and_score_epoch(
     app: FastAPI,
     client: httpx.AsyncClient,
@@ -366,6 +386,7 @@ async def test_stale_snapshot_and_active_or_natural_retry_fail_closed(
     retry_maker: async_sessionmaker[AsyncSession],
 ) -> None:
     agent_id = await _seed(retry_maker)
+    await _seed_online_heartbeat(retry_maker, hotkey="validator-0")
     _install(app, retry_maker)
     await client.get(f"/api/v1/admin/validation-retries/{agent_id}", headers=_HEADERS)
     stale = await client.post(
@@ -400,6 +421,46 @@ async def test_stale_snapshot_and_active_or_natural_retry_fail_closed(
         headers=_HEADERS,
     )
     assert denied.status_code == 409
+
+
+async def test_offline_natural_retry_does_not_block_healthy_sibling_recovery(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    retry_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    agent_id = await _seed(retry_maker)
+    async with retry_maker() as session, session.begin():
+        offline = await session.get(
+            ValidatorTicket, (agent_id, _BENCH_VERSION, "validator-0")
+        )
+        assert offline is not None
+        offline.attempt_count = 1
+    for index in (1, 2, 3):
+        await _seed_online_heartbeat(retry_maker, hotkey=f"validator-{index}")
+    _install(app, retry_maker)
+
+    detail = await client.get(
+        f"/api/v1/admin/validation-retries/{agent_id}", headers=_HEADERS
+    )
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["automatic_retry_available"] is False
+    assert detail.json()["recovery_allowed"] is True
+
+    granted = await client.post(
+        f"/api/v1/admin/validation-retries/{agent_id}/retry",
+        headers=_HEADERS,
+        json={
+            "request_id": str(uuid4()),
+            "expected_snapshot": detail.json()["snapshot"],
+            "reason": "Offline validator cannot consume its preserved retry slot",
+        },
+    )
+    assert granted.status_code == 200, granted.text
+    assert granted.json()["recovery"]["granted_validator_hotkeys"] == [
+        "validator-1",
+        "validator-2",
+        "validator-3",
+    ]
 
 
 async def test_manual_grant_allows_exactly_one_more_same_version_issue(
@@ -441,6 +502,7 @@ async def test_final_operator_grant_remains_retryable_with_exhausted_sibling(
 ) -> None:
     """A spent recovery cap cannot erase budget the final grant just restored."""
     agent_id = await _seed(retry_maker, score_count=2)
+    await _seed_online_heartbeat(retry_maker, hotkey="validator-2")
     _install(app, retry_maker)
     async with retry_maker() as session, session.begin():
         for index in range(3):
@@ -2245,6 +2307,7 @@ async def test_list_classifies_every_retry_state(
         tickets=[("val-0", TicketStatus.ISSUED, 1, None)],
     )
     await _seed_states(retry_maker, name="queued-agent", tickets=[])
+    await _seed_online_heartbeat(retry_maker, hotkey="val-0")
     _install(app, retry_maker)
 
     response = await client.get("/api/v1/admin/validation-retries", headers=_HEADERS)
@@ -2475,6 +2538,7 @@ async def test_infra_grant_lifts_a_would_be_exhausted_ticket(
             )
         )
     _install(app, retry_maker)
+    await _seed_online_heartbeat(retry_maker, hotkey="val-0")
 
     response = await client.get("/api/v1/admin/validation-retries", headers=_HEADERS)
     assert response.status_code == 200, response.text
