@@ -43,6 +43,14 @@ export function median(nums: number[]): number {
   return s.length % 2 ? (s[m] as number) : ((s[m - 1] as number) + (s[m] as number)) / 2;
 }
 
+/** HTML-escape the five specials (&<>"'). Solid escapes text on its own;
+ * this exists for the few places raw strings become markup/attributes. */
+export function esc(s: unknown): string {
+  return String(s).replace(/[&<>"']/g, (c) => {
+    return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c] as string;
+  });
+}
+
 /** Relative time from an ISO string: "5m ago". Invalid dates render "–" (en
  * dash); future timestamps clamp to "0s ago". */
 export function relTime(iso: string | null | undefined): string {
@@ -53,6 +61,69 @@ export function relTime(iso: string | null | undefined): string {
   if (s < 3600) return Math.floor(s / 60) + "m ago";
   if (s < 86400) return Math.floor(s / 3600) + "h ago";
   return Math.floor(s / 86400) + "d ago";
+}
+
+/** Future-facing twin of relTime for deadlines (embargo unlock times):
+ * "in 5m" (units rounded UP); an elapsed deadline reads "any moment now";
+ * invalid dates render "–". */
+export function relTimeUntil(iso: string | null | undefined): string {
+  const t = iso == null ? NaN : new Date(iso).getTime();
+  if (isNaN(t)) return "–";
+  const s = (t - Date.now()) / 1000;
+  if (s <= 0) return "any moment now";
+  if (s < 60) return "in " + Math.ceil(s) + "s";
+  if (s < 3600) return "in " + Math.ceil(s / 60) + "m";
+  if (s < 86400) return "in " + Math.ceil(s / 3600) + "h";
+  return "in " + Math.ceil(s / 86400) + "d";
+}
+
+/** Elapsed-seconds twin of relTime, for API-reported ages (staleness
+ * markers) rather than timestamps. Takes seconds because that is what the
+ * API sends; invalid/negative render "–". */
+export function relDuration(seconds: unknown): string {
+  const s = Number(seconds);
+  if (!isFinite(s) || s < 0) return "–";
+  if (s < 60) return Math.floor(s) + "s";
+  if (s < 3600) return Math.floor(s / 60) + "m";
+  if (s < 86400) return Math.floor(s / 3600) + "h";
+  return Math.floor(s / 86400) + "d";
+}
+
+/** "Name, Submission vN" — the agent's full accessible label. */
+export function agentLabel(
+  name: string | null | undefined,
+  version: number | null | undefined,
+): string {
+  const label = name || "Unnamed agent";
+  return label + ", " + agentVersionLabel(version);
+}
+
+/** Display name with the "Unnamed agent" fallback. */
+export function agentName(name: string | null | undefined): string {
+  return name || "Unnamed agent";
+}
+
+/** "Submission vN"; a missing version reads "Legacy submission". */
+export function agentVersionLabel(version: number | null | undefined): string {
+  return version == null ? "Legacy submission" : "Submission v" + version;
+}
+
+/** Label of the submission this entry duplicates: the duplicate's own agent
+ * label when named, else "Submission " + first 8 chars of its id; "" when
+ * the entry is not a duplicate. */
+export function duplicateLabel(
+  entry:
+    | {
+        duplicate_of?: string | null;
+        duplicate_name?: string | null;
+        duplicate_version?: number | null;
+      }
+    | null
+    | undefined,
+): string {
+  if (!entry || !entry.duplicate_of) return "";
+  if (entry.duplicate_name) return agentLabel(entry.duplicate_name, entry.duplicate_version);
+  return "Submission " + String(entry.duplicate_of).slice(0, 8);
 }
 
 /** Abbreviate an ss58 hotkey for a compact row (full value stays in the

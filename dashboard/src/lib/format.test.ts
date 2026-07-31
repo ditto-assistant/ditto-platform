@@ -1,16 +1,23 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  agentLabel,
+  agentName,
+  agentVersionLabel,
   athDate,
   clamp01,
+  duplicateLabel,
   elapsedDuration,
+  esc,
   fmtMs,
   fx,
   marginText,
   median,
   num,
   pct,
+  relDuration,
   relTime,
+  relTimeUntil,
   releaseTime,
   shortKey,
   shortModel,
@@ -135,6 +142,97 @@ describe("relTime", () => {
     expect(relTime("not-a-date")).toBe("–");
     expect(relTime(undefined)).toBe("–");
     expect(relTime(null)).toBe("–");
+  });
+});
+
+describe("esc", () => {
+  it("escapes the five HTML specials", () => {
+    expect(esc('<a href="x">&\'</a>')).toBe("&lt;a href=&quot;x&quot;&gt;&amp;&#39;&lt;/a&gt;");
+  });
+
+  it("stringifies non-string input", () => {
+    expect(esc(5)).toBe("5");
+    expect(esc(null)).toBe("null");
+  });
+});
+
+describe("relTimeUntil", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-23T12:00:00Z"));
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("renders future deadlines with units rounded up", () => {
+    expect(relTimeUntil("2026-07-23T12:00:45Z")).toBe("in 45s");
+    // 4m30s rounds UP to 5m — a deadline never reads sooner than it is.
+    expect(relTimeUntil("2026-07-23T12:04:30Z")).toBe("in 5m");
+    expect(relTimeUntil("2026-07-23T15:00:00Z")).toBe("in 3h");
+    expect(relTimeUntil("2026-07-25T12:00:00Z")).toBe("in 2d");
+  });
+
+  it("reads 'any moment now' once the deadline has passed", () => {
+    expect(relTimeUntil("2026-07-23T12:00:00Z")).toBe("any moment now");
+    expect(relTimeUntil("2026-07-23T11:00:00Z")).toBe("any moment now");
+  });
+
+  it("renders an en dash for invalid or missing input", () => {
+    expect(relTimeUntil("junk")).toBe("–");
+    expect(relTimeUntil(null)).toBe("–");
+    expect(relTimeUntil(undefined)).toBe("–");
+  });
+});
+
+describe("relDuration", () => {
+  it("renders API-reported ages given in seconds", () => {
+    expect(relDuration(45)).toBe("45s");
+    expect(relDuration(300)).toBe("5m");
+    expect(relDuration(7200)).toBe("2h");
+    expect(relDuration(200000)).toBe("2d");
+    expect(relDuration("90")).toBe("1m");
+  });
+
+  it("renders an en dash for negative or non-numeric input", () => {
+    expect(relDuration(-1)).toBe("–");
+    expect(relDuration("nope")).toBe("–");
+    expect(relDuration(undefined)).toBe("–");
+    expect(relDuration(Infinity)).toBe("–");
+  });
+});
+
+describe("agent naming", () => {
+  it("labels an agent by name and submission version", () => {
+    expect(agentLabel("My agent", 3)).toBe("My agent, Submission v3");
+    expect(agentLabel(null, null)).toBe("Unnamed agent, Legacy submission");
+  });
+
+  it("falls back to 'Unnamed agent'", () => {
+    expect(agentName("My agent")).toBe("My agent");
+    expect(agentName(null)).toBe("Unnamed agent");
+    expect(agentName("")).toBe("Unnamed agent");
+  });
+
+  it("reads a missing version as a legacy submission (v0 is a real version)", () => {
+    expect(agentVersionLabel(null)).toBe("Legacy submission");
+    expect(agentVersionLabel(undefined)).toBe("Legacy submission");
+    expect(agentVersionLabel(0)).toBe("Submission v0");
+    expect(agentVersionLabel(4)).toBe("Submission v4");
+  });
+});
+
+describe("duplicateLabel", () => {
+  it("is empty when the entry duplicates nothing", () => {
+    expect(duplicateLabel(null)).toBe("");
+    expect(duplicateLabel({})).toBe("");
+  });
+
+  it("names the duplicated submission when known, else its short id", () => {
+    expect(
+      duplicateLabel({ duplicate_of: "abc", duplicate_name: "Prior", duplicate_version: 2 }),
+    ).toBe("Prior, Submission v2");
+    expect(duplicateLabel({ duplicate_of: "0123456789abcdef" })).toBe("Submission 01234567");
   });
 });
 
