@@ -73,6 +73,7 @@ from ditto.db.models import (
     BenchmarkRollout,
     EvaluationPayment,
     Score,
+    ScoreAuditEntry,
     ScreenedImageUpload,
     ScreenerHeartbeat,
     ScreenerReviewSettingsRevision,
@@ -2768,6 +2769,151 @@ class TestQuarantineAdmin:
             assert agent.screening_policy_version == SCREENING_POLICY_VERSION
             assert [attempt.attempt_id for attempt in attempts] == [attempt_id]
             assert len(scores) == 1
+
+    async def test_operator_rebuilds_only_the_screened_image_build_only(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        app.state.config = replace(
+            app.state.config,
+            admin_api_token="test-admin-token-at-least-32-characters",
+        )
+        agent_id = await _seed_agent(
+            session_maker,
+            status=AgentStatus.EVALUATING,
+            screening_policy_version=SCREENING_POLICY_VERSION,
+        )
+        now = datetime.now(UTC)
+        attempt_id = uuid4()
+        image_upload_id = uuid5(
+            NAMESPACE_URL, f"{agent_id}:{attempt_id}:stale-screened-image"
+        )
+        validator_hotkey = "5ValidatorWithLegacyImageTransport"
+        async with session_maker() as session, session.begin():
+            session.add(
+                BenchmarkRollout(
+                    rollout_id=uuid4(),
+                    from_version=_SOURCE_VERSION,
+                    desired_version=_TARGET_VERSION,
+                    status="activated",
+                    cohort_size=5,
+                    created_at=now,
+                    activated_at=now,
+                )
+            )
+            session.add(
+                ScreeningAttempt(
+                    attempt_id=attempt_id,
+                    agent_id=agent_id,
+                    screener_hotkey=_SCREENER_HOTKEY,
+                    policy_version=SCREENING_POLICY_VERSION,
+                    status="passed",
+                    started_at=now - timedelta(minutes=5),
+                    deadline=now,
+                    finished_at=now,
+                )
+            )
+            await session.flush()
+            session.add(
+                ScreenedImageUpload(
+                    image_upload_id=image_upload_id,
+                    agent_id=agent_id,
+                    attempt_id=attempt_id,
+                    screener_hotkey=_SCREENER_HOTKEY,
+                    storage_upload_id=f"storage-{image_upload_id}",
+                    sha256="12" * 32,
+                    size_bytes=123,
+                    image_id="sha256:" + "34" * 32,
+                    image_ref=f"ditto-screen/{agent_id}:latest",
+                    status="verified",
+                    expires_at=now + timedelta(minutes=15),
+                    verified_at=now,
+                )
+            )
+            agent = await session.get(Agent, agent_id)
+            assert agent is not None
+            agent.screened_image_sha256 = "12" * 32
+            agent.screened_image_size_bytes = 123
+            agent.screened_image_id = "sha256:" + "34" * 32
+            agent.screened_image_ref = f"ditto-screen/{agent_id}:latest"
+            agent.screened_image_upload_id = image_upload_id
+            agent.screened_image_verified_at = now
+            session.add(
+                BenchmarkDataset(
+                    agent_id=agent_id,
+                    bench_version=_TARGET_VERSION,
+                    seed=42,
+                    sha256="aa" * 32,
+                    run_size="full",
+                )
+            )
+            session.add(
+                ValidatorTicket(
+                    agent_id=agent_id,
+                    validator_hotkey=validator_hotkey,
+                    status=TicketStatus.ISSUED,
+                    issued_at=now,
+                    deadline=now + timedelta(minutes=90),
+                    bench_version=_TARGET_VERSION,
+                    attempt_count=2,
+                )
+            )
+
+        _install_db(app, session_maker)
+        headers = {
+            "Authorization": "Bearer test-admin-token-at-least-32-characters",
+            "X-Admin-Actor": "backroom:test-user",
+        }
+        inspected = await client.get(
+            f"/api/v1/admin/screening-submissions/{agent_id}/rebuild-screened-image",
+            headers=headers,
+        )
+        assert inspected.status_code == 200, inspected.text
+        assert inspected.json()["rebuild_allowed"] is True
+        assert inspected.json()["validator_ticket_active"] is True
+
+        rebuilt = await client.post(
+            f"/api/v1/admin/screening-submissions/{agent_id}/rebuild-screened-image",
+            headers=headers,
+            json={
+                "reason": "Rebuild legacy image transport for current validators",
+                "expected_sha256": _SHA256,
+                "expected_bench_version": _TARGET_VERSION,
+                "expected_score_count": 0,
+                "expected_image_sha256": "12" * 32,
+                "expected_image_upload_id": str(image_upload_id),
+            },
+        )
+        assert rebuilt.status_code == 200, rebuilt.text
+        assert rebuilt.json()["expired_ticket_count"] == 1
+
+        async with session_maker() as session:
+            agent = await session.get(Agent, agent_id)
+            dataset = await session.get(BenchmarkDataset, (agent_id, _TARGET_VERSION))
+            ticket = await session.get(
+                ValidatorTicket, (agent_id, _TARGET_VERSION, validator_hotkey)
+            )
+            event = await session.scalar(
+                select(ScoreAuditEntry).where(
+                    ScoreAuditEntry.agent_id == agent_id,
+                    ScoreAuditEntry.event
+                    == f"screened_image_rebuild:v{_TARGET_VERSION}",
+                )
+            )
+            assert agent is not None
+            assert agent.status == AgentStatus.EVALUATING
+            assert agent.screened_image_sha256 is None
+            assert dataset is not None and dataset.sha256 == "aa" * 32
+            assert ticket is not None and ticket.status == TicketStatus.EXPIRED
+            assert ticket.manual_retry_grants == 1
+            assert event is not None
+
+        claim = await client.post(_CLAIM_URL)
+        assert claim.status_code == 200, claim.text
+        assert claim.json()["items"][0]["agent_id"] == str(agent_id)
+        assert claim.json()["items"][0]["build_only"] is True
 
     async def test_contract_refresh_rescreens_rebuilds_and_reissues_the_dataset(
         self,
