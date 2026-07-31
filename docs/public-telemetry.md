@@ -91,6 +91,9 @@ rate-limited, `Cache-Control: public, max-age=30`. Read-only, aggregate-only.
     aggregate_method, finalized, score_count, tool_mean, memory_mean,
     first_seen, n,
     median_ms, bench_version, dataset_sha256, models, per_category,
+    submission_family: { member_count, selection_rule, members: [
+      { agent_id, agent_name, agent_version, miner_hotkey,
+        canonical_composite, submitted_at, representative } ] },
     integrity, tokens } ], emissions: { champion_agent_id, recipients,
     raw_leader_decision, margin, dethrone_z, champion_share, rank_shares,
     tail_size } }`.
@@ -104,6 +107,11 @@ rate-limited, `Cache-Control: public, max-age=30`. Read-only, aggregate-only.
   themselves and always trail the finalized board.
   Different names and hotkeys under one coldkey compete for one position; the
   best eligible generation wins and its hotkey remains the weight destination.
+  `submission_family` keeps the other finalized, full-benchmark generations
+  visible without exposing the coldkey itself or assigning them independent
+  ranks. The same family projection appears on `/agent/{id}/pipeline`, so a
+  direct link to a non-representative score explains which submission represents
+  it on the board.
   During a
   benchmark rollout the default response is the exact authoritative hybrid pool
   validators fold: v3 for an agent at 3/3, otherwise that agent's active-version
