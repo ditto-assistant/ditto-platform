@@ -221,20 +221,12 @@ def evaluate_duplicate_signals(
     rotated keys, which coldkey equality cannot see. Each entry is a hotkey
     cryptographically proven to be the same operator as this miner: both
     endpoints signed the link, each with its own hotkey or the coldkey bound to
-    it (see :mod:`ditto.api_server.attestation`). The exemption is **narrower**
-    than the coldkey one on purpose, and applies to the derivative rules only:
-
-    - rules **2** and **3** — the near-duplicate signals that punish a miner for
-      iterating on their own prior work — skip attested predecessors;
-    - rules **1** and **1b** — byte-identical ``sha256`` and identical
-      canonicalized source — do **not**. Re-submitting the same artifact under a
-      new key is precisely the shape of emission-slot farming, and it is the one
-      case where a single operator glance is worth more than an automatic pass.
-      A stronger proof of *who* does not make an identical re-upload more
-      meritorious, so this scope is unchanged by the strength of the evidence
-      behind the link. The existing same-coldkey exemption is unbounded in
-      exactly this way; this one deliberately is not, and must not be widened
-      to match it.
+    it (see :mod:`ditto.api_server.attestation`). All copy rules skip those
+    attested predecessors, including byte-identical and canonicalized-source
+    matches. Copy moderation answers whether one owner took another owner's
+    work; a cryptographically proven same owner cannot plagiarize itself.
+    Emission-slot deduplication is a separate policy and must not be enforced by
+    holding legitimate same-owner generations in copy review.
 
     Originality attribution also follows upload chronology,
     not score-finalization order: normalized-source and near-duplicate rules compare
@@ -305,9 +297,9 @@ def evaluate_duplicate_signals(
         ),
         key=lambda e: (_utc(e.first_seen), e.agent_id.int),
     )
-    # Rules 2 and 3 additionally drop hotkeys proven to be the same operator.
-    # Rules 1 and 1b keep the full list -- see the docstring for why an identity
-    # match is not covered by an owner-link attestation.
+    # Every copy rule drops hotkeys cryptographically proven to be the same
+    # operator. Emission-slot allocation is enforced elsewhere; this gate only
+    # answers whether a submission copied a different owner.
     earlier_unattested = (
         earlier_others
         if not linked_owner_hotkeys
@@ -318,7 +310,7 @@ def evaluate_duplicate_signals(
     # This is a defense-in-depth mirror of the separate admission-time exact-byte
     # guard. It uses the same upload chronology so a later-finalized row can never
     # become the retroactive original of an earlier submission.
-    for e in earlier_others:
+    for e in earlier_unattested:
         if e.sha256 == sha256:
             return ReviewDecision(
                 held=True,
@@ -331,7 +323,7 @@ def evaluate_duplicate_signals(
     #     match, held unconditionally like sha256 — no score-proximity requirement.
     #     Both hashes must be present (null = "no repack match", never a hit).
     if normalized_source_hash is not None:
-        for e in earlier_others:
+        for e in earlier_unattested:
             if e.normalized_source_hash == normalized_source_hash:
                 return ReviewDecision(
                     held=True,
