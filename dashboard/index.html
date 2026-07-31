@@ -5822,6 +5822,17 @@
         stat("Tool/memory base", "0.5 × " + fx(e.tool_mean) + " + 0.5 × " + fx(e.memory_mean) + " = " + fx(b.base_accuracy)) +
         stat("Benchmark quality gates", "× " + fx(b.benchmark_quality_multiplier) + " (−" + (qualityReduction * 100).toFixed(1) + "%)") +
         stat("Pre-token composite", fx(b.pre_token_composite));
+      var factors = b.quality_factors || [];
+      if (factors.length) {
+        body += '<div class="stat-group quality-factor-list"><div class="stat-head">Quality factor detail</div>' +
+          factors.map(function (factor) {
+            var value = [];
+            if (factor.multiplier != null) value.push("× " + fx(factor.multiplier));
+            if (factor.metric != null && factor.metric !== factor.multiplier) value.push("observed " + fx(factor.metric));
+            if (factor.audit_count != null) value.push(factor.audit_count + " audit pairs");
+            return stat('<span class="tip" tabindex="0" data-tooltip="' + esc(factor.explanation) + '">' + esc(factor.label) + '</span>', value.join(" · "));
+          }).join("") + '</div>';
+      }
       if (b.token_efficiency_multiplier == null) {
         body += stat("Token efficiency", "not applied or unavailable");
       } else {
@@ -5839,7 +5850,7 @@
         body += stat("Observed token use", te.observed_total_tokens.toLocaleString() + " / " + budget);
       }
       return '<div class="stat-group"><div class="stat-head">Composite calculation</div>' + body +
-        '<p class="calc-note">The benchmark-quality multiplier combines scorer-owned behavioural and integrity gates before token efficiency. It is shown as one audited factor so the platform cannot drift from the benchmark scorer. Token efficiency is separate and can never remove more than 10%.</p></div>';
+        '<p class="calc-note">The signed aggregate remains authoritative. Exact multipliers are shown where the scorer stored them; “observed” values are diagnostics, not multiplier curves. “Other quality effects” reconciles older runs whose individual gates were not stored separately. Token efficiency is separate and can never remove more than 10%.</p></div>';
     }
 
     function openModal(i, preserveUrl) {
