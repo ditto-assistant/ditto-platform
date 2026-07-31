@@ -1,0 +1,25 @@
+/* Styles are ported page-by-page from the monolith's <style> block; this file
+ * aggregates them. Until the shell port lands it carries only the pieces the
+ * scaffold itself needs. */
+
+.skip-link {
+  position: absolute;
+  left: -9999px;
+}
+
+.skip-link:focus {
+  left: 8px;
+  top: 8px;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
