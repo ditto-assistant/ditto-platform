@@ -1273,7 +1273,7 @@ _V7_CAPABILITIES: dict[str, object] = {
     "full_stack_managed": False,
     "stack_updater": False,
     "sandbox_egress_restricted": True,
-    "executor_isolation": "privileged_dind",
+    "executor_isolation": "rootless_dind",
 }
 _V7_COMPONENTS: dict[str, object] = {
     name: {
