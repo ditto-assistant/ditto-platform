@@ -163,7 +163,7 @@ def _capabilities(now: datetime) -> tuple[dict, dict]:
         "sandbox_egress_restricted": True,
         "ticket_inference": True,
         "signed_score_quorum": True,
-        "executor_isolation": "privileged_dind",
+        "executor_isolation": "rootless_dind",
         "scorer_benchmarks": {
             "status": "fresh_verified",
             # V8 uses the same hosted-inference identity as v7. A scorer that
@@ -2242,6 +2242,31 @@ async def test_capability_gate_is_parameterised_per_bench_version() -> None:
     assert not heartbeat_supports_version(stale, now=now, version=4)
     legacy_v7 = _heartbeat("legacy-v7", now, versions=[2, 7], protocol_version=10)
     assert not heartbeat_supports_version(legacy_v7, now=now, version=7)
+
+
+@pytest.mark.parametrize(
+    ("executor_isolation", "supports_v8"),
+    [
+        ("unknown", False),
+        ("privileged_dind", False),
+        ("rootless_dind", True),
+        ("rootless_host", True),
+        ("ephemeral_vm", True),
+    ],
+)
+async def test_v8_requires_an_isolated_executor_but_v7_remains_compatible(
+    executor_isolation: str, supports_v8: bool
+) -> None:
+    now = datetime.now(UTC).replace(microsecond=0)
+    heartbeat = _heartbeat(
+        "executor-boundary", now, versions=[7, 8], protocol_version=18
+    )
+    capabilities = heartbeat.capabilities
+    assert capabilities is not None
+    capabilities["executor_isolation"] = executor_isolation
+
+    assert heartbeat_supports_version(heartbeat, now=now, version=7)
+    assert heartbeat_supports_version(heartbeat, now=now, version=8) is supports_v8
 
 
 async def test_capable_validator_counts_agree_with_the_per_version_state(

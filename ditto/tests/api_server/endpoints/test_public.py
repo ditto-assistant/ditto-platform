@@ -2529,6 +2529,63 @@ class TestPublicLeaderboard:
         assert listed == [finalized, best_provisional]
         assert body["count"] == 2
 
+    async def test_owner_family_keeps_hidden_generations_visible_without_ranks(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        coldkey = "5SharedFinalizedFamilyColdkey"
+        representative = await _seed_k3(
+            session_maker,
+            miner="5" + "T" * 47,
+            composites=[0.95, 0.96, 0.97],
+            created_at=datetime(2026, 6, 8, 12, 0, tzinfo=UTC),
+        )
+        hidden_generation = await _seed_k3(
+            session_maker,
+            miner="5" + "U" * 47,
+            composites=[0.90, 0.91, 0.92],
+            created_at=datetime(2026, 6, 8, 13, 0, tzinfo=UTC),
+        )
+        await _seed_payment(
+            session_maker,
+            agent_id=representative,
+            miner_hotkey="5" + "T" * 47,
+            miner_coldkey=coldkey,
+            index=41,
+        )
+        await _seed_payment(
+            session_maker,
+            agent_id=hidden_generation,
+            miner_hotkey="5" + "U" * 47,
+            miner_coldkey=coldkey,
+            index=42,
+        )
+        await _activate_era(session_maker)
+        _install_db(app, session_maker)
+
+        board = (await client.get("/api/v1/public/leaderboard")).json()
+
+        assert board["count"] == 1
+        entry = board["entries"][0]
+        assert entry["agent_id"] == representative
+        family = entry["submission_family"]
+        assert family["member_count"] == 2
+        assert [member["agent_id"] for member in family["members"]] == [
+            representative,
+            hidden_generation,
+        ]
+        assert [member["representative"] for member in family["members"]] == [
+            True,
+            False,
+        ]
+
+        pipeline = (
+            await client.get(f"/api/v1/public/agent/{hidden_generation}/pipeline")
+        ).json()
+        assert pipeline["submission_family"] == family
+
     async def test_open_rollout_exposes_settled_and_rollout_state_per_entry(
         self,
         app: FastAPI,

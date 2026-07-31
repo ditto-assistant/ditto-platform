@@ -29,6 +29,7 @@ from ditto.db.models import (
     Agent,
     BenchmarkRolloutMember,
     EvaluationPayment,
+    OwnerAttestation,
     Score,
 )
 from ditto.db.queries.agents import get_agent_by_id
@@ -155,6 +156,92 @@ class LedgerRow:
     per-case breakdown. The public leaderboard exposes a **safe subset** (never
     ``per_case``, which carries the answer key); validator-gated endpoints may
     read it whole. ``None`` for rows scored before details were persisted."""
+
+
+@dataclass(frozen=True)
+class SubmissionFamilyMemberRow:
+    """One finalized full-benchmark generation in an owner's ranking family."""
+
+    owner: str
+    agent_id: UUID
+    agent_name: str
+    agent_version: int | None
+    miner_hotkey: str
+    canonical_composite: float
+    submitted_at: datetime
+
+
+async def list_submission_family_members(
+    session: AsyncSession,
+    *,
+    bench_version: int,
+) -> dict[str, list[SubmissionFamilyMemberRow]]:
+    """Return every finalized ranked generation grouped by emission owner.
+
+    The leaderboard intentionally publishes one representative per payment-time
+    coldkey. This companion read keeps the other scored generations visible
+    without assigning them fake ranks or extra emission positions. It rebuilds
+    each agent's canonical quorum median from the same score rows used by the
+    ledger and applies the same full-run and positive-score gates.
+    """
+    rows = (
+        await session.execute(
+            select(
+                Agent.agent_id,
+                Agent.name,
+                Agent.version,
+                Agent.miner_hotkey,
+                Agent.created_at,
+                EvaluationPayment.miner_coldkey,
+                Score.validator_hotkey,
+                Score.composite,
+            )
+            .join(Score, Score.agent_id == Agent.agent_id)
+            .outerjoin(EvaluationPayment, EvaluationPayment.agent_id == Agent.agent_id)
+            .where(
+                Agent.status.in_((AgentStatus.SCORED, AgentStatus.LIVE)),
+                Score.bench_version == bench_version,
+                Score.n >= MIN_ELIGIBLE_CASES,
+                Score.composite > 0.0,
+            )
+            .order_by(Agent.created_at, Agent.agent_id, Score.validator_hotkey)
+        )
+    ).all()
+
+    by_agent: dict[UUID, list[Any]] = defaultdict(list)
+    for row in rows:
+        by_agent[row.agent_id].append(row)
+
+    families: dict[str, list[SubmissionFamilyMemberRow]] = defaultdict(list)
+    for agent_id, score_rows in by_agent.items():
+        if len({row.validator_hotkey for row in score_rows}) < SCORING_QUORUM:
+            continue
+        first = score_rows[0]
+        owner = emission_owner(
+            miner_hotkey=first.miner_hotkey,
+            miner_coldkey=first.miner_coldkey,
+        )
+        families[owner].append(
+            SubmissionFamilyMemberRow(
+                owner=owner,
+                agent_id=agent_id,
+                agent_name=first.name,
+                agent_version=first.version,
+                miner_hotkey=first.miner_hotkey,
+                canonical_composite=float(median(row.composite for row in score_rows)),
+                submitted_at=first.created_at,
+            )
+        )
+
+    for members in families.values():
+        members.sort(
+            key=lambda member: (
+                -member.canonical_composite,
+                member.submitted_at,
+                str(member.agent_id),
+            )
+        )
+    return dict(families)
 
 
 @dataclass(frozen=True)
@@ -318,6 +405,59 @@ def emission_owner(*, miner_hotkey: str, miner_coldkey: str | None) -> str:
     if miner_coldkey is not None:
         return f"coldkey:{miner_coldkey}"
     return f"hotkey:{miner_hotkey}"
+
+
+async def attested_emission_owner_roots(
+    session: AsyncSession,
+    identities: Sequence[tuple[str, str]],
+) -> list[str]:
+    """Canonical owner roots for already-loaded ``(hotkey, raw owner)`` rows.
+
+    Payment-time coldkeys and active, mutually signed owner attestations are
+    both ownership edges.  Folding them together here preserves the existing
+    one-coldkey/one-slot rule while ensuring a miner cannot occupy another
+    emission slot merely by rotating both hotkey and coldkey after proving the
+    two hotkeys have the same operator.
+
+    The graph is intentionally evaluated at read time: revoking an attestation
+    stops affecting future leaderboard/weight reads without rewriting any
+    submission, score, payment, or historical audit row.
+    """
+    if not identities:
+        return []
+
+    from ditto.api_server.attestation import expected_netuid
+
+    parent: dict[str, str] = {}
+
+    def find(node: str) -> str:
+        parent.setdefault(node, node)
+        while parent[node] != node:
+            parent[node] = parent[parent[node]]
+            node = parent[node]
+        return node
+
+    def union(left: str, right: str) -> None:
+        left_root = find(left)
+        right_root = find(right)
+        if left_root == right_root:
+            return
+        lo, hi = sorted((left_root, right_root))
+        parent[hi] = lo
+
+    for hotkey, raw_owner in identities:
+        union(f"hotkey:{hotkey}", raw_owner)
+
+    links = await session.execute(
+        select(OwnerAttestation.hotkey_lo, OwnerAttestation.hotkey_hi).where(
+            OwnerAttestation.netuid == expected_netuid(),
+            OwnerAttestation.revoked_at.is_(None),
+        )
+    )
+    for hotkey_lo, hotkey_hi in links:
+        union(f"hotkey:{hotkey_lo}", f"hotkey:{hotkey_hi}")
+
+    return [find(f"hotkey:{hotkey}") for hotkey, _raw_owner in identities]
 
 
 @dataclass(frozen=True)
@@ -779,6 +919,7 @@ async def count_ranked_quorum_agents(
     qualifying = (
         select(
             per_version.c.agent_id,
+            Agent.miner_hotkey.label("miner_hotkey"),
             _emission_owner_key().label("emission_owner"),
         )
         .join(Agent, Agent.agent_id == per_version.c.agent_id)
@@ -795,14 +936,12 @@ async def count_ranked_quorum_agents(
                 per_version.c.srn * 2 == per_version.c.cnt + 1,
             ),
         )
-        .subquery()
     )
-    return int(
-        await session.scalar(
-            select(func.count(func.distinct(qualifying.c.emission_owner)))
-        )
-        or 0
-    )
+    identities = [
+        (row.miner_hotkey, row.emission_owner)
+        for row in (await session.execute(qualifying)).all()
+    ]
+    return len(set(await attested_emission_owner_roots(session, identities)))
 
 
 async def list_eligible_ledger(
@@ -1096,7 +1235,7 @@ async def list_eligible_ledger(
         )
     )
     result = await session.execute(stmt)
-    return [
+    ledger = [
         LedgerRow(
             miner_hotkey=row.miner_hotkey,
             agent_id=row.agent_id,
@@ -1126,6 +1265,25 @@ async def list_eligible_ledger(
         )
         for row in result
     ]
+    roots = await attested_emission_owner_roots(
+        session,
+        [
+            (
+                row.miner_hotkey,
+                emission_owner(
+                    miner_hotkey=row.miner_hotkey,
+                    miner_coldkey=row.miner_coldkey,
+                ),
+            )
+            for row in ledger
+        ],
+    )
+    # ``stmt`` is already in canonical score order. Keeping the first row per
+    # proven owner therefore selects that owner's best eligible submission.
+    best_by_owner: dict[str, LedgerRow] = {}
+    for root, row in zip(roots, ledger, strict=True):
+        best_by_owner.setdefault(root, row)
+    return list(best_by_owner.values())
 
 
 async def quorum_composites(
@@ -1277,15 +1435,22 @@ async def list_provisional_ledger(
     # A provisional row has no continual mean to rank on -- it has not reached
     # quorum -- so the canonical comparator reads its raw composite here.
     candidates.sort(key=lambda candidate: score_order_key(candidate[0]))
+    roots = await attested_emission_owner_roots(
+        session,
+        [
+            (
+                candidate[0].miner_hotkey,
+                emission_owner(
+                    miner_hotkey=candidate[0].miner_hotkey,
+                    miner_coldkey=candidate[0].miner_coldkey,
+                ),
+            )
+            for candidate in candidates
+        ],
+    )
     best_by_owner: dict[str, tuple[LedgerRow, int]] = {}
-    for candidate in candidates:
-        best_by_owner.setdefault(
-            emission_owner(
-                miner_hotkey=candidate[0].miner_hotkey,
-                miner_coldkey=candidate[0].miner_coldkey,
-            ),
-            candidate,
-        )
+    for root, candidate in zip(roots, candidates, strict=True):
+        best_by_owner.setdefault(root, candidate)
     return list(best_by_owner.values())
 
 

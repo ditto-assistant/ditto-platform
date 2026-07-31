@@ -1224,6 +1224,15 @@ def verified_scorer_for_version(
         or scorer.v7_calibration is None
     ):
         return None
+    # V8 accepts arbitrary-language miner images, so a scorer binary claiming
+    # support is insufficient. Require the signed executor boundary as well.
+    # V7 remains routable during the additive migration.
+    if version >= 8 and capabilities.executor_isolation not in {
+        "rootless_dind",
+        "rootless_host",
+        "ephemeral_vm",
+    }:
+        return None
     component = stack.components.dittobench_api
     if not (
         capabilities.screened_images

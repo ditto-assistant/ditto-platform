@@ -183,6 +183,10 @@ class TestDashboard:
             'class="operations"'
         )
         assert 'id="leaderboard-title">Leaderboard' in body
+        assert "one rank per payment-owner family" in body
+        assert 'class="family-toggle"' in body
+        assert "Scored, but not independently ranked" in body
+        assert "function renderFamilyStanding(pipeline)" in body
         assert 'id="leaderboard-notice" role="status" aria-live="polite"' in body
         assert "Provisional standings." in body
         assert "not the required 3 of 3 scores" in body
@@ -349,8 +353,12 @@ class TestDashboard:
         assert "mean of the initial three scores" in body
         assert "full cohort wave" in body
         assert "continually adjusts up or down" in body
-        assert "function continualVarianceSvg(e)" in body
-        assert "Score observations: initial quorum" in body
+        # The per-sample dot plot was a debugging view; the row now carries the
+        # seed-round count and keeps the mean's composition in the tooltip.
+        assert "function continualVarianceSvg(e)" not in body
+        assert "Score observations: initial quorum" not in body
+        assert "continual-retest seed " in body
+        assert 'class="rollout-chip settled seed-rounds-chip tip"' in body
         assert "benchmarkVersionKey(pipeline.active_bench_version)" in body
         assert "cohortMedian(cohort.scores)" in body
         assert "pipeline.score_count) + ' of ' + esc(pipeline.quorum)" not in body

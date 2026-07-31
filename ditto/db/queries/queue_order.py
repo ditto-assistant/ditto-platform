@@ -75,6 +75,7 @@ from ditto.db.models import (
     BenchmarkDataset,
     BenchmarkRollout,
     EvaluationPayment,
+    OwnerAttestation,
     Score,
     ValidatorHeartbeat,
     ValidatorTicket,
@@ -613,13 +614,36 @@ async def resolve_owner_linkage(
             .where(Agent.agent_id == agent_id)
         )
     ).one()
+    from ditto.api_server.attestation import expected_netuid
+
+    directly_attested = set(
+        await session.scalars(
+            select(
+                case(
+                    (
+                        OwnerAttestation.hotkey_lo == owner_hotkey,
+                        OwnerAttestation.hotkey_hi,
+                    ),
+                    else_=OwnerAttestation.hotkey_lo,
+                )
+            ).where(
+                OwnerAttestation.netuid == expected_netuid(),
+                OwnerAttestation.revoked_at.is_(None),
+                or_(
+                    OwnerAttestation.hotkey_lo == owner_hotkey,
+                    OwnerAttestation.hotkey_hi == owner_hotkey,
+                ),
+            )
+        )
+    )
+    owner_hotkeys = {owner_hotkey, *directly_attested}
     linked_coldkeys = {
         coldkey
         for coldkey in (
             await session.scalars(
                 select(EvaluationPayment.miner_coldkey)
                 .where(
-                    EvaluationPayment.miner_hotkey == owner_hotkey,
+                    EvaluationPayment.miner_hotkey.in_(owner_hotkeys),
                     EvaluationPayment.miner_coldkey.is_not(None),
                 )
                 .distinct()
@@ -629,7 +653,7 @@ async def resolve_owner_linkage(
     }
     if owner_coldkey is not None:
         linked_coldkeys.add(owner_coldkey)
-    linked_hotkeys = {owner_hotkey}
+    linked_hotkeys = set(owner_hotkeys)
     if linked_coldkeys:
         linked_hotkeys.update(
             (
@@ -672,14 +696,34 @@ async def resolve_owner_linkage_batch(
             .where(Agent.agent_id.in_(requested))
         )
     ).all()
+    from ditto.api_server.attestation import expected_netuid
+
     owner_hotkeys = {hotkey for _, hotkey, _ in agent_rows}
+    direct_links: dict[str, set[str]] = {}
+    for hotkey_lo, hotkey_hi in (
+        await session.execute(
+            select(OwnerAttestation.hotkey_lo, OwnerAttestation.hotkey_hi).where(
+                OwnerAttestation.netuid == expected_netuid(),
+                OwnerAttestation.revoked_at.is_(None),
+                or_(
+                    OwnerAttestation.hotkey_lo.in_(owner_hotkeys),
+                    OwnerAttestation.hotkey_hi.in_(owner_hotkeys),
+                ),
+            )
+        )
+    ).all():
+        direct_links.setdefault(hotkey_lo, set()).add(hotkey_hi)
+        direct_links.setdefault(hotkey_hi, set()).add(hotkey_lo)
+    payment_scope_hotkeys = owner_hotkeys | {
+        linked for hotkey in owner_hotkeys for linked in direct_links.get(hotkey, ())
+    }
     # Hop one: every payment-time coldkey ever observed for these hotkeys.
     coldkeys_by_hotkey: dict[str, set[str]] = {}
     for hotkey, coldkey in (
         await session.execute(
             select(EvaluationPayment.miner_hotkey, EvaluationPayment.miner_coldkey)
             .where(
-                EvaluationPayment.miner_hotkey.in_(owner_hotkeys),
+                EvaluationPayment.miner_hotkey.in_(payment_scope_hotkeys),
                 EvaluationPayment.miner_coldkey.is_not(None),
             )
             .distinct()
@@ -708,10 +752,13 @@ async def resolve_owner_linkage_batch(
             hotkeys_by_coldkey.setdefault(coldkey, set()).add(hotkey)
     linkage: dict[UUID, OwnerLinkage] = {}
     for agent_id, owner_hotkey, owner_coldkey in agent_rows:
+        directly_attested = direct_links.get(owner_hotkey, set())
         linked_coldkeys = set(coldkeys_by_hotkey.get(owner_hotkey, ()))
+        for linked_hotkey in directly_attested:
+            linked_coldkeys.update(coldkeys_by_hotkey.get(linked_hotkey, ()))
         if owner_coldkey is not None:
             linked_coldkeys.add(owner_coldkey)
-        linked_hotkeys = {owner_hotkey}
+        linked_hotkeys = {owner_hotkey, *directly_attested}
         for coldkey in linked_coldkeys:
             linked_hotkeys.update(hotkeys_by_coldkey.get(coldkey, ()))
         linkage[agent_id] = OwnerLinkage(

@@ -125,6 +125,31 @@ def test_unknown_rust_contract_detail_stays_public_safe() -> None:
     assert "SECRET_FROM_UNTRUSTED_DETAIL" not in reason
 
 
+def test_public_container_contract_reason_is_language_neutral() -> None:
+    detail = (
+        "error[SCR-CONTRACT-001]: Dockerfile is missing from the archive root\n\n"
+        "help: package the harness contents so Dockerfile is at the top level"
+    )
+
+    assert _public_screening_reason(detail, "container-harness-contract") == (
+        "Container harness contract failed (SCR-CONTRACT-001): Dockerfile is "
+        "missing from the archive root. Package the harness contents so Dockerfile "
+        "is at the top level."
+    )
+
+
+def test_unknown_container_contract_detail_stays_public_safe() -> None:
+    reason = _public_screening_reason(
+        "error[SCR-CONTRACT-999]: SECRET_FROM_UNTRUSTED_DETAIL",
+        "container-harness-contract",
+    )
+
+    assert reason.startswith(
+        "Submission does not satisfy the container harness contract"
+    )
+    assert "SECRET_FROM_UNTRUSTED_DETAIL" not in reason
+
+
 def _result_payload(
     agent_id: UUID,
     *,

@@ -387,6 +387,28 @@ class PublicArtifactDownload(BaseModel):
     expires_at: datetime
 
 
+class PublicSubmissionFamilyMember(BaseModel):
+    """One finalized submission sharing a leaderboard ownership slot."""
+
+    agent_id: UUID
+    agent_name: str
+    agent_version: Annotated[int | None, Field(default=None, ge=1)] = None
+    miner_hotkey: Annotated[str, Field(pattern=_SS58_PATTERN)]
+    canonical_composite: Annotated[float, Field(gt=0.0, le=1.0)]
+    submitted_at: datetime
+    representative: bool = False
+
+
+class PublicSubmissionFamily(BaseModel):
+    """The scored generations collapsed into one owner leaderboard position."""
+
+    member_count: Annotated[int, Field(ge=1)]
+    selection_rule: Literal["best_canonical_score_per_payment_owner"] = (
+        "best_canonical_score_per_payment_owner"
+    )
+    members: list[PublicSubmissionFamilyMember] = Field(default_factory=list)
+
+
 class PublicLeaderboardEntry(BaseModel):
     """One miner's best score, aggregate-only, for public display.
 
@@ -461,6 +483,14 @@ class PublicLeaderboardEntry(BaseModel):
         ),
     ] = None
     artifact_release: PublicArtifactRelease | None = None
+    submission_family: PublicSubmissionFamily | None = Field(
+        default=None,
+        description=(
+            "Finalized, full-benchmark submissions sharing this entry's payment-"
+            "time ownership slot. The representative is the only independently "
+            "ranked member; the others remain visible for score transparency."
+        ),
+    )
     miner_hotkey: Annotated[
         str, Field(pattern=_SS58_PATTERN, description="Miner's SS58 hotkey.")
     ]
@@ -2187,6 +2217,13 @@ class PublicSubmissionPipeline(BaseModel):
     generated_at: datetime
     agent_id: UUID
     status: str
+    submission_family: PublicSubmissionFamily | None = Field(
+        default=None,
+        description=(
+            "Current-benchmark submission family when this agent shares a "
+            "leaderboard ownership slot with another finalized generation."
+        ),
+    )
     active_bench_version: Annotated[
         int, Field(ge=1, description="Benchmark version currently being scored.")
     ]

@@ -1162,6 +1162,50 @@ _RUST_CONTRACT_PUBLIC_REASONS = {
     ),
 }
 
+_CONTAINER_CONTRACT_DIAGNOSTIC_RE = re.compile(
+    r"^error\[(SCR-(?:ARCHIVE|CONTRACT)-\d{3})\]:", re.IGNORECASE
+)
+_CONTAINER_CONTRACT_PUBLIC_REASONS = {
+    "SCR-ARCHIVE-001": (
+        "archive contains an unsafe or non-canonical path. Remove absolute paths, "
+        "parent traversals, backslashes, drive prefixes, and redundant components."
+    ),
+    "SCR-ARCHIVE-002": (
+        "archive contains a duplicate path. Package each path exactly once."
+    ),
+    "SCR-ARCHIVE-003": (
+        "archive contains a link or special file. Package only regular files and "
+        "directories."
+    ),
+    "SCR-ARCHIVE-004": (
+        "archive expands beyond the safety limit. Remove generated assets and build "
+        "output before packaging."
+    ),
+    "SCR-ARCHIVE-005": (
+        "archive contains too many members. Remove generated directories and package "
+        "only the harness."
+    ),
+    "SCR-ARCHIVE-006": (
+        "archive is not a readable gzip-compressed tar. Recreate it as a .tar.gz "
+        "archive and retry."
+    ),
+    "SCR-CONTRACT-001": (
+        "Dockerfile is missing from the archive root. Package the harness contents "
+        "so Dockerfile is at the top level."
+    ),
+    "SCR-CONTRACT-002": (
+        "Dockerfile could not be read. Recreate the archive from readable regular "
+        "files."
+    ),
+    "SCR-CONTRACT-003": (
+        "Dockerfile is not valid UTF-8 text. Commit a readable UTF-8 Dockerfile."
+    ),
+    "SCR-CONTRACT-004": (
+        "Dockerfile requests an insecure build entitlement. Remove host networking "
+        "and insecure build security modes."
+    ),
+}
+
 
 def _public_screening_reason(detail: str, reason_code: str | None = None) -> str:
     """Map untrusted screener detail to a stable, public-safe failure category.
@@ -1172,6 +1216,22 @@ def _public_screening_reason(detail: str, reason_code: str | None = None) -> str
     """
     if reason_code == "exact-cross-miner-duplicate":
         return "Artifact is an exact duplicate of another miner submission"
+    if reason_code == "container-harness-contract":
+        match = _CONTAINER_CONTRACT_DIAGNOSTIC_RE.match(detail.strip())
+        if match is not None:
+            diagnostic_code = match.group(1).upper()
+            public_detail = _CONTAINER_CONTRACT_PUBLIC_REASONS.get(diagnostic_code)
+            if public_detail is not None:
+                return (
+                    "Container harness contract failed "
+                    f"({diagnostic_code}): {public_detail}"
+                )
+        return (
+            "Submission does not satisfy the container harness contract. Rebuild "
+            "the archive as a readable .tar.gz containing only regular files and "
+            "directories, with Dockerfile at the archive root. The implementation "
+            "language is unrestricted."
+        )
     if reason_code == "rust-harness-contract":
         match = _RUST_CONTRACT_DIAGNOSTIC_RE.match(detail.strip())
         if match is not None:
