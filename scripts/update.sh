@@ -284,8 +284,14 @@ deploy_stage="dashboard-build"
 # the other pre-pm2 stages on purpose: a failed build aborts the deploy while
 # the old process (and its previously built dist/, which git reset does not
 # touch) is still serving, so the EXIT trap's rollback rules apply unchanged.
-echo "==> building dashboard"
-(cd dashboard && npm ci --no-audit --no-fund && npm run build)
+# A checkout without the dashboard is served API-only by the factory, so the
+# build is skipped on the same condition rather than failing the deploy.
+if [ -f dashboard/package.json ]; then
+  echo "==> building dashboard"
+  (cd dashboard && npm ci --no-audit --no-fund && npm run build)
+else
+  echo "==> no dashboard/package.json; skipping dashboard build"
+fi
 
 deploy_stage="deploy-config"
 # Ansible is the only writer of .env. Deploy-owned values live in a separate
