@@ -69,6 +69,7 @@ from ditto.api_models import (
     PublicBenchGlossaryResponse,
     PublicBenchIntegrity,
     PublicBenchmarkProgress,
+    PublicBenchmarkQualityFactor,
     PublicBenchmarkRelease,
     PublicBenchmarkTimelinePoint,
     PublicBenchmarkTimelineResponse,
@@ -105,6 +106,8 @@ from ditto.api_models import (
     PublicScreeningReviewEvidence,
     PublicScreeningReviewFinding,
     PublicScreeningReviewLocation,
+    PublicSubmissionFamily,
+    PublicSubmissionFamilyMember,
     PublicSubmissionPipeline,
     PublicSubmissionScores,
     PublicSubmissionsResponse,
@@ -267,6 +270,7 @@ from ditto.db.queries.scores import (
     SCORING_QUORUM,
     LedgerRow,
     SubmissionRow,
+    attested_emission_owner_roots,
     emission_owner,
     get_public_health,
     get_score_counts,
@@ -278,6 +282,7 @@ from ditto.db.queries.scores import (
     list_public_submissions,
     list_scored_bench_versions,
     list_scores_for_bench_version,
+    list_submission_family_members,
     quorum_composites,
 )
 from ditto.db.queries.screening import (
@@ -1529,6 +1534,104 @@ def _safe_raw_composite(details: dict) -> float | None:
     return value if math.isfinite(value) and 0.0 <= value <= 1.0 else None
 
 
+_QUALITY_FACTOR_SPECS = (
+    (
+        "tool_efficiency",
+        "Tool efficiency",
+        "Observed economy of tool use.",
+        "tool_efficiency",
+    ),
+    (
+        "metamorphic_consistency",
+        "Consistency",
+        "Share of equivalent prompts with consistent outcomes.",
+        "metamorphic_consistency_factor",
+    ),
+    (
+        "memory_over_call",
+        "Memory over-call",
+        "Avoidance of unnecessary memory-side actions.",
+        "memory_over_call_factor",
+    ),
+    (
+        "canary_integrity",
+        "Canary integrity",
+        "Whether the run avoided leaking the planted integrity canary.",
+        "canary_integrity_factor",
+    ),
+    (
+        "conversational_sanity",
+        "Conversational sanity",
+        "Aggregate performance across conversational behavior slices.",
+        "conversational_sanity_factor",
+    ),
+    (
+        "transform_robustness",
+        "Transform robustness",
+        "Consistency across reproducible transformed audit pairs.",
+        "transform_audit_factor",
+    ),
+)
+
+
+def _unit_float(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    result = float(value)
+    return result if math.isfinite(result) and 0.0 <= result <= 1.0 else None
+
+
+def _safe_quality_factors(
+    details: dict, aggregate_multiplier: float
+) -> list[PublicBenchmarkQualityFactor]:
+    """Allowlist scorer telemetry without deriving scorer policy curves."""
+    explicit = details.get("benchmark_quality_factors")
+    explicit = explicit if isinstance(explicit, dict) else {}
+    out: list[PublicBenchmarkQualityFactor] = []
+    known_product = 1.0
+    known_count = 0
+    _, audit_count = _safe_transform_robustness(details)
+    for key, label, explanation, multiplier_key in _QUALITY_FACTOR_SPECS:
+        metric = _unit_float(details.get(key))
+        multiplier = _unit_float(explicit.get(key))
+        if multiplier is None:
+            multiplier = _unit_float(details.get(multiplier_key))
+        # This field has always represented the exact applied factor; the other
+        # observed metrics are not assumed to equal their versioned curves.
+        if key == "tool_efficiency" and multiplier is None:
+            multiplier = metric
+        if metric is None and multiplier is None:
+            continue
+        if multiplier is not None:
+            known_product *= multiplier
+            known_count += 1
+        out.append(
+            PublicBenchmarkQualityFactor(
+                key=key,
+                label=label,
+                metric=metric,
+                multiplier=multiplier,
+                audit_count=audit_count if key == "transform_robustness" else None,
+                explanation=explanation,
+            )
+        )
+    if known_count and known_product > 0:
+        remainder = min(1.0, max(0.0, aggregate_multiplier / known_product))
+        if remainder < 1.0 - 1e-6:
+            out.append(
+                PublicBenchmarkQualityFactor(
+                    key="other_quality_effects",
+                    label="Other quality effects",
+                    multiplier=remainder,
+                    explanation=(
+                        "Combined effect not separable in this run's stored telemetry; "
+                        "it reconciles the visible factors to the signed aggregate."
+                    ),
+                )
+            )
+    return out
+
+
 def _composite_breakdown(
     *,
     tool_mean: float,
@@ -1573,6 +1676,7 @@ def _composite_breakdown(
         return PublicCompositeBreakdown(
             base_accuracy=base,
             benchmark_quality_multiplier=quality_multiplier,
+            quality_factors=_safe_quality_factors(details, quality_multiplier),
             pre_token_composite=pre_token,
             token_efficiency_multiplier=token_multiplier,
             token_penalty=token_penalty,
@@ -1609,6 +1713,7 @@ def _public_entry(
     efficiency_bonus: float | None = None,
     efficiency_snapshot_id: UUID | None = None,
     efficiency_bonus_preview: float | None = None,
+    submission_family: PublicSubmissionFamily | None = None,
 ) -> PublicLeaderboardEntry:
     """Map a ledger row to the public entry, exposing only the safe subset of
     ``details`` (never ``per_case``, which carries the answer key)."""
@@ -1638,6 +1743,7 @@ def _public_entry(
         agent_name=agent_name,
         agent_version=agent_version,
         artifact_release=artifact_release,
+        submission_family=submission_family,
         miner_hotkey=r.miner_hotkey,
         miner_uid=miner_uid,
         registered=registered,
@@ -1718,6 +1824,31 @@ def _public_entry(
         ),
         history=trend,
         case_results=_safe_case_results(details),
+    )
+
+
+def _public_submission_family(
+    members: list[Any],
+    *,
+    representative_agent_id: UUID,
+) -> PublicSubmissionFamily | None:
+    """Project a payment-owner family without exposing its coldkey."""
+    if not members:
+        return None
+    return PublicSubmissionFamily(
+        member_count=len(members),
+        members=[
+            PublicSubmissionFamilyMember(
+                agent_id=member.agent_id,
+                agent_name=member.agent_name,
+                agent_version=member.agent_version,
+                miner_hotkey=member.miner_hotkey,
+                canonical_composite=member.canonical_composite,
+                submitted_at=member.submitted_at,
+                representative=member.agent_id == representative_agent_id,
+            )
+            for member in members
+        ],
     )
 
 
@@ -2100,15 +2231,19 @@ async def leaderboard(
         continual_mean_active=continual_mean_active,
     )
     finalized_rows = rank_submissions(finalized_rows, scores=board_official_composites)
+    family_members_by_owner = (
+        await list_submission_family_members(
+            session,
+            bench_version=finalized_rows[0].bench_version,
+        )
+        if finalized_rows
+        else {}
+    )
     # The finalized board is already one row per owner (``list_eligible_ledger``
     # partitions on ``emission_owner``), so the provisional overlay has to
     # suppress and dedupe on that same owner. Keyed on the hotkey it showed an
     # owner's second hotkey as an extra provisional row beside the finalized one
     # it is not separately ranked against.
-    finalized_owners = {
-        emission_owner(miner_hotkey=row.miner_hotkey, miner_coldkey=row.miner_coldkey)
-        for row in finalized_rows
-    }
     provisional_candidates = [
         (row, score_counts.get(row.agent_id, 0))
         for row in ledger_rows
@@ -2117,12 +2252,25 @@ async def leaderboard(
     # Pre-quorum rows have no continual mean, so the canonical comparator reads
     # their raw composite -- the same call ``list_provisional_ledger`` makes.
     provisional_candidates.sort(key=lambda candidate: score_order_key(candidate[0]))
+    owner_rows = finalized_rows + [row for row, _count in provisional_candidates]
+    owner_roots = await attested_emission_owner_roots(
+        session,
+        [
+            (
+                row.miner_hotkey,
+                emission_owner(
+                    miner_hotkey=row.miner_hotkey,
+                    miner_coldkey=row.miner_coldkey,
+                ),
+            )
+            for row in owner_rows
+        ],
+    )
+    finalized_owners = set(owner_roots[: len(finalized_rows)])
     provisional_by_owner: dict[str, tuple[LedgerRow, int]] = {}
-    for candidate in provisional_candidates:
-        owner = emission_owner(
-            miner_hotkey=candidate[0].miner_hotkey,
-            miner_coldkey=candidate[0].miner_coldkey,
-        )
+    for owner, candidate in zip(
+        owner_roots[len(finalized_rows) :], provisional_candidates, strict=True
+    ):
         if owner not in finalized_owners:
             provisional_by_owner.setdefault(owner, candidate)
     provisional_rows = list(provisional_by_owner.values())
@@ -2222,6 +2370,16 @@ async def leaderboard(
                 ),
                 fold_stderr=fold_stderrs.get(row.agent_id),
                 artifact_release=artifact_releases[row.agent_id],
+                submission_family=_public_submission_family(
+                    family_members_by_owner.get(
+                        emission_owner(
+                            miner_hotkey=row.miner_hotkey,
+                            miner_coldkey=row.miner_coldkey,
+                        ),
+                        [],
+                    ),
+                    representative_agent_id=row.agent_id,
+                ),
                 official_composite=board_official_composites.get(
                     row.agent_id, row.composite
                 ),
@@ -3947,6 +4105,25 @@ async def agent_pipeline(
         )
     )
     canonical_version = await active_bench_version(session)
+    current_families = await list_submission_family_members(
+        session, bench_version=canonical_version
+    )
+    agent_family_members = next(
+        (
+            members
+            for members in current_families.values()
+            if any(member.agent_id == agent_id for member in members)
+        ),
+        [],
+    )
+    submission_family = (
+        _public_submission_family(
+            agent_family_members,
+            representative_agent_id=agent_family_members[0].agent_id,
+        )
+        if agent_family_members
+        else None
+    )
     canonical_scores = [
         score for score in accepted_scores if score.bench_version == canonical_version
     ]
@@ -4062,6 +4239,7 @@ async def agent_pipeline(
             benchmark_admitted=benchmark_admitted,
             retired=agent_retired,
         ),
+        submission_family=submission_family,
         active_bench_version=canonical_version,
         score_bench_version=era_version,
         score_count=len(era_scores),

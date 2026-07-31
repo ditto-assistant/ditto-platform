@@ -117,7 +117,11 @@ from ditto.api_server.continual_retest_settings import (
     ContinualRetestSettingsResolver,
     rollout_standdown_reason,
 )
-from ditto.api_server.crn import champion_anchored_seeds, fold_seed_bound
+from ditto.api_server.crn import (
+    champion_anchored_seeds,
+    continual_anchor_horizon,
+    fold_seed_bound,
+)
 from ditto.api_server.datapipeline import DatasetGenerator
 from ditto.api_server.dependencies import (
     get_chain_client,
@@ -130,7 +134,6 @@ from ditto.api_server.fingerprint import reference_corpus_provenance
 from ditto.api_server.inference_concurrency_settings import resolved_proxy_config
 from ditto.api_server.inference_routing import record_ticket_route_quality
 from ditto.api_server.koth import (
-    TOP5_MAX_CONFIRMATION_SEEDS,
     KothEntry,
     emission_set,
     project_koth,
@@ -2943,11 +2946,16 @@ async def _champion_anchored_seed_set(
     )
     if not members:
         return frozenset()
+    history = await confirmation_composites_by_seed(
+        session,
+        agent_ids=tuple(member.agent_id for member in members),
+        bench_version=canonical_version,
+    )
     return frozenset(
         champion_anchored_seeds(
             members[0].agent_id,
             version=canonical_version,
-            max_seeds=TOP5_MAX_CONFIRMATION_SEEDS,
+            max_seeds=continual_anchor_horizon(history),
         )
     )
 
@@ -2989,16 +2997,16 @@ async def _top5_confirmation_seed_plan(
     a full backlog would multiply retest volume by the cohort size for no
     convergence benefit; it keeps the one-seed-per-round pacing it has today.
     """
-    anchor = champion_anchored_seeds(
-        champion_agent_id,
-        version=canonical_version,
-        max_seeds=TOP5_MAX_CONFIRMATION_SEEDS,
-    )
     cohort_ids = tuple(dict.fromkeys((*cohort_member_ids, *wave_member_ids)))
     history = await confirmation_composites_by_seed(
         session,
         agent_ids=tuple(dict.fromkeys((*cohort_ids, member_agent_id))),
         bench_version=canonical_version,
+    )
+    anchor = champion_anchored_seeds(
+        champion_agent_id,
+        version=canonical_version,
+        max_seeds=continual_anchor_horizon(history),
     )
     seeds_by_agent = {agent_id: values.keys() for agent_id, values in history.items()}
     # The live reign's seeds first, in issuing order, then everything the lane has
@@ -3132,13 +3140,13 @@ async def _unserved_catchup_members(
     members = tuple(dict.fromkeys(emission_member_ids))
     if len(members) < 2:
         return frozenset()
+    history = await confirmation_composites_by_seed(
+        session, agent_ids=members, bench_version=canonical_version
+    )
     full = champion_anchored_seeds(
         champion_agent_id,
         version=canonical_version,
-        max_seeds=TOP5_MAX_CONFIRMATION_SEEDS,
-    )
-    history = await confirmation_composites_by_seed(
-        session, agent_ids=members, bench_version=canonical_version
+        max_seeds=continual_anchor_horizon(history),
     )
     seeds_by_agent = {agent_id: values.keys() for agent_id, values in history.items()}
     leases = await _live_retest_leases(
@@ -3206,33 +3214,28 @@ async def _top5_member_is_least_covered(
     if requested_member_id not in member_ids:
         return False
 
-    # One continual retest per validator at a time: a validator already running
-    # a wave member re-asks for that same member (a poll or a restart) and gets
-    # it back, and is not handed a second one.
-    #
-    # Scoped to CONTINUAL_RETEST leases. Matching any live lease meant a
-    # canonical benchmark on an unrelated slot answered the question "which
-    # cohort member is least covered" with "none of them", so a validator
-    # scoring ordinary queue work could never start a retest -- the fleet-wide
-    # veto that ``issue_confirmation_ticket`` used to apply again one layer
-    # down. Coverage is a property of the cohort, not of the validator's
-    # canonical workload; the slot rails belong downstream.
-    existing_retest = await session.scalar(
-        select(ValidatorTicket)
-        .where(
-            ValidatorTicket.validator_hotkey == validator_hotkey,
-            ValidatorTicket.status == TicketStatus.ISSUED,
-            ValidatorTicket.purpose == TicketPurpose.CONTINUAL_RETEST,
-            ValidatorTicket.deadline > now,
+    # A validator may fill several advertised slots with different cohort
+    # members. Re-asking for an existing member remains idempotent, but a lease
+    # for member A must not veto a free slot for member B. Slot capacity and
+    # collision rails are enforced below by ``_idle_retest_slot`` and the
+    # unique live-slot index.
+    existing_retests = (
+        await session.scalars(
+            select(ValidatorTicket).where(
+                ValidatorTicket.validator_hotkey == validator_hotkey,
+                ValidatorTicket.status == TicketStatus.ISSUED,
+                ValidatorTicket.purpose == TicketPurpose.CONTINUAL_RETEST,
+                ValidatorTicket.deadline > now,
+            )
         )
-        .limit(1)
-    )
-    if existing_retest is not None:
-        return (
-            existing_retest.agent_id == requested_member_id
-            and existing_retest.bench_version == canonical_version
-            and existing_retest.seed == wave_seed
-        )
+    ).all()
+    if any(
+        ticket.agent_id == requested_member_id
+        and ticket.bench_version == canonical_version
+        and ticket.seed == wave_seed
+        for ticket in existing_retests
+    ):
+        return True
 
     history = await confirmation_composites_by_seed(
         session,
@@ -3501,7 +3504,20 @@ async def request_top5_confirmation_job(
             canonical_version=canonical_version,
             settings=continual_settings,
         )
-        wave_member_ids = frozenset(member.agent_id for member in wave_members)
+        # These sets answer different questions and must not be conflated:
+        #
+        # * ``wave_member_ids`` is the raw-score gate retained for compatibility
+        #   with already-issued waves.
+        # * ``emission_member_ids`` is the current authoritative top five after
+        #   completed continual aggregates are folded in.
+        #
+        # The former decides whether a legacy wave may advance.  Fairness and
+        # catch-up priority must use the latter, otherwise a newly promoted
+        # current top-five agent is treated like spare-capacity rank-N work and
+        # can remain at zero confirmations while folded-out raw members keep
+        # accumulating samples.
+        wave_member_ids = tuple(member.agent_id for member in wave_members)
+        emission_member_ids = frozenset(member.agent_id for member in emission_members)
         if not members or members[0].agent_id != payload.champion_agent_id:
             raise HTTPException(
                 status_code=409,
@@ -3559,7 +3575,7 @@ async def request_top5_confirmation_job(
             session,
             champion_agent_id=payload.champion_agent_id,
             member_agent_id=payload.member_agent_id,
-            wave_member_ids=tuple(member.agent_id for member in wave_members),
+            wave_member_ids=wave_member_ids,
             cohort_member_ids=tuple(member.agent_id for member in members),
             canonical_version=canonical_version,
         )
@@ -3610,11 +3626,13 @@ async def request_top5_confirmation_job(
         if not await _top5_member_is_least_covered(
             session,
             members=members,
-            emission_member_ids=wave_member_ids,
+            emission_member_ids=emission_member_ids,
             catchup_member_ids=await _unserved_catchup_members(
                 session,
                 champion_agent_id=payload.champion_agent_id,
-                emission_member_ids=tuple(member.agent_id for member in wave_members),
+                emission_member_ids=tuple(
+                    member.agent_id for member in emission_members
+                ),
                 canonical_version=canonical_version,
                 now=now,
             ),

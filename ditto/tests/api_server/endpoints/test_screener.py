@@ -83,6 +83,7 @@ from ditto.db.models import (
     ScreeningQuarantineResolution,
     ValidatorTicket,
 )
+from ditto.db.queries.attestation import record_attestation
 from ditto.db.queries.screening import MAX_SCREENING_EXPIRIES
 from ditto.db.queries.tickets import issue_ticket
 from ditto.tests.legacy_era import retired_era_writes_allowed
@@ -121,6 +122,31 @@ def test_unknown_rust_contract_detail_stays_public_safe() -> None:
     )
 
     assert reason.startswith("Submission does not satisfy the Rust harness contract")
+    assert "SECRET_FROM_UNTRUSTED_DETAIL" not in reason
+
+
+def test_public_container_contract_reason_is_language_neutral() -> None:
+    detail = (
+        "error[SCR-CONTRACT-001]: Dockerfile is missing from the archive root\n\n"
+        "help: package the harness contents so Dockerfile is at the top level"
+    )
+
+    assert _public_screening_reason(detail, "container-harness-contract") == (
+        "Container harness contract failed (SCR-CONTRACT-001): Dockerfile is "
+        "missing from the archive root. Package the harness contents so Dockerfile "
+        "is at the top level."
+    )
+
+
+def test_unknown_container_contract_detail_stays_public_safe() -> None:
+    reason = _public_screening_reason(
+        "error[SCR-CONTRACT-999]: SECRET_FROM_UNTRUSTED_DETAIL",
+        "container-harness-contract",
+    )
+
+    assert reason.startswith(
+        "Submission does not satisfy the container harness contract"
+    )
     assert "SECRET_FROM_UNTRUSTED_DETAIL" not in reason
 
 
@@ -1549,6 +1575,50 @@ class TestClaim:
             miner_hotkey="5NewHotkey",
             miner_coldkey=coldkey,
         )
+        _install_db(app, session_maker)
+
+        claimed = (await client.post(_CLAIM_URL)).json()["items"][0]
+
+        assert claimed["agent_id"] == str(retry)
+        assert claimed["precheck_reason_code"] is None
+        assert claimed["duplicate_of"] is None
+
+    async def test_direct_owner_link_is_not_prechecked_as_exact_duplicate(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        old_hotkey = "5OldLinkedHotkey"
+        new_hotkey = "5NewLinkedHotkey"
+        await _seed_agent(
+            session_maker,
+            status=AgentStatus.EVALUATING,
+            miner_hotkey=old_hotkey,
+            miner_coldkey="5OldColdkey",
+        )
+        retry = await _seed_agent(
+            session_maker,
+            status=AgentStatus.UPLOADED,
+            miner_hotkey=new_hotkey,
+            miner_coldkey="5NewColdkey",
+        )
+        lo, hi = sorted((old_hotkey, new_hotkey))
+        async with session_maker() as session, session.begin():
+            await record_attestation(
+                session,
+                netuid=118,
+                hotkey_lo=lo,
+                hotkey_hi=hi,
+                nonce=uuid4(),
+                issued_at=datetime.now(UTC),
+                lo_key_kind="hotkey",
+                lo_signer=lo,
+                lo_signature="ab" * 64,
+                hi_key_kind="hotkey",
+                hi_signer=hi,
+                hi_signature="cd" * 64,
+            )
         _install_db(app, session_maker)
 
         claimed = (await client.post(_CLAIM_URL)).json()["items"][0]

@@ -265,13 +265,23 @@ class PublicTokenEfficiency(BaseModel):
     decision_reason: str
 
 
+class PublicBenchmarkQualityFactor(BaseModel):
+    """One public-safe input to the scorer-owned benchmark quality multiplier."""
+
+    key: Annotated[str, Field(pattern=r"^[a-z0-9_]+$")]
+    label: str
+    metric: Annotated[float | None, Field(default=None, ge=0.0, le=1.0)] = None
+    multiplier: Annotated[float | None, Field(default=None, ge=0.0, le=1.0)] = None
+    audit_count: Annotated[int | None, Field(default=None, ge=0)] = None
+    explanation: str
+
+
 class PublicCompositeBreakdown(BaseModel):
     """Public arithmetic from capability means to the final composite.
 
-    ``benchmark_quality_multiplier`` is intentionally aggregate-only. The
-    scorer owns the individual integrity and behavioural gates; publishing one
-    combined multiplier explains the arithmetic without duplicating scorer
-    policy in the platform or leaking benchmark answer-key material.
+    The scorer remains authoritative for every multiplier. ``quality_factors``
+    is an allowlisted projection of stored aggregate telemetry; it never
+    reconstructs case content or reimplements benchmark policy.
     """
 
     formula: str = (
@@ -282,6 +292,7 @@ class PublicCompositeBreakdown(BaseModel):
     memory_weight: Annotated[float, Field(ge=0.0, le=1.0)] = 0.5
     base_accuracy: Annotated[float, Field(ge=0.0, le=1.0)]
     benchmark_quality_multiplier: Annotated[float, Field(ge=0.0, le=1.0)]
+    quality_factors: list[PublicBenchmarkQualityFactor] = Field(default_factory=list)
     pre_token_composite: Annotated[float, Field(ge=0.0, le=1.0)]
     token_efficiency_multiplier: Annotated[
         float | None,
@@ -387,6 +398,28 @@ class PublicArtifactDownload(BaseModel):
     expires_at: datetime
 
 
+class PublicSubmissionFamilyMember(BaseModel):
+    """One finalized submission sharing a leaderboard ownership slot."""
+
+    agent_id: UUID
+    agent_name: str
+    agent_version: Annotated[int | None, Field(default=None, ge=1)] = None
+    miner_hotkey: Annotated[str, Field(pattern=_SS58_PATTERN)]
+    canonical_composite: Annotated[float, Field(gt=0.0, le=1.0)]
+    submitted_at: datetime
+    representative: bool = False
+
+
+class PublicSubmissionFamily(BaseModel):
+    """The scored generations collapsed into one owner leaderboard position."""
+
+    member_count: Annotated[int, Field(ge=1)]
+    selection_rule: Literal["best_canonical_score_per_payment_owner"] = (
+        "best_canonical_score_per_payment_owner"
+    )
+    members: list[PublicSubmissionFamilyMember] = Field(default_factory=list)
+
+
 class PublicLeaderboardEntry(BaseModel):
     """One miner's best score, aggregate-only, for public display.
 
@@ -461,6 +494,14 @@ class PublicLeaderboardEntry(BaseModel):
         ),
     ] = None
     artifact_release: PublicArtifactRelease | None = None
+    submission_family: PublicSubmissionFamily | None = Field(
+        default=None,
+        description=(
+            "Finalized, full-benchmark submissions sharing this entry's payment-"
+            "time ownership slot. The representative is the only independently "
+            "ranked member; the others remain visible for score transparency."
+        ),
+    )
     miner_hotkey: Annotated[
         str, Field(pattern=_SS58_PATTERN, description="Miner's SS58 hotkey.")
     ]
@@ -2187,6 +2228,13 @@ class PublicSubmissionPipeline(BaseModel):
     generated_at: datetime
     agent_id: UUID
     status: str
+    submission_family: PublicSubmissionFamily | None = Field(
+        default=None,
+        description=(
+            "Current-benchmark submission family when this agent shares a "
+            "leaderboard ownership slot with another finalized generation."
+        ),
+    )
     active_bench_version: Annotated[
         int, Field(ge=1, description="Benchmark version currently being scored.")
     ]

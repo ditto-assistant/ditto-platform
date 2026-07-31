@@ -15,12 +15,13 @@ from uuid import UUID, uuid4
 import bittensor
 import httpx
 from fastapi import FastAPI
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from ditto.api_models.agent_status import AgentStatus
 from ditto.api_server.attestation import canonical_pair, link_message
 from ditto.api_server.dependencies import get_session
-from ditto.db.models import Agent, EvaluationPayment
+from ditto.db.models import Agent, AthReview, AthReviewAction, EvaluationPayment
 
 _TOKEN = "test-admin-token-at-least-32-characters"
 _HEADERS = {"Authorization": f"Bearer {_TOKEN}", "X-Admin-Actor": "operator"}
@@ -161,6 +162,74 @@ async def test_valid_link_is_recorded(
     # The scope is stated on the wire so nobody downstream has to infer it.
     assert payload["scope"] == "plagiarism-screening-only"
     assert payload["grants_additional_emission_slot"] is False
+    assert payload["cleared_copy_review_count"] == 0
+
+
+async def test_valid_link_backfills_pending_direct_pair_copy_review(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    session_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    _install(app, session_maker)
+    alice, bob = _kp("//Alice"), _kp("//Bob")
+    reference_id, held_id, review_id = uuid4(), uuid4(), uuid4()
+    reason = f"content near-duplicate of agent {reference_id}"
+    now = datetime.now(UTC)
+    async with session_maker() as session, session.begin():
+        session.add_all(
+            [
+                Agent(
+                    agent_id=reference_id,
+                    miner_hotkey=alice.ss58_address,
+                    name="reference",
+                    sha256="aa" * 32,
+                    status=AgentStatus.SCORED,
+                    created_at=now - timedelta(minutes=2),
+                ),
+                Agent(
+                    agent_id=held_id,
+                    miner_hotkey=bob.ss58_address,
+                    name="held",
+                    sha256="bb" * 32,
+                    status=AgentStatus.ATH_PENDING_REVIEW,
+                    duplicate_of=reference_id,
+                    review_reason=reason,
+                    created_at=now - timedelta(minutes=1),
+                ),
+                AthReview(
+                    review_id=review_id,
+                    agent_id=held_id,
+                    status="pending",
+                    opened_at=now,
+                    original_duplicate_of=reference_id,
+                    original_reason=reason,
+                    original_policy_version=9,
+                    original_evidence={},
+                    algorithm_provenance={"review_kind": "copy"},
+                ),
+            ]
+        )
+
+    response = await client.post(_URL, json=_body(alice, bob))
+
+    assert response.status_code == 201, response.text
+    assert response.json()["cleared_copy_review_count"] == 1
+    async with session_maker() as session:
+        held = await session.get(Agent, held_id)
+        review = await session.get(AthReview, review_id)
+        action = await session.scalar(
+            select(AthReviewAction).where(AthReviewAction.review_id == review_id)
+        )
+        assert held is not None and held.status == AgentStatus.SCORED
+        assert held.duplicate_of is None
+        assert held.review_reason is None
+        assert review is not None and review.status == "resolved"
+        assert review.resolution == "clear"
+        assert action is not None
+        assert action.action == "clear"
+        assert (
+            action.evidence["owner_attestation_id"] == response.json()["attestation_id"]
+        )
 
 
 async def test_pair_order_does_not_matter(

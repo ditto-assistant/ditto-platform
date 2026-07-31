@@ -3618,10 +3618,10 @@ class OwnerAttestation(Base):
     they do not control, in either direction. ``lo``/``hi`` carry no meaning
     beyond giving the pair exactly one representation.
 
-    This table feeds **copy screening only**. It is deliberately absent from
-    :func:`ditto.db.queries.scores.emission_owner_key`, the single authority
-    for emission-slot partitioning, so an attestation can neither create nor
-    collapse an emission position.
+    Active links are authoritative same-operator evidence for copy screening,
+    queue-capacity serialization, and one-slot-per-owner emission
+    partitioning. The score ledger retains each underlying submission while
+    selecting only the linked owner's best eligible row for emissions.
     """
 
     __tablename__ = "owner_attestations"

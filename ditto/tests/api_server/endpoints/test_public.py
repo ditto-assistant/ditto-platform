@@ -342,6 +342,32 @@ def test_composite_breakdown_separates_quality_gates_from_token_penalty() -> Non
     assert breakdown.final_composite == 0.365398
 
 
+def test_composite_breakdown_exposes_public_safe_quality_factor_telemetry() -> None:
+    breakdown = public_endpoint._composite_breakdown(
+        tool_mean=0.9,
+        memory_mean=0.7,
+        final_composite=0.64,
+        details={
+            "raw_composite": 0.64,
+            "tool_efficiency": 0.8,
+            "metamorphic_consistency": 0.75,
+            "conversational_sanity": 0.9,
+            "transform_robustness": 0.8,
+            "audit_case_count": 12,
+            "expected": "must never leak",
+        },
+    )
+
+    assert breakdown is not None
+    factors = {factor.key: factor for factor in breakdown.quality_factors}
+    assert factors["tool_efficiency"].multiplier == pytest.approx(0.8)
+    assert factors["metamorphic_consistency"].metric == pytest.approx(0.75)
+    assert factors["conversational_sanity"].metric == pytest.approx(0.9)
+    assert factors["transform_robustness"].audit_count == 12
+    assert "other_quality_effects" not in factors
+    assert "expected" not in breakdown.model_dump_json()
+
+
 def test_composite_breakdown_shows_no_token_penalty_when_within_budget() -> None:
     details = {
         "raw_composite": 0.493952,
@@ -2528,6 +2554,63 @@ class TestPublicLeaderboard:
         listed = [entry["agent_id"] for entry in body["entries"]]
         assert listed == [finalized, best_provisional]
         assert body["count"] == 2
+
+    async def test_owner_family_keeps_hidden_generations_visible_without_ranks(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        coldkey = "5SharedFinalizedFamilyColdkey"
+        representative = await _seed_k3(
+            session_maker,
+            miner="5" + "T" * 47,
+            composites=[0.95, 0.96, 0.97],
+            created_at=datetime(2026, 6, 8, 12, 0, tzinfo=UTC),
+        )
+        hidden_generation = await _seed_k3(
+            session_maker,
+            miner="5" + "U" * 47,
+            composites=[0.90, 0.91, 0.92],
+            created_at=datetime(2026, 6, 8, 13, 0, tzinfo=UTC),
+        )
+        await _seed_payment(
+            session_maker,
+            agent_id=representative,
+            miner_hotkey="5" + "T" * 47,
+            miner_coldkey=coldkey,
+            index=41,
+        )
+        await _seed_payment(
+            session_maker,
+            agent_id=hidden_generation,
+            miner_hotkey="5" + "U" * 47,
+            miner_coldkey=coldkey,
+            index=42,
+        )
+        await _activate_era(session_maker)
+        _install_db(app, session_maker)
+
+        board = (await client.get("/api/v1/public/leaderboard")).json()
+
+        assert board["count"] == 1
+        entry = board["entries"][0]
+        assert entry["agent_id"] == representative
+        family = entry["submission_family"]
+        assert family["member_count"] == 2
+        assert [member["agent_id"] for member in family["members"]] == [
+            representative,
+            hidden_generation,
+        ]
+        assert [member["representative"] for member in family["members"]] == [
+            True,
+            False,
+        ]
+
+        pipeline = (
+            await client.get(f"/api/v1/public/agent/{hidden_generation}/pipeline")
+        ).json()
+        assert pipeline["submission_family"] == family
 
     async def test_open_rollout_exposes_settled_and_rollout_state_per_entry(
         self,

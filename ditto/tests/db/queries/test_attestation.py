@@ -1,22 +1,17 @@
 """Tests for :mod:`ditto.db.queries.attestation`.
 
-Includes the load-bearing scoping tests: an attestation must never move a
-submission into or out of an emission position, and the emission code must
-never learn about attestations at all.
+Includes the load-bearing ownership tests: a mutually signed owner link gives
+the linked hotkeys one emission position while preserving their rows.
 """
 
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from uuid import uuid4
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
-import ditto.api_server.efficiency as efficiency_module
-import ditto.api_server.koth as koth_module
-import ditto.db.queries.scores as scores_module
 from ditto.api_models.agent_status import AgentStatus
 from ditto.db.models import Agent, EvaluationPayment
 from ditto.db.queries.attestation import (
@@ -303,41 +298,11 @@ class TestBoundColdkey:
         assert await get_bound_coldkey_for_hotkey(session, hotkey=_C) is None
 
 
-class TestEmissionSlotsAreUnaffected:
-    """The scoping constraint, pinned.
-
-    An attestation exempts plagiarism screening. It must not be an input to
-    emission-slot allocation, which stays partitioned by payment-time coldkey
-    via :func:`ditto.db.queries.scores.emission_owner_key`.
-    """
-
-    async def test_emission_code_never_learns_about_attestations(self) -> None:
-        """The structural guarantee, asserted structurally.
-
-        A coldkey-grade ownership proof is exactly the thing it would be
-        tempting to consume when allocating emission slots. This test fails the
-        moment any emission-path module so much as mentions attestations, which
-        is a far stronger guard than a reviewer remembering the rule.
-        """
-        for module in (scores_module, koth_module, efficiency_module):
-            module_file = module.__file__
-            assert module_file is not None
-            source = Path(module_file).read_text()
-            assert "attest" not in source.lower(), (
-                f"{module.__name__} references attestations; the emission path "
-                "must not consume owner links"
-            )
-
-    async def test_attestation_does_not_change_the_emission_ledger(
+class TestEmissionSlotsFollowProvenOwnership:
+    async def test_attestation_collapses_distinct_coldkeys_to_one_slot(
         self, session: AsyncSession
     ) -> None:
-        """Identical ledger before and after the link is recorded.
-
-        Two coldkeys, two hotkeys, one real operator. Recording the proof that
-        they are one operator changes the emission ledger in *no* way: it
-        neither grants an extra position nor silently removes one. Emission
-        policy is a separate lever and this feature does not pull it.
-        """
+        """Two proved hotkeys belonging to one operator get one best slot."""
         first_seen = datetime(2026, 6, 8, 9, 0, 0, tzinfo=UTC)
         await _seed_scored_agent(
             session,
@@ -355,17 +320,16 @@ class TestEmissionSlotsAreUnaffected:
         )
 
         before = await list_eligible_ledger(session)
-        before_key = sorted((r.agent_id, r.miner_coldkey) for r in before)
+        assert len(before) == 2
         # Close the transaction the read autobegan so the write can open its own.
         await session.rollback()
 
         await _attest(session, a=_A, b=_B)
 
         after = await list_eligible_ledger(session)
-        after_key = sorted((r.agent_id, r.miner_coldkey) for r in after)
-
-        assert after_key == before_key
-        assert len(after) == len(before)
+        assert len(after) == 1
+        assert after[0].miner_hotkey == _A
+        assert after[0].composite == 0.90
 
     async def test_attestation_does_not_split_one_coldkey_into_two_slots(
         self, session: AsyncSession
@@ -396,3 +360,37 @@ class TestEmissionSlotsAreUnaffected:
         ledger = await list_eligible_ledger(session)
         assert len(ledger) == 1
         assert ledger[0].miner_coldkey == "5SharedColdkey"
+
+    async def test_revocation_restores_independent_emission_slots(
+        self, session: AsyncSession
+    ) -> None:
+        """A revoked proof stops collapsing the owners on the next read."""
+        first_seen = datetime(2026, 6, 8, 9, 0, 0, tzinfo=UTC)
+        await _seed_scored_agent(
+            session,
+            miner=_A,
+            coldkey="5ColdkeyA",
+            composite=0.90,
+            created_at=first_seen,
+        )
+        await _seed_scored_agent(
+            session,
+            miner=_B,
+            coldkey="5ColdkeyB",
+            composite=0.85,
+            created_at=first_seen + timedelta(hours=1),
+        )
+        link = await _attest(session, a=_A, b=_B)
+        attestation_id = link.attestation_id
+        assert len(await list_eligible_ledger(session)) == 1
+        await session.rollback()
+
+        async with session.begin():
+            revoked = await revoke_attestation(
+                session,
+                attestation_id=attestation_id,
+                revoked_by=_A,
+                reason="owners separated",
+            )
+        assert revoked is not None
+        assert len(await list_eligible_ledger(session)) == 2

@@ -26,13 +26,14 @@ adjudicating a dispute, and it is the handle an operator would use to find and
 revoke links resting on a key type later found to be compromised. Both are real
 value without gating behaviour.
 
-Not an emission input
----------------------
-Deliberately **not** wired into
-:func:`ditto.db.queries.scores.emission_owner_key`. That expression is the
-single authority for one-slot-per-owner partitioning, and an attestation must
-not be able to move a submission into or out of an emission position. See the
-module docstring of :mod:`ditto.api_server.attestation`.
+Owner identity input
+--------------------
+An active, mutually signed link is authoritative evidence that both hotkeys
+belong to one operator. Copy screening uses that fact as an exemption; queue
+allocation uses it to serialize the owner's submissions; and the score ledger
+uses it to collapse the linked component to one best emission position.
+Revocation is prospective and restores independent treatment on the next
+read. See the module docstring of :mod:`ditto.api_server.attestation`.
 """
 
 from __future__ import annotations
@@ -40,10 +41,19 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
+from uuid import uuid4
 
-from sqlalchemy import desc, or_, select
+from sqlalchemy import and_, desc, or_, select
+from sqlalchemy.orm import aliased
 
-from ditto.db.models import Agent, EvaluationPayment, OwnerAttestation
+from ditto.api_models.agent_status import AgentStatus
+from ditto.db.models import (
+    Agent,
+    AthReview,
+    AthReviewAction,
+    EvaluationPayment,
+    OwnerAttestation,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -156,6 +166,93 @@ async def record_attestation(
     session.add(row)
     await session.flush()
     return row
+
+
+async def clear_linked_pending_copy_reviews(
+    session: AsyncSession,
+    *,
+    hotkey_lo: str,
+    hotkey_hi: str,
+    attestation_id: UUID,
+    now: datetime | None = None,
+) -> tuple[UUID, ...]:
+    """Clear pending copy holds proven to be within this direct owner pair.
+
+    The signed link is stronger ownership evidence than the payment-coldkey
+    inference available when the hold opened. Backfill is deliberately narrow:
+    only a pending review whose held agent and original match are the two exact
+    endpoints is cleared. Benchmark-overfit reviews, unrelated hotkeys, stale
+    review evidence, and transitive neighbors are untouched.
+    """
+    candidate = aliased(Agent)
+    reference = aliased(Agent)
+    rows = (
+        await session.execute(
+            select(AthReview, candidate)
+            .join(candidate, candidate.agent_id == AthReview.agent_id)
+            .join(reference, reference.agent_id == AthReview.original_duplicate_of)
+            .where(
+                AthReview.status == "pending",
+                candidate.status == AgentStatus.ATH_PENDING_REVIEW,
+                or_(
+                    and_(
+                        candidate.miner_hotkey == hotkey_lo,
+                        reference.miner_hotkey == hotkey_hi,
+                    ),
+                    and_(
+                        candidate.miner_hotkey == hotkey_hi,
+                        reference.miner_hotkey == hotkey_lo,
+                    ),
+                ),
+            )
+            .with_for_update()
+        )
+    ).all()
+    resolved_at = now or datetime.now(UTC)
+    actor = f"owner-link:{attestation_id}"
+    reason = (
+        "Automatically cleared after both hotkeys signed a direct owner-link "
+        "attestation; same-owner lineage is not plagiarism."
+    )
+    cleared: list[UUID] = []
+    for review, held in rows:
+        # Fail closed if another lifecycle path changed the evidence without
+        # resolving the durable review row.
+        if (
+            held.duplicate_of != review.original_duplicate_of
+            or held.review_reason != review.original_reason
+        ):
+            continue
+        previous_status = review.original_evidence.get("previous_status")
+        held.status = (
+            AgentStatus.LIVE
+            if previous_status == AgentStatus.LIVE.value
+            else AgentStatus.SCORED
+        )
+        held.duplicate_of = None
+        held.review_reason = None
+        review.status = "resolved"
+        review.resolved_at = resolved_at
+        review.resolved_by = actor
+        review.resolution = "clear"
+        review.resolution_reason = reason
+        session.add(
+            AthReviewAction(
+                action_id=uuid4(),
+                review_id=review.review_id,
+                action="clear",
+                reason=reason,
+                actor=actor,
+                evidence={
+                    "previous_status": previous_status,
+                    "owner_attestation_id": str(attestation_id),
+                },
+                created_at=resolved_at,
+            )
+        )
+        cleared.append(review.review_id)
+    await session.flush()
+    return tuple(cleared)
 
 
 async def revoke_attestation(
