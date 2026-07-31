@@ -104,9 +104,6 @@ def recovery_gate(
         return False, False, "submission already reached scoring quorum", []
     if any(ticket.status == TicketStatus.ISSUED for ticket in tickets):
         return False, False, "a validator ticket is still active", []
-    if recovery_count >= MAX_OPERATOR_RECOVERIES_PER_AGENT:
-        return False, False, "operator retry limit reached", []
-
     score_hotkeys = {score.validator_hotkey for score in scores}
     non_scored = [
         ticket
@@ -132,6 +129,14 @@ def recovery_gate(
             else "automatic validator retry is still cooling down"
         )
         return available, False, reason, []
+
+    # The cap limits minting another operator grant; it must not invalidate
+    # retry budget a previous grant already restored. In particular, the final
+    # allowed recovery can revive the one ticket needed to finish quorum while
+    # an exhausted sibling remains in the ledger. Check that live budget first
+    # so the revived ticket stays visible and dispatchable.
+    if recovery_count >= MAX_OPERATOR_RECOVERIES_PER_AGENT:
+        return False, False, "operator retry limit reached", []
 
     needed = SCORING_QUORUM - score_count
     exhausted = sorted(

@@ -434,6 +434,86 @@ async def test_manual_grant_allows_exactly_one_more_same_version_issue(
     assert ticket.manual_retry_grants == 1
 
 
+async def test_final_operator_grant_remains_retryable_with_exhausted_sibling(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    retry_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """A spent recovery cap cannot erase budget the final grant just restored."""
+    agent_id = await _seed(retry_maker, score_count=2)
+    _install(app, retry_maker)
+    async with retry_maker() as session, session.begin():
+        for index in range(3):
+            session.add(
+                ValidatorRetryRecovery(
+                    recovery_id=uuid4(),
+                    agent_id=agent_id,
+                    actor="operator",
+                    reason=f"prior verified infrastructure recovery {index}",
+                    expected_snapshot=f"prior-snapshot-{index}",
+                    score_count=2,
+                    bench_version=_BENCH_VERSION,
+                    ticket_snapshot=[],
+                    granted_validator_hotkeys=["validator-2"],
+                    created_at=_T0 - timedelta(days=3 - index),
+                )
+            )
+
+    detail = await client.get(
+        f"/api/v1/admin/validation-retries/{agent_id}", headers=_HEADERS
+    )
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["recovery_allowed"] is True
+
+    granted = await client.post(
+        f"/api/v1/admin/validation-retries/{agent_id}/retry",
+        headers=_HEADERS,
+        json={
+            "request_id": str(uuid4()),
+            "expected_snapshot": detail.json()["snapshot"],
+            "reason": "Final verified validator infrastructure recovery",
+        },
+    )
+    assert granted.status_code == 200, granted.text
+    assert granted.json()["recovery"]["granted_validator_hotkeys"] == ["validator-2"]
+
+    after = await client.get(
+        f"/api/v1/admin/validation-retries/{agent_id}", headers=_HEADERS
+    )
+    assert after.status_code == 200, after.text
+    assert after.json()["automatic_retry_available"] is True
+    assert after.json()["recovery_allowed"] is False
+    assert after.json()["blocking_reason"] == (
+        "automatic validator retry is already available"
+    )
+    by_hotkey = {
+        ticket["validator_hotkey"]: ticket for ticket in after.json()["tickets"]
+    }
+    assert by_hotkey["validator-2"]["retry_budget_exhausted"] is False
+    assert by_hotkey["validator-3"]["retry_budget_exhausted"] is True
+
+    listing = await client.get("/api/v1/admin/validation-retries", headers=_HEADERS)
+    assert listing.status_code == 200, listing.text
+    listed = next(
+        item
+        for item in listing.json()["submissions"]
+        if item["agent_id"] == str(agent_id)
+    )
+    assert listed["retry_state"] == "retry_available"
+
+    async with retry_maker() as session, session.begin():
+        ticket = await issue_ticket(
+            session,
+            validator_hotkey="validator-2",
+            now=datetime.now(UTC) + timedelta(seconds=1),
+            ttl=timedelta(minutes=90),
+            bench_version=_BENCH_VERSION,
+        )
+    assert ticket is not None and ticket.agent_id == agent_id
+    assert ticket.attempt_count == 3
+    assert ticket.manual_retry_grants == 1
+
+
 async def test_withdraw_failed_submission_preserves_history_and_stops_assignment(
     app: FastAPI,
     client: httpx.AsyncClient,
