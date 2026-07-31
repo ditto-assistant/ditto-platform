@@ -1,25 +1,19 @@
-/* Styles are ported page-by-page from the monolith's <style> block; this file
- * aggregates them. Until the shell port lands it carries only the pieces the
- * scaffold itself needs. */
+/* Shared CSS ported from the monolith <style> block (lines 94-2530),
+ * split by owner. Import order preserves the monolith cascade: tokens,
+ * then reset/ground, shell chrome, shared widgets, modal, search. */
 
-.skip-link {
-  position: absolute;
-  left: -9999px;
-}
+@import "./tokens.css";
+@import "./base.css";
+@import "./shell.css";
+@import "./widgets.css";
+@import "./modal.css";
+@import "./search.css";
 
-.skip-link:focus {
-  left: 8px;
-  top: 8px;
-}
+/* page styles are appended by the page ports */
 
-.visually-hidden {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  margin: -1px;
-  padding: 0;
-  overflow: hidden;
-  clip: rect(0 0 0 0);
-  white-space: nowrap;
-  border: 0;
-}
+@import "./pages/overview.css";
+@import "./pages/leaderboard.css";
+@import "./pages/benchmark.css";
+@import "./pages/operations.css";
+@import "./pages/submissions.css";
+@import "./pages/reviews.css";

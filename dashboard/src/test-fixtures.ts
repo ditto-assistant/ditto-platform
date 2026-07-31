@@ -2,6 +2,7 @@
 // fixture set is one coherent production snapshot: leaderboard entries,
 // activity rows, and the per-agent drilldowns reference the same agents.
 import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 /** Agent id of the leaderboard's top entry at capture time. */
@@ -9,9 +10,13 @@ export const FIXTURE_TOP_AGENT_ID = "c77140d8-3ac5-42c3-8f5c-a99cd283365d";
 /** A rejected submission's agent id (thin pipeline, no scores). */
 export const FIXTURE_REJECTED_AGENT_ID = "8a5d27ee-6ed4-45d4-aaa4-e73957eb8217";
 
+// Resolved with path math rather than `new URL(rel, import.meta.url)`: Vite
+// statically rewrites that pattern into a server-root asset URL, which under
+// vitest resolves to file:///fixtures/… and breaks every fixture read.
+const FIXTURES_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "fixtures");
+
 export function loadFixture<T = unknown>(name: string): T {
-  const path = fileURLToPath(new URL(`../fixtures/${name}.json`, import.meta.url));
-  return JSON.parse(readFileSync(path, "utf-8")) as T;
+  return JSON.parse(readFileSync(join(FIXTURES_DIR, `${name}.json`), "utf-8")) as T;
 }
 
 /** Resolve an API path (as passed to getJSON, no API base) to a fixture name,
