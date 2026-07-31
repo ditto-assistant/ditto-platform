@@ -118,6 +118,8 @@ def official_composites(
     quorum: Mapping[UUID, Sequence[float]],
     completed_waves: Mapping[UUID, Mapping[int, float]],
     continual_mean_active: bool,
+    efficiency_bonuses: Mapping[UUID, float] | None = None,
+    efficiency_fold_active: bool = False,
 ) -> dict[UUID, float]:
     """The score every ranking surface cuts on, per agent.
 
@@ -127,7 +129,8 @@ def official_composites(
     """
     from ditto.api_server.koth import KothEntry, effective_composite
 
-    if not continual_mean_active:
+    bonuses = efficiency_bonuses or {}
+    if not continual_mean_active and not efficiency_fold_active:
         return {row.agent_id: row.composite for row in rows}
     return {
         row.agent_id: effective_composite(
@@ -144,6 +147,9 @@ def official_composites(
                     for _seed, value in sorted(
                         completed_waves.get(row.agent_id, {}).items()
                     )
+                ),
+                efficiency_bonus=(
+                    bonuses.get(row.agent_id) if efficiency_fold_active else None
                 ),
             )
         )

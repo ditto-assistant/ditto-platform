@@ -1709,6 +1709,7 @@ def _public_entry(
     rollout_score_count: int | None = None,
     artifact_release: PublicArtifactRelease | None = None,
     official_composite: float | None = None,
+    pre_efficiency_composite: float | None = None,
     completed_wave_count: int = 0,
     initial_quorum_composites: tuple[float, ...] = (),
     completed_wave_composites: tuple[float, ...] = (),
@@ -1759,6 +1760,11 @@ def _public_entry(
         official_composite=(
             official_composite if official_composite is not None else r.composite
         ),
+        pre_efficiency_composite=(
+            pre_efficiency_composite
+            if pre_efficiency_composite is not None
+            else (official_composite if official_composite is not None else r.composite)
+        ),
         aggregate_method=(
             "continual_mean"
             if continual_aggregate_active and completed_wave_count > 0
@@ -1788,7 +1794,16 @@ def _public_entry(
         # always 1.0, so this line is a no-op until an operator enables
         # enforcement against a threshold that has already been published.
         effective_composite=(
-            bonus_effective_composite(r.composite, efficiency_bonus)
+            bonus_effective_composite(
+                pre_efficiency_composite
+                if pre_efficiency_composite is not None
+                else (
+                    official_composite
+                    if official_composite is not None
+                    else r.composite
+                ),
+                efficiency_bonus,
+            )
             * model_use_factor(model_use_verdict, mode=model_use_policy().mode)
             if efficiency_bonus is not None
             else None
@@ -1867,9 +1882,11 @@ def _public_koth_emissions(
     include_continual_scores: bool = True,
     wave_membership: WaveMembership = DEFAULT_WAVE_MEMBERSHIP,
     anchor_version: int | None = None,
+    efficiency_bonuses: dict[UUID, float] | None = None,
 ) -> PublicKothEmissions | None:
     """Project the finalized score pool through the validator's pure fold."""
     quorum_values = quorum_by_agent or {}
+    bonus_values = efficiency_bonuses or {}
     candidates, by_seed, depths = completed_wave_data(
         rows,
         stderrs=stderrs,
@@ -1923,6 +1940,7 @@ def _public_koth_emissions(
                     if confirmations is not None
                     else None
                 ),
+                efficiency_bonus=bonus_values.get(row.agent_id),
             )
         )
 
@@ -2229,11 +2247,30 @@ async def leaderboard(
         wave_membership=continual_settings.wave_membership,
         anchor_version=active_version,
     )
+    pre_efficiency_composites = official_composites(
+        finalized_rows,
+        quorum=quorum,
+        completed_waves=completed_by_seed,
+        continual_mean_active=continual_mean_active,
+    )
+    efficiency_fold_active = bool(
+        efficiency_config.enabled
+        and efficiency_config.fold_enabled
+        and efficiency_view is not None
+        and not efficiency_view.preview
+    )
+    efficiency_bonuses = (
+        {agent_id: row.bonus for agent_id, row in efficiency_view.bonuses.items()}
+        if efficiency_fold_active and efficiency_view is not None
+        else {}
+    )
     board_official_composites = official_composites(
         finalized_rows,
         quorum=quorum,
         completed_waves=completed_by_seed,
         continual_mean_active=continual_mean_active,
+        efficiency_bonuses=efficiency_bonuses,
+        efficiency_fold_active=efficiency_fold_active,
     )
     finalized_rows = rank_submissions(finalized_rows, scores=board_official_composites)
     family_members_by_owner = (
@@ -2391,6 +2428,9 @@ async def leaderboard(
                 official_composite=board_official_composites.get(
                     row.agent_id, row.composite
                 ),
+                pre_efficiency_composite=pre_efficiency_composites.get(
+                    row.agent_id, row.composite
+                ),
                 completed_wave_count=completed_depth.get(row.agent_id, 0),
                 initial_quorum_composites=tuple(quorum.get(row.agent_id, ())),
                 completed_wave_composites=tuple(
@@ -2474,6 +2514,7 @@ async def leaderboard(
                 include_continual_scores=continual_mean_active,
                 wave_membership=continual_settings.wave_membership,
                 anchor_version=active_version,
+                efficiency_bonuses=efficiency_bonuses,
             )
         ),
         efficiency=_efficiency_status(efficiency_view),

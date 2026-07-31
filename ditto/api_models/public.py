@@ -555,17 +555,32 @@ class PublicLeaderboardEntry(BaseModel):
         float,
         Field(
             ge=0.0,
-            le=1.0,
+            le=1.1,
             description=(
                 "Composite used for the current leaderboard and weight fold. It "
                 "starts as the canonical three-validator median, then becomes "
                 "the arithmetic mean of those three scores plus every retained "
-                "per-seed sample accepted for this agent. Scheduling membership "
-                "never removes an accepted sample."
+                "per-seed sample accepted for this agent. When the Bench v7+ "
+                "relative-efficiency fold is active, the frozen bonus multiplies "
+                "that continual aggregate. Scheduling membership never removes "
+                "an accepted sample."
             ),
         ),
     ]
     aggregate_method: Literal["canonical_median", "continual_mean"] = "canonical_median"
+    pre_efficiency_composite: Annotated[
+        float | None,
+        Field(
+            default=None,
+            ge=0.0,
+            le=1.0,
+            description=(
+                "The ranking composite after continual aggregation but before "
+                "the Bench v7+ relative-efficiency bonus. Equal to "
+                "official_composite while the bonus fold is inactive."
+            ),
+        ),
+    ] = None
     aggregate_sample_count: Annotated[int, Field(ge=3)] = 3
     completed_wave_count: Annotated[
         int,
@@ -646,15 +661,12 @@ class PublicLeaderboardEntry(BaseModel):
             ge=0.0,
             le=1.1,
             description=(
-                "composite * (1 + efficiency_bonus): the token-efficiency view "
-                "of the score, with the frozen bonus applied. The validator's "
-                "composite is never modified; this is a separate, derived field "
-                "so the UI can show provenance (base, bonus, effective) "
-                "distinctly. Null whenever efficiency_bonus is null.\n\n"
-                "Name collision warning: this is NOT the value the board ranks "
-                "by, and it is unrelated to ``koth.effective_composite()``, "
-                "which is the continual-mean estimator surfaced here as "
-                "``official_composite``. ``rank`` never reads this field."
+                "pre_efficiency_composite * (1 + efficiency_bonus): the final "
+                "ranking score with the frozen relative-efficiency bonus "
+                "applied after continual aggregation. Equal to "
+                "official_composite while the fold is active, and null whenever "
+                "efficiency_bonus is null. The validator's signed composite is "
+                "never modified."
             ),
         ),
     ] = None

@@ -164,11 +164,17 @@ export function BenchmarkPage(): JSX.Element {
                   <b>What a score is.</b> The <b>composite</b> starts at{" "}
                   <code>0.5 × tool mean + 0.5 × memory mean</code>. DittoBench then applies
                   benchmark quality gates for wasteful tool use, consistency, unnecessary
-                  memory-side actions, canary integrity, and v5 conversational sanity. Finally, v5
-                  applies token efficiency, which can remove <b>at most 10%</b>. The row detail
-                  shows the exact base, combined quality multiplier, token multiplier, and final
-                  arithmetic. A low composite can therefore come from the benchmark quality gates
-                  even when the token penalty is zero.
+                  memory-side actions, canary integrity, and conversational sanity. Bench v6 and
+                  older retain their signed legacy token penalty, which can remove{" "}
+                  <b>at most 10%</b>. The row detail shows that historical arithmetic without
+                  applying it to newer benches.
+                </li>
+                <li>
+                  <b>How the current token-efficiency bonus works.</b> On Bench v7 and newer,
+                  audited relative efficiency is strictly upside. The platform first computes the
+                  continual score from the original quorum and every retained retest sample, then
+                  applies the frozen cohort bonus. The leaderboard shows the pre-bonus score, bonus
+                  percentage, and final folded score separately.
                 </li>
                 <li>
                   <b>Which runs rank.</b> Only runs that administer the <b>full</b> benchmark

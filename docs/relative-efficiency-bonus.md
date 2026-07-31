@@ -176,17 +176,19 @@ Public (`GET /api/v1/public/leaderboard`):
 * `GET /api/v1/public/efficiency/snapshots/{snapshot_id}`: the full immutable
   audit record. Lineage digests are moderation-adjacent and never exposed —
   members carry opaque `lineage_group` ordinals plus `collapsed_agent_ids`.
-* Leaderboard **ranking still follows `official_composite`** — never
-  `effective_composite`; the effective score is display/provenance until the
-  fold consumes it (below).
+* Leaderboard ranking always follows `official_composite`. While the fold is
+  active that field is the continual aggregate multiplied by the frozen bonus;
+  `pre_efficiency_composite`, `efficiency_bonus`, and `effective_composite`
+  expose the same arithmetic as separate provenance fields for the dashboard.
 
 Validator ledger (`GET /api/v1/scoring/scores`): `LedgerEntry` gains
 additive-optional `efficiency_bonus` and `effective_composite`, populated
 **only** when `DITTO_EFFICIENCY_BONUS_FOLD_ENABLED=true`. With the flag off
 (default) the ledger is byte-identical to the pre-bonus wire shape. The
-weight fold itself lives in ditto-subnet and must ship its own consensus
-change before consuming these fields; a validator must never fold them
-unilaterally. (The `LedgerEntry` contract golden was regenerated —
+weight fold itself lives in ditto-subnet and independently applies the bonus
+after continual aggregation, including shared-seed paired comparisons. A
+validator must never fold these fields unless the Platform operator activates
+the fold globally. (The `LedgerEntry` contract golden was regenerated —
 `ditto/tests/contract/validator_contract.json` — and the ditto-subnet copy
 must be synced when that repo picks up the fields.)
 
@@ -263,12 +265,13 @@ revision with `enabled: true, fold_enabled: true`.
 3. **Active.** The first epoch whose deduped cohort reaches `N_min` freezes
    an active snapshot; every finalized qualified agent gets its insert-once
    bonus row; the leaderboard shows base / bonus / effective distinctly.
-4. **Fold (later, cross-repo).** After ditto-subnet ships a weight-fold
-   consensus change that consumes `effective_composite`, flip the fold on
+4. **Fold (coordinated, cross-repo).** After the bonus-aware ditto-subnet
+   release is live across the participating fleet, flip the fold on
    (`fold_enabled: true` via the settings endpoint, or
    `DITTO_EFFICIENCY_BONUS_FOLD_ENABLED=true` as the seed) so the ledger
-   carries the fields. Until both halves are done, emissions remain a pure
-   function of the base composite.
+   carries the fields. Validators derive the combined score from the continual
+   evidence plus `efficiency_bonus`; the dashboard exposes the pre-bonus score,
+   awarded percentage, and folded score so the change is never silent.
 
 Each of these transitions can be a live backroom settings change (no restart);
 the env vars remain the seed default for a fresh deployment.

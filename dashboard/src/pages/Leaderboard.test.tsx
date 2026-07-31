@@ -111,6 +111,31 @@ describe("dedicated leaderboard page (row 3 slice)", () => {
     expect(document.querySelector("aside.board-rail")).toBeNull();
   });
 
+  it("shows an active efficiency award beside the final folded score", async () => {
+    renderPage({
+      patch: (name, body) => {
+        if (name !== "leaderboard") return body;
+        const payload = body as LeaderboardPayload;
+        const entries = (payload.entries ?? []).map((entry) => ({
+          ...entry,
+          official_composite: 0.756,
+          pre_efficiency_composite: 0.72,
+          efficiency_bonus: 0.05,
+        }));
+        return { ...payload, entries };
+      },
+    });
+    await waitForBoard();
+    await waitFor(() =>
+      expect(document.querySelector(".cline2 .efficiency-bonus-chip")?.textContent).toBe(
+        "efficiency +5.0%",
+      ),
+    );
+    const chip = document.querySelector(".cline2 .efficiency-bonus-chip");
+    expect(chip?.textContent).toBe("efficiency +5.0%");
+    expect(chip).toHaveAttribute("data-tooltip", expect.stringContaining("0.720 becomes 0.756"));
+  });
+
   it("re-asserts hide-md/hide-sm as table-cell for this board only (the pinned CSS)", () => {
     // The page's promise is every column at every viewport: undo the
     // window-width column hiding for this board only. The table keeps its

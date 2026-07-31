@@ -58,6 +58,7 @@ class KothEntry:
     completed_wave_composites: tuple[float, ...] | None = None
     confirmation_composites: tuple[float, ...] | None = None
     confirmation_seeds: tuple[int, ...] | None = None
+    efficiency_bonus: float | None = None
 
 
 @dataclass(frozen=True)
@@ -340,8 +341,21 @@ def _validated_composites(
     return values
 
 
-def effective_composite(entry: KothEntry) -> float:
-    """Return the score that drives the continual leaderboard and weight fold.
+def _efficiency_multiplier(entry: KothEntry) -> float:
+    """Return the bounded multiplier for an awarded relative-efficiency bonus."""
+    bonus = entry.efficiency_bonus
+    if (
+        isinstance(bonus, bool)
+        or not isinstance(bonus, (int, float))
+        or not math.isfinite(bonus)
+        or not 0.0 <= bonus <= 0.1
+    ):
+        return 1.0
+    return 1.0 + float(bonus)
+
+
+def continual_composite(entry: KothEntry) -> float:
+    """Return the continual aggregate before relative efficiency is applied.
 
     An agent starts on the robust three-validator median stored in
     ``entry.composite``. Once at least one completed cohort wave exists, the
@@ -368,6 +382,18 @@ def effective_composite(entry: KothEntry) -> float:
     if len(ordered) % 2:
         return ordered[midpoint]
     return (ordered[midpoint - 1] + ordered[midpoint]) / 2.0
+
+
+def effective_composite(entry: KothEntry) -> float:
+    """Return the final score that drives ranking, KOTH, and emissions.
+
+    Continual evidence is aggregated first. A frozen Bench v7+ relative token
+    efficiency bonus, when awarded and activated for the fold, then multiplies
+    that aggregate. Missing bonus data remains byte-identical to the continual-
+    only fold, and older benchmark token penalties remain inside their signed
+    composites rather than entering this mechanism.
+    """
+    return continual_composite(entry) * _efficiency_multiplier(entry)
 
 
 def _effective_composite(entry: KothEntry) -> float:
@@ -405,8 +431,16 @@ def _paired_statistic(
     shared = sorted(challenger_by_seed.keys() & champion_by_seed.keys())
     if len(shared) < 2:
         return None
-    differences = [challenger_by_seed[seed] - champion_by_seed[seed] for seed in shared]
-    champion_reference = sum(champion_by_seed[seed] for seed in shared) / len(shared)
+    challenger_multiplier = _efficiency_multiplier(challenger)
+    champion_multiplier = _efficiency_multiplier(champion)
+    differences = [
+        challenger_by_seed[seed] * challenger_multiplier
+        - champion_by_seed[seed] * champion_multiplier
+        for seed in shared
+    ]
+    champion_reference = sum(
+        champion_by_seed[seed] * champion_multiplier for seed in shared
+    ) / len(shared)
     mean_difference = sum(differences) / len(differences)
     variance = sum(
         (difference - mean_difference) ** 2 for difference in differences
@@ -441,6 +475,8 @@ def _dethrone_decision(challenger: KothEntry, champion: KothEntry) -> DethroneDe
     statistical_lead: float | None = None
     method: Literal["flat", "unpaired", "paired"] = "flat"
     if challenger_stderr is not None and champion_stderr is not None:
+        challenger_stderr *= _efficiency_multiplier(challenger)
+        champion_stderr *= _efficiency_multiplier(champion)
         statistical_lead = KOTH_DETHRONE_Z * math.sqrt(
             challenger_stderr**2 + champion_stderr**2
         )

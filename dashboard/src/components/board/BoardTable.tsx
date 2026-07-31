@@ -56,6 +56,7 @@ import type { BoardSortKey, BoardTab as BoardTabName } from "./board-state";
 import {
   ChipTip,
   ContinualScoreChip,
+  EfficiencyBonusChip,
   QualityGateChip,
   RankMove,
   RolloutChip,
@@ -149,7 +150,7 @@ const HEADERS: HeaderSpec[] = [
     key: "composite",
     label: "Current score",
     width: "230px",
-    tip: "Current leaderboard score in [0,1]. It starts as the median of the first three accepted validator scores. After each full top-five cohort wave completes, it becomes the arithmetic mean of those original three scores plus one aggregate per eligible shared wave, so continual retests can move it up or down. Retained confirmation seeds stay in the append-only audit ledger even when the current cohort cannot aggregate them.",
+    tip: "Score used for ranking and emissions. It begins with the three-validator aggregate, continually incorporates every retained retest sample, then applies any awarded Bench v7+ relative token-efficiency bonus. The row shows both adjustments so the folded score is never silent.",
   },
   {
     key: "tool",
@@ -274,6 +275,7 @@ function CompositeCell(props: { entry: BoardEntry; store: LeaderboardStore }): J
             desiredVersion={props.store.bench().desired ?? props.store.bench().active}
           />
           <ContinualScoreChip entry={props.entry} />
+          <EfficiencyBonusChip entry={props.entry} />
           <QualityGateChip entry={props.entry} />
           <TokenPenaltyChip entry={props.entry} />
         </div>

@@ -9,6 +9,7 @@ import { Dynamic } from "solid-js/web";
 
 import { esc, fx } from "../../lib/format";
 import {
+  displayComposite,
   qualityGateChipLabel,
   scoreQuorum,
   continualWaves,
@@ -197,6 +198,28 @@ export function TokenPenaltyChip(props: { entry: BoardEntry }): JSX.Element {
           {s().label}
         </ChipTip>
       )}
+    </Show>
+  );
+}
+
+/** Bench v7+ frozen relative-efficiency award, applied after continual aggregation. */
+export function EfficiencyBonusChip(props: { entry: BoardEntry }): JSX.Element {
+  const active = (): boolean =>
+    props.entry.efficiency_bonus != null && props.entry.pre_efficiency_composite != null;
+  const bonus = (): number => Math.max(0, Number(props.entry.efficiency_bonus) || 0);
+  const tip = (): string =>
+    "Relative token efficiency adds " +
+    (bonus() * 100).toFixed(1) +
+    "% after continual retest aggregation: " +
+    fx(Number(props.entry.pre_efficiency_composite)) +
+    " becomes " +
+    fx(displayComposite(props.entry)) +
+    ". This is the score used for ranking and emissions.";
+  return (
+    <Show when={active()}>
+      <ChipTip class="rollout-chip settled efficiency-bonus-chip tip" tabindex={0} text={tip()}>
+        {"efficiency +" + (bonus() * 100).toFixed(1) + "%"}
+      </ChipTip>
     </Show>
   );
 }
