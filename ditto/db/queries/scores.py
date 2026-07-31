@@ -29,6 +29,7 @@ from ditto.db.models import (
     Agent,
     BenchmarkRolloutMember,
     EvaluationPayment,
+    OwnerAttestation,
     Score,
 )
 from ditto.db.queries.agents import get_agent_by_id
@@ -404,6 +405,59 @@ def emission_owner(*, miner_hotkey: str, miner_coldkey: str | None) -> str:
     if miner_coldkey is not None:
         return f"coldkey:{miner_coldkey}"
     return f"hotkey:{miner_hotkey}"
+
+
+async def attested_emission_owner_roots(
+    session: AsyncSession,
+    identities: Sequence[tuple[str, str]],
+) -> list[str]:
+    """Canonical owner roots for already-loaded ``(hotkey, raw owner)`` rows.
+
+    Payment-time coldkeys and active, mutually signed owner attestations are
+    both ownership edges.  Folding them together here preserves the existing
+    one-coldkey/one-slot rule while ensuring a miner cannot occupy another
+    emission slot merely by rotating both hotkey and coldkey after proving the
+    two hotkeys have the same operator.
+
+    The graph is intentionally evaluated at read time: revoking an attestation
+    stops affecting future leaderboard/weight reads without rewriting any
+    submission, score, payment, or historical audit row.
+    """
+    if not identities:
+        return []
+
+    from ditto.api_server.attestation import expected_netuid
+
+    parent: dict[str, str] = {}
+
+    def find(node: str) -> str:
+        parent.setdefault(node, node)
+        while parent[node] != node:
+            parent[node] = parent[parent[node]]
+            node = parent[node]
+        return node
+
+    def union(left: str, right: str) -> None:
+        left_root = find(left)
+        right_root = find(right)
+        if left_root == right_root:
+            return
+        lo, hi = sorted((left_root, right_root))
+        parent[hi] = lo
+
+    for hotkey, raw_owner in identities:
+        union(f"hotkey:{hotkey}", raw_owner)
+
+    links = await session.execute(
+        select(OwnerAttestation.hotkey_lo, OwnerAttestation.hotkey_hi).where(
+            OwnerAttestation.netuid == expected_netuid(),
+            OwnerAttestation.revoked_at.is_(None),
+        )
+    )
+    for hotkey_lo, hotkey_hi in links:
+        union(f"hotkey:{hotkey_lo}", f"hotkey:{hotkey_hi}")
+
+    return [find(f"hotkey:{hotkey}") for hotkey, _raw_owner in identities]
 
 
 @dataclass(frozen=True)
@@ -865,6 +919,7 @@ async def count_ranked_quorum_agents(
     qualifying = (
         select(
             per_version.c.agent_id,
+            Agent.miner_hotkey.label("miner_hotkey"),
             _emission_owner_key().label("emission_owner"),
         )
         .join(Agent, Agent.agent_id == per_version.c.agent_id)
@@ -881,14 +936,12 @@ async def count_ranked_quorum_agents(
                 per_version.c.srn * 2 == per_version.c.cnt + 1,
             ),
         )
-        .subquery()
     )
-    return int(
-        await session.scalar(
-            select(func.count(func.distinct(qualifying.c.emission_owner)))
-        )
-        or 0
-    )
+    identities = [
+        (row.miner_hotkey, row.emission_owner)
+        for row in (await session.execute(qualifying)).all()
+    ]
+    return len(set(await attested_emission_owner_roots(session, identities)))
 
 
 async def list_eligible_ledger(
@@ -1182,7 +1235,7 @@ async def list_eligible_ledger(
         )
     )
     result = await session.execute(stmt)
-    return [
+    ledger = [
         LedgerRow(
             miner_hotkey=row.miner_hotkey,
             agent_id=row.agent_id,
@@ -1212,6 +1265,25 @@ async def list_eligible_ledger(
         )
         for row in result
     ]
+    roots = await attested_emission_owner_roots(
+        session,
+        [
+            (
+                row.miner_hotkey,
+                emission_owner(
+                    miner_hotkey=row.miner_hotkey,
+                    miner_coldkey=row.miner_coldkey,
+                ),
+            )
+            for row in ledger
+        ],
+    )
+    # ``stmt`` is already in canonical score order. Keeping the first row per
+    # proven owner therefore selects that owner's best eligible submission.
+    best_by_owner: dict[str, LedgerRow] = {}
+    for root, row in zip(roots, ledger, strict=True):
+        best_by_owner.setdefault(root, row)
+    return list(best_by_owner.values())
 
 
 async def quorum_composites(
@@ -1363,15 +1435,22 @@ async def list_provisional_ledger(
     # A provisional row has no continual mean to rank on -- it has not reached
     # quorum -- so the canonical comparator reads its raw composite here.
     candidates.sort(key=lambda candidate: score_order_key(candidate[0]))
+    roots = await attested_emission_owner_roots(
+        session,
+        [
+            (
+                candidate[0].miner_hotkey,
+                emission_owner(
+                    miner_hotkey=candidate[0].miner_hotkey,
+                    miner_coldkey=candidate[0].miner_coldkey,
+                ),
+            )
+            for candidate in candidates
+        ],
+    )
     best_by_owner: dict[str, tuple[LedgerRow, int]] = {}
-    for candidate in candidates:
-        best_by_owner.setdefault(
-            emission_owner(
-                miner_hotkey=candidate[0].miner_hotkey,
-                miner_coldkey=candidate[0].miner_coldkey,
-            ),
-            candidate,
-        )
+    for root, candidate in zip(roots, candidates, strict=True):
+        best_by_owner.setdefault(root, candidate)
     return list(best_by_owner.values())
 
 

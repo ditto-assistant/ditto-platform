@@ -34,6 +34,7 @@ from ditto.db.models import (
     SubmissionRetirement,
     ValidatorTicket,
 )
+from ditto.db.queries.attestation import record_attestation
 from ditto.db.queries.benchmark_admission import activated_rollout_for_version
 from ditto.db.queries.queue_order import (
     OWNER_CONCURRENT_SUBMISSION_LIMIT_DEFAULT,
@@ -550,6 +551,55 @@ class TestOwnerLinkage:
             assert batch[agent_id] == await resolve_owner_linkage(
                 session, agent_id=agent_id
             )
+
+    @pytest.mark.integration
+    async def test_attested_hotkeys_share_one_capacity_owner(
+        self, session: AsyncSession
+    ) -> None:
+        """A proved cross-coldkey owner link also serializes queue capacity."""
+        hotkey_a = "5AttestedOwnerA"
+        hotkey_b = "5AttestedOwnerB"
+        agent_a = await _seed_agent(
+            session,
+            name="linked-a",
+            hotkey=hotkey_a,
+            coldkey="5LinkedColdA",
+            created_at=_NOW - timedelta(hours=1),
+        )
+        agent_b = await _seed_agent(
+            session,
+            name="linked-b",
+            hotkey=hotkey_b,
+            coldkey="5LinkedColdB",
+            created_at=_NOW,
+        )
+        async with session.begin():
+            await record_attestation(
+                session,
+                netuid=118,
+                hotkey_lo=min(hotkey_a, hotkey_b),
+                hotkey_hi=max(hotkey_a, hotkey_b),
+                nonce=uuid4(),
+                issued_at=_NOW,
+                lo_key_kind="hotkey",
+                lo_signer=min(hotkey_a, hotkey_b),
+                lo_signature="ab" * 64,
+                hi_key_kind="hotkey",
+                hi_signer=max(hotkey_a, hotkey_b),
+                hi_signature="cd" * 64,
+            )
+
+        linkage_a = await resolve_owner_linkage(session, agent_id=agent_a)
+        linkage_b = await resolve_owner_linkage(session, agent_id=agent_b)
+        assert linkage_a.hotkeys == linkage_b.hotkeys == frozenset({hotkey_a, hotkey_b})
+        assert (
+            linkage_a.coldkeys
+            == linkage_b.coldkeys
+            == frozenset({"5LinkedColdA", "5LinkedColdB"})
+        )
+        batch = await resolve_owner_linkage_batch(session, agent_ids=(agent_a, agent_b))
+        assert batch[agent_a] == linkage_a
+        assert batch[agent_b] == linkage_b
 
 
 class TestOwnerCapacityGate:

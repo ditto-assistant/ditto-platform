@@ -269,6 +269,7 @@ from ditto.db.queries.scores import (
     SCORING_QUORUM,
     LedgerRow,
     SubmissionRow,
+    attested_emission_owner_roots,
     emission_owner,
     get_public_health,
     get_score_counts,
@@ -2143,10 +2144,6 @@ async def leaderboard(
     # suppress and dedupe on that same owner. Keyed on the hotkey it showed an
     # owner's second hotkey as an extra provisional row beside the finalized one
     # it is not separately ranked against.
-    finalized_owners = {
-        emission_owner(miner_hotkey=row.miner_hotkey, miner_coldkey=row.miner_coldkey)
-        for row in finalized_rows
-    }
     provisional_candidates = [
         (row, score_counts.get(row.agent_id, 0))
         for row in ledger_rows
@@ -2155,12 +2152,25 @@ async def leaderboard(
     # Pre-quorum rows have no continual mean, so the canonical comparator reads
     # their raw composite -- the same call ``list_provisional_ledger`` makes.
     provisional_candidates.sort(key=lambda candidate: score_order_key(candidate[0]))
+    owner_rows = finalized_rows + [row for row, _count in provisional_candidates]
+    owner_roots = await attested_emission_owner_roots(
+        session,
+        [
+            (
+                row.miner_hotkey,
+                emission_owner(
+                    miner_hotkey=row.miner_hotkey,
+                    miner_coldkey=row.miner_coldkey,
+                ),
+            )
+            for row in owner_rows
+        ],
+    )
+    finalized_owners = set(owner_roots[: len(finalized_rows)])
     provisional_by_owner: dict[str, tuple[LedgerRow, int]] = {}
-    for candidate in provisional_candidates:
-        owner = emission_owner(
-            miner_hotkey=candidate[0].miner_hotkey,
-            miner_coldkey=candidate[0].miner_coldkey,
-        )
+    for owner, candidate in zip(
+        owner_roots[len(finalized_rows) :], provisional_candidates, strict=True
+    ):
         if owner not in finalized_owners:
             provisional_by_owner.setdefault(owner, candidate)
     provisional_rows = list(provisional_by_owner.values())

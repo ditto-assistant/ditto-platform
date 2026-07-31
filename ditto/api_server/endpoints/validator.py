@@ -117,7 +117,11 @@ from ditto.api_server.continual_retest_settings import (
     ContinualRetestSettingsResolver,
     rollout_standdown_reason,
 )
-from ditto.api_server.crn import champion_anchored_seeds, fold_seed_bound
+from ditto.api_server.crn import (
+    champion_anchored_seeds,
+    continual_anchor_horizon,
+    fold_seed_bound,
+)
 from ditto.api_server.datapipeline import DatasetGenerator
 from ditto.api_server.dependencies import (
     get_chain_client,
@@ -130,7 +134,6 @@ from ditto.api_server.fingerprint import reference_corpus_provenance
 from ditto.api_server.inference_concurrency_settings import resolved_proxy_config
 from ditto.api_server.inference_routing import record_ticket_route_quality
 from ditto.api_server.koth import (
-    TOP5_MAX_CONFIRMATION_SEEDS,
     KothEntry,
     emission_set,
     project_koth,
@@ -2943,11 +2946,16 @@ async def _champion_anchored_seed_set(
     )
     if not members:
         return frozenset()
+    history = await confirmation_composites_by_seed(
+        session,
+        agent_ids=tuple(member.agent_id for member in members),
+        bench_version=canonical_version,
+    )
     return frozenset(
         champion_anchored_seeds(
             members[0].agent_id,
             version=canonical_version,
-            max_seeds=TOP5_MAX_CONFIRMATION_SEEDS,
+            max_seeds=continual_anchor_horizon(history),
         )
     )
 
@@ -2989,16 +2997,16 @@ async def _top5_confirmation_seed_plan(
     a full backlog would multiply retest volume by the cohort size for no
     convergence benefit; it keeps the one-seed-per-round pacing it has today.
     """
-    anchor = champion_anchored_seeds(
-        champion_agent_id,
-        version=canonical_version,
-        max_seeds=TOP5_MAX_CONFIRMATION_SEEDS,
-    )
     cohort_ids = tuple(dict.fromkeys((*cohort_member_ids, *wave_member_ids)))
     history = await confirmation_composites_by_seed(
         session,
         agent_ids=tuple(dict.fromkeys((*cohort_ids, member_agent_id))),
         bench_version=canonical_version,
+    )
+    anchor = champion_anchored_seeds(
+        champion_agent_id,
+        version=canonical_version,
+        max_seeds=continual_anchor_horizon(history),
     )
     seeds_by_agent = {agent_id: values.keys() for agent_id, values in history.items()}
     # The live reign's seeds first, in issuing order, then everything the lane has
@@ -3132,13 +3140,13 @@ async def _unserved_catchup_members(
     members = tuple(dict.fromkeys(emission_member_ids))
     if len(members) < 2:
         return frozenset()
+    history = await confirmation_composites_by_seed(
+        session, agent_ids=members, bench_version=canonical_version
+    )
     full = champion_anchored_seeds(
         champion_agent_id,
         version=canonical_version,
-        max_seeds=TOP5_MAX_CONFIRMATION_SEEDS,
-    )
-    history = await confirmation_composites_by_seed(
-        session, agent_ids=members, bench_version=canonical_version
+        max_seeds=continual_anchor_horizon(history),
     )
     seeds_by_agent = {agent_id: values.keys() for agent_id, values in history.items()}
     leases = await _live_retest_leases(
