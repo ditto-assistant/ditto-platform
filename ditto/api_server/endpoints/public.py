@@ -69,6 +69,7 @@ from ditto.api_models import (
     PublicBenchGlossaryResponse,
     PublicBenchIntegrity,
     PublicBenchmarkProgress,
+    PublicBenchmarkQualityFactor,
     PublicBenchmarkRelease,
     PublicBenchmarkTimelinePoint,
     PublicBenchmarkTimelineResponse,
@@ -1533,6 +1534,104 @@ def _safe_raw_composite(details: dict) -> float | None:
     return value if math.isfinite(value) and 0.0 <= value <= 1.0 else None
 
 
+_QUALITY_FACTOR_SPECS = (
+    (
+        "tool_efficiency",
+        "Tool efficiency",
+        "Observed economy of tool use.",
+        "tool_efficiency",
+    ),
+    (
+        "metamorphic_consistency",
+        "Consistency",
+        "Share of equivalent prompts with consistent outcomes.",
+        "metamorphic_consistency_factor",
+    ),
+    (
+        "memory_over_call",
+        "Memory over-call",
+        "Avoidance of unnecessary memory-side actions.",
+        "memory_over_call_factor",
+    ),
+    (
+        "canary_integrity",
+        "Canary integrity",
+        "Whether the run avoided leaking the planted integrity canary.",
+        "canary_integrity_factor",
+    ),
+    (
+        "conversational_sanity",
+        "Conversational sanity",
+        "Aggregate performance across conversational behavior slices.",
+        "conversational_sanity_factor",
+    ),
+    (
+        "transform_robustness",
+        "Transform robustness",
+        "Consistency across reproducible transformed audit pairs.",
+        "transform_audit_factor",
+    ),
+)
+
+
+def _unit_float(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    result = float(value)
+    return result if math.isfinite(result) and 0.0 <= result <= 1.0 else None
+
+
+def _safe_quality_factors(
+    details: dict, aggregate_multiplier: float
+) -> list[PublicBenchmarkQualityFactor]:
+    """Allowlist scorer telemetry without deriving scorer policy curves."""
+    explicit = details.get("benchmark_quality_factors")
+    explicit = explicit if isinstance(explicit, dict) else {}
+    out: list[PublicBenchmarkQualityFactor] = []
+    known_product = 1.0
+    known_count = 0
+    _, audit_count = _safe_transform_robustness(details)
+    for key, label, explanation, multiplier_key in _QUALITY_FACTOR_SPECS:
+        metric = _unit_float(details.get(key))
+        multiplier = _unit_float(explicit.get(key))
+        if multiplier is None:
+            multiplier = _unit_float(details.get(multiplier_key))
+        # This field has always represented the exact applied factor; the other
+        # observed metrics are not assumed to equal their versioned curves.
+        if key == "tool_efficiency" and multiplier is None:
+            multiplier = metric
+        if metric is None and multiplier is None:
+            continue
+        if multiplier is not None:
+            known_product *= multiplier
+            known_count += 1
+        out.append(
+            PublicBenchmarkQualityFactor(
+                key=key,
+                label=label,
+                metric=metric,
+                multiplier=multiplier,
+                audit_count=audit_count if key == "transform_robustness" else None,
+                explanation=explanation,
+            )
+        )
+    if known_count and known_product > 0:
+        remainder = min(1.0, max(0.0, aggregate_multiplier / known_product))
+        if remainder < 1.0 - 1e-6:
+            out.append(
+                PublicBenchmarkQualityFactor(
+                    key="other_quality_effects",
+                    label="Other quality effects",
+                    multiplier=remainder,
+                    explanation=(
+                        "Combined effect not separable in this run's stored telemetry; "
+                        "it reconciles the visible factors to the signed aggregate."
+                    ),
+                )
+            )
+    return out
+
+
 def _composite_breakdown(
     *,
     tool_mean: float,
@@ -1577,6 +1676,7 @@ def _composite_breakdown(
         return PublicCompositeBreakdown(
             base_accuracy=base,
             benchmark_quality_multiplier=quality_multiplier,
+            quality_factors=_safe_quality_factors(details, quality_multiplier),
             pre_token_composite=pre_token,
             token_efficiency_multiplier=token_multiplier,
             token_penalty=token_penalty,

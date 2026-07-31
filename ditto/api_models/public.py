@@ -265,13 +265,23 @@ class PublicTokenEfficiency(BaseModel):
     decision_reason: str
 
 
+class PublicBenchmarkQualityFactor(BaseModel):
+    """One public-safe input to the scorer-owned benchmark quality multiplier."""
+
+    key: Annotated[str, Field(pattern=r"^[a-z0-9_]+$")]
+    label: str
+    metric: Annotated[float | None, Field(default=None, ge=0.0, le=1.0)] = None
+    multiplier: Annotated[float | None, Field(default=None, ge=0.0, le=1.0)] = None
+    audit_count: Annotated[int | None, Field(default=None, ge=0)] = None
+    explanation: str
+
+
 class PublicCompositeBreakdown(BaseModel):
     """Public arithmetic from capability means to the final composite.
 
-    ``benchmark_quality_multiplier`` is intentionally aggregate-only. The
-    scorer owns the individual integrity and behavioural gates; publishing one
-    combined multiplier explains the arithmetic without duplicating scorer
-    policy in the platform or leaking benchmark answer-key material.
+    The scorer remains authoritative for every multiplier. ``quality_factors``
+    is an allowlisted projection of stored aggregate telemetry; it never
+    reconstructs case content or reimplements benchmark policy.
     """
 
     formula: str = (
@@ -282,6 +292,7 @@ class PublicCompositeBreakdown(BaseModel):
     memory_weight: Annotated[float, Field(ge=0.0, le=1.0)] = 0.5
     base_accuracy: Annotated[float, Field(ge=0.0, le=1.0)]
     benchmark_quality_multiplier: Annotated[float, Field(ge=0.0, le=1.0)]
+    quality_factors: list[PublicBenchmarkQualityFactor] = Field(default_factory=list)
     pre_token_composite: Annotated[float, Field(ge=0.0, le=1.0)]
     token_efficiency_multiplier: Annotated[
         float | None,
