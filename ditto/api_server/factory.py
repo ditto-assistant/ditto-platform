@@ -182,7 +182,6 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             payment_verifier = create_payment_verifier(
                 chain=chain,
                 oracle=price_oracle,
-                pricing_config=config.pricing,
                 send_address=config.upload_payment_address,
             )
             app.state.payment_verifier = payment_verifier

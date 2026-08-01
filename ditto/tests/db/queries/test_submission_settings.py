@@ -15,7 +15,7 @@ from ditto.db.queries.submission_settings import (
 pytestmark = pytest.mark.asyncio
 
 
-async def test_admission_remains_valid_during_extended_paid_upload_recovery(
+async def test_payment_admission_remains_reusable_for_24_hours(
     session: AsyncSession,
 ) -> None:
     now = datetime(2026, 7, 24, 20, 0, tzinfo=UTC)
@@ -39,6 +39,33 @@ async def test_admission_remains_valid_during_extended_paid_upload_recovery(
             settings=settings,
             now=now + timedelta(hours=23, minutes=59),
         )
+
+
+async def test_unpaid_admission_stops_blocking_after_short_anti_race_window(
+    session: AsyncSession,
+) -> None:
+    now = datetime(2026, 7, 24, 20, 0, tzinfo=UTC)
+    settings = EffectiveSubmissionSettings(revision=1, cooldown_seconds=3600)
+    async with session.begin():
+        admission = await reserve_upload_admission(
+            session,
+            miner_coldkey="coldkey",
+            miner_hotkey="hotkey",
+            sha256="a" * 64,
+            settings=settings,
+            now=now,
+        )
+    async with session.begin():
+        replacement = await reserve_upload_admission(
+            session,
+            miner_coldkey="coldkey",
+            miner_hotkey="hotkey",
+            sha256="b" * 64,
+            settings=settings,
+            now=now + timedelta(minutes=16),
+        )
+
+    assert replacement.token != admission.token
 
 
 async def test_reservation_is_idempotent_and_blocks_competing_series(

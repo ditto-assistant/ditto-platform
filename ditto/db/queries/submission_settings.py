@@ -13,19 +13,21 @@ from ditto.db.models import SubmissionSettingsRevision, UploadAdmissionReservati
 from ditto.db.queries.agents import SubmissionCooldownError, get_submission_retry_at
 
 DEFAULT_SUBMISSION_COOLDOWN_SECONDS = 3600
+DEFAULT_SUBMISSION_FEE_RAO = 40_000_000
 MIN_SUBMISSION_COOLDOWN_SECONDS = 60
 MAX_SUBMISSION_COOLDOWN_SECONDS = 86400
-# A miner may need several long HTTP attempts after payment when the platform or
-# its chain/storage dependencies are degraded. Keep the pre-payment reservation
-# valid for a full-day recovery window so those attempts cannot lose the
-# slot to a competing submission from the same coldkey.
+# A finalized payment may recover its admission for 24 hours. An unpaid
+# reservation only excludes a competing archive for 15 minutes; these are
+# deliberately separate clocks so a crashed attempt cannot block a coldkey all day.
 UPLOAD_ADMISSION_TTL = timedelta(hours=24)
+UPLOAD_ADMISSION_BLOCK_TTL = timedelta(minutes=15)
 
 
 @dataclass(frozen=True)
 class EffectiveSubmissionSettings:
     revision: int
     cooldown_seconds: int
+    fee_amount_rao: int = DEFAULT_SUBMISSION_FEE_RAO
 
 
 @dataclass(frozen=True)
@@ -33,6 +35,7 @@ class UploadAdmission:
     token: uuid.UUID
     expires_at: datetime
     cooldown_seconds: int
+    fee_amount_rao: int
 
 
 async def latest_submission_settings(
@@ -51,10 +54,14 @@ async def effective_submission_settings(
     latest = await latest_submission_settings(session)
     if latest is None:
         return EffectiveSubmissionSettings(
-            revision=0, cooldown_seconds=DEFAULT_SUBMISSION_COOLDOWN_SECONDS
+            revision=0,
+            cooldown_seconds=DEFAULT_SUBMISSION_COOLDOWN_SECONDS,
+            fee_amount_rao=DEFAULT_SUBMISSION_FEE_RAO,
         )
     return EffectiveSubmissionSettings(
-        revision=latest.revision, cooldown_seconds=latest.cooldown_seconds
+        revision=latest.revision,
+        cooldown_seconds=latest.cooldown_seconds,
+        fee_amount_rao=latest.fee_amount_rao,
     )
 
 
@@ -68,6 +75,17 @@ async def _lock_coldkey(session: AsyncSession, miner_coldkey: str) -> None:
 
 def _utc(value: datetime) -> datetime:
     return value.replace(tzinfo=UTC) if value.tzinfo is None else value
+
+
+def _reservation_expiry(row: UploadAdmissionReservation) -> datetime:
+    return _utc(row.expires_at)
+
+
+def _reservation_block_until(row: UploadAdmissionReservation) -> datetime:
+    return min(
+        _reservation_expiry(row),
+        _utc(row.created_at) + UPLOAD_ADMISSION_BLOCK_TTL,
+    )
 
 
 async def reserve_upload_admission(
@@ -86,7 +104,7 @@ async def reserve_upload_admission(
     existing = await session.get(
         UploadAdmissionReservation, miner_coldkey, with_for_update=True
     )
-    if existing is not None and _utc(existing.expires_at) <= current:
+    if existing is not None and _reservation_expiry(existing) <= current:
         await session.delete(existing)
         await session.flush()
         existing = None
@@ -94,8 +112,9 @@ async def reserve_upload_admission(
         if existing.miner_hotkey == miner_hotkey and existing.sha256 == sha256:
             return UploadAdmission(
                 token=existing.token,
-                expires_at=_utc(existing.expires_at),
+                expires_at=_reservation_expiry(existing),
                 cooldown_seconds=existing.cooldown_seconds,
+                fee_amount_rao=existing.fee_amount_rao,
             )
         if replace_existing and existing.miner_hotkey == miner_hotkey:
             # A verified, still-unconsumed payment for this hotkey may fund a
@@ -109,10 +128,16 @@ async def reserve_upload_admission(
             await session.flush()
             return UploadAdmission(
                 token=existing.token,
-                expires_at=_utc(existing.expires_at),
+                expires_at=_reservation_expiry(existing),
                 cooldown_seconds=existing.cooldown_seconds,
+                fee_amount_rao=existing.fee_amount_rao,
             )
-        raise SubmissionCooldownError(_utc(existing.expires_at))
+        block_until = _reservation_block_until(existing)
+        if block_until > current:
+            raise SubmissionCooldownError(block_until)
+        await session.delete(existing)
+        await session.flush()
+        existing = None
 
     if not replace_existing:
         retry_at = await get_submission_retry_at(
@@ -131,6 +156,8 @@ async def reserve_upload_admission(
         sha256=sha256,
         settings_revision=settings.revision,
         cooldown_seconds=settings.cooldown_seconds,
+        fee_amount_rao=settings.fee_amount_rao,
+        created_at=current,
         expires_at=current + UPLOAD_ADMISSION_TTL,
     )
     session.add(row)
@@ -139,7 +166,24 @@ async def reserve_upload_admission(
         token=row.token,
         expires_at=row.expires_at,
         cooldown_seconds=row.cooldown_seconds,
+        fee_amount_rao=row.fee_amount_rao,
     )
+
+
+async def get_upload_admission(
+    session: AsyncSession, *, token: uuid.UUID
+) -> UploadAdmissionReservation | None:
+    return await session.scalar(
+        select(UploadAdmissionReservation).where(
+            UploadAdmissionReservation.token == token
+        )
+    )
+
+
+async def get_upload_admission_for_coldkey(
+    session: AsyncSession, *, miner_coldkey: str
+) -> UploadAdmissionReservation | None:
+    return await session.get(UploadAdmissionReservation, miner_coldkey)
 
 
 async def consume_or_enforce_upload_admission(
@@ -158,7 +202,7 @@ async def consume_or_enforce_upload_admission(
     existing = await session.get(
         UploadAdmissionReservation, miner_coldkey, with_for_update=True
     )
-    if existing is not None and _utc(existing.expires_at) <= current:
+    if existing is not None and _reservation_expiry(existing) <= current:
         await session.delete(existing)
         await session.flush()
         existing = None
@@ -170,23 +214,30 @@ async def consume_or_enforce_upload_admission(
             or existing.miner_hotkey != miner_hotkey
             or existing.sha256 != sha256
         ):
-            raise SubmissionCooldownError(
-                _utc(existing.expires_at)
+            retry_at = (
+                _reservation_block_until(existing)
                 if existing is not None
                 else current + timedelta(seconds=60)
+            )
+            raise SubmissionCooldownError(
+                retry_at if retry_at > current else current + timedelta(seconds=60)
             )
         await session.delete(existing)
         await session.flush()
         return
 
     if existing is not None:
-        raise SubmissionCooldownError(_utc(existing.expires_at))
+        block_until = _reservation_block_until(existing)
+        if block_until > current:
+            raise SubmissionCooldownError(block_until)
+        await session.delete(existing)
+        await session.flush()
 
-    retry_at = await get_submission_retry_at(
+    submission_retry_at = await get_submission_retry_at(
         session,
         miner_coldkey=miner_coldkey,
         cooldown=timedelta(seconds=settings.cooldown_seconds),
         now=current,
     )
-    if retry_at is not None:
-        raise SubmissionCooldownError(retry_at)
+    if submission_retry_at is not None:
+        raise SubmissionCooldownError(submission_retry_at)

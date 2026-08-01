@@ -15,7 +15,6 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from ditto.api_server.payment_verifier import (
-    PAYMENT_DRIFT_TOLERANCE,
     PaymentAmountMismatch,
     PaymentCallTypeMismatch,
     PaymentDestinationMismatch,
@@ -27,13 +26,9 @@ from ditto.api_server.payment_verifier import (
     VerifiedPayment,
 )
 from ditto.api_server.payment_verifier.verifier import _to_ss58
-from ditto.api_server.pricing import PricingConfig
 from ditto.chain.errors import ChainConnectionError, ExtrinsicNotFoundError
 
-# At fee_usd=5, fee_buffer=1.4, price=400 USD/TAO:
-#   fee_tao = 5 * 1.4 / 400 = 0.0175 TAO
-#   quote_rao = 17_500_000
-QUOTE_RAO = 17_500_000
+QUOTE_RAO = 40_000_000
 
 # Alice's well-known account: ss58 <-> 32-byte public key. Some chains' Pylon
 # decodes extrinsic addresses as hex pubkeys, so the verifier must normalize.
@@ -59,19 +54,6 @@ class TestToSs58:
     def test_unparseable_returns_empty(self):
         assert _to_ss58(None) == ""
         assert _to_ss58(12345) == ""
-
-
-def _make_pricing_config(**overrides: Any) -> PricingConfig:
-    defaults: dict[str, Any] = {
-        "fee_usd": Decimal("5"),
-        "fee_buffer": Decimal("1.4"),
-        "cache_ttl_seconds": 3600,
-        "max_stale_seconds": 86400,
-        "coingecko_timeout_seconds": 5.0,
-        "override_tao_usd": None,
-    }
-    defaults.update(overrides)
-    return PricingConfig(**defaults)
 
 
 def _make_proof(**overrides: Any) -> PaymentProof:
@@ -115,7 +97,6 @@ def _make_verifier(
     timestamp_side_effect: Exception | None = None,
     price_usd: Decimal = Decimal("400"),
     send_address: str = "5SendAddress",
-    pricing_config: PricingConfig | None = None,
 ) -> PaymentVerifier:
     chain = MagicMock()
     if extrinsic_side_effect is not None:
@@ -143,7 +124,6 @@ def _make_verifier(
     return PaymentVerifier(
         chain=chain,
         oracle=oracle,
-        pricing_config=pricing_config or _make_pricing_config(),
         send_address=send_address,
     )
 
@@ -151,7 +131,9 @@ def _make_verifier(
 class TestVerifyPaymentHappyPath:
     async def test_happy_path_returns_verified_payment(self):
         verifier = _make_verifier()
-        result = await verifier.verify_payment(_make_proof(), expected_hotkey="5Hotkey")
+        result = await verifier.verify_payment(
+            _make_proof(), expected_hotkey="5Hotkey", expected_amount_rao=QUOTE_RAO
+        )
         assert isinstance(result, VerifiedPayment)
         assert result.block_hash == "0xblock"
         assert result.extrinsic_index == 7
@@ -167,15 +149,32 @@ class TestVerifyPaymentHappyPath:
         on SDK decode. Verifier normalises both."""
         ext = _make_extrinsic_info(dest={"Id": "5SendAddress"})
         verifier = _make_verifier(extrinsic_info=ext)
-        result = await verifier.verify_payment(_make_proof(), expected_hotkey="5Hotkey")
+        result = await verifier.verify_payment(
+            _make_proof(), expected_hotkey="5Hotkey", expected_amount_rao=QUOTE_RAO
+        )
         assert result.dest_address == "5SendAddress"
+
+    async def test_usd_reporting_outage_does_not_reject_payment(self):
+        verifier = _make_verifier()
+        verifier._oracle.get_tao_usd = AsyncMock(side_effect=RuntimeError("down"))
+
+        result = await verifier.verify_payment(
+            _make_proof(),
+            expected_hotkey="5Hotkey",
+            expected_amount_rao=QUOTE_RAO,
+        )
+
+        assert result.amount_rao == QUOTE_RAO
+        assert result.tao_usd_rate is None
 
 
 class TestExtrinsicLookup:
     async def test_not_found_raises_typed(self):
         verifier = _make_verifier(extrinsic_side_effect=ExtrinsicNotFoundError("nope"))
         with pytest.raises(PaymentNotFoundOnChain):
-            await verifier.verify_payment(_make_proof(), expected_hotkey="5Hotkey")
+            await verifier.verify_payment(
+                _make_proof(), expected_hotkey="5Hotkey", expected_amount_rao=QUOTE_RAO
+            )
 
     async def test_chain_connection_error_propagates(self):
         """ChainConnectionError must NOT be swallowed; envelope handler
@@ -184,7 +183,9 @@ class TestExtrinsicLookup:
             extrinsic_side_effect=ChainConnectionError("pylon down")
         )
         with pytest.raises(ChainConnectionError):
-            await verifier.verify_payment(_make_proof(), expected_hotkey="5Hotkey")
+            await verifier.verify_payment(
+                _make_proof(), expected_hotkey="5Hotkey", expected_amount_rao=QUOTE_RAO
+            )
 
 
 class TestCallType:
@@ -192,27 +193,35 @@ class TestCallType:
         ext = _make_extrinsic_info(call_module="System")
         verifier = _make_verifier(extrinsic_info=ext)
         with pytest.raises(PaymentCallTypeMismatch):
-            await verifier.verify_payment(_make_proof(), expected_hotkey="5Hotkey")
+            await verifier.verify_payment(
+                _make_proof(), expected_hotkey="5Hotkey", expected_amount_rao=QUOTE_RAO
+            )
 
     async def test_wrong_function_rejected(self):
         ext = _make_extrinsic_info(call_function="transfer_allow_death")
         verifier = _make_verifier(extrinsic_info=ext)
         with pytest.raises(PaymentCallTypeMismatch):
-            await verifier.verify_payment(_make_proof(), expected_hotkey="5Hotkey")
+            await verifier.verify_payment(
+                _make_proof(), expected_hotkey="5Hotkey", expected_amount_rao=QUOTE_RAO
+            )
 
     async def test_missing_value_arg_rejected_as_call_type(self):
         ext = _make_extrinsic_info()
         ext.call_args = {"dest": "5SendAddress"}  # value key missing
         verifier = _make_verifier(extrinsic_info=ext)
         with pytest.raises(PaymentCallTypeMismatch):
-            await verifier.verify_payment(_make_proof(), expected_hotkey="5Hotkey")
+            await verifier.verify_payment(
+                _make_proof(), expected_hotkey="5Hotkey", expected_amount_rao=QUOTE_RAO
+            )
 
 
 class TestSuccessEvent:
     async def test_failed_extrinsic_rejected(self):
         verifier = _make_verifier(success=False)
         with pytest.raises(PaymentExtrinsicFailed):
-            await verifier.verify_payment(_make_proof(), expected_hotkey="5Hotkey")
+            await verifier.verify_payment(
+                _make_proof(), expected_hotkey="5Hotkey", expected_amount_rao=QUOTE_RAO
+            )
 
 
 class TestDestination:
@@ -220,51 +229,53 @@ class TestDestination:
         ext = _make_extrinsic_info(dest="5SomeoneElse")
         verifier = _make_verifier(extrinsic_info=ext)
         with pytest.raises(PaymentDestinationMismatch):
-            await verifier.verify_payment(_make_proof(), expected_hotkey="5Hotkey")
+            await verifier.verify_payment(
+                _make_proof(), expected_hotkey="5Hotkey", expected_amount_rao=QUOTE_RAO
+            )
 
     async def test_unparseable_dest_rejected_as_mismatch(self):
         ext = _make_extrinsic_info(dest=12345)  # int, not str/dict
         verifier = _make_verifier(extrinsic_info=ext)
         with pytest.raises(PaymentDestinationMismatch):
-            await verifier.verify_payment(_make_proof(), expected_hotkey="5Hotkey")
+            await verifier.verify_payment(
+                _make_proof(), expected_hotkey="5Hotkey", expected_amount_rao=QUOTE_RAO
+            )
 
 
-class TestAmountBand:
+class TestAmount:
     @pytest.mark.parametrize(
         "delta_pct",
         [Decimal("-0.5"), Decimal("-0.05"), Decimal("-0.021")],
     )
-    async def test_below_lower_band_rejected(self, delta_pct: Decimal):
+    async def test_underpayment_rejected(self, delta_pct: Decimal):
         value = int(QUOTE_RAO * (Decimal(1) + delta_pct))
         ext = _make_extrinsic_info(value=value)
         verifier = _make_verifier(extrinsic_info=ext)
         with pytest.raises(PaymentAmountMismatch):
-            await verifier.verify_payment(_make_proof(), expected_hotkey="5Hotkey")
+            await verifier.verify_payment(
+                _make_proof(), expected_hotkey="5Hotkey", expected_amount_rao=QUOTE_RAO
+            )
 
     @pytest.mark.parametrize(
         "delta_pct",
         [Decimal("0.021"), Decimal("0.05"), Decimal("0.5")],
     )
-    async def test_above_upper_band_rejected(self, delta_pct: Decimal):
+    async def test_overpayment_rejected(self, delta_pct: Decimal):
         value = int(QUOTE_RAO * (Decimal(1) + delta_pct))
         ext = _make_extrinsic_info(value=value)
         verifier = _make_verifier(extrinsic_info=ext)
         with pytest.raises(PaymentAmountMismatch):
-            await verifier.verify_payment(_make_proof(), expected_hotkey="5Hotkey")
+            await verifier.verify_payment(
+                _make_proof(), expected_hotkey="5Hotkey", expected_amount_rao=QUOTE_RAO
+            )
 
-    async def test_exact_lower_band_edge_accepts(self):
-        lower = int(QUOTE_RAO * (Decimal(1) - PAYMENT_DRIFT_TOLERANCE))
-        ext = _make_extrinsic_info(value=lower)
+    async def test_exact_operator_fee_accepts(self):
+        ext = _make_extrinsic_info(value=QUOTE_RAO)
         verifier = _make_verifier(extrinsic_info=ext)
-        result = await verifier.verify_payment(_make_proof(), expected_hotkey="5Hotkey")
-        assert result.amount_rao == lower
-
-    async def test_exact_upper_band_edge_accepts(self):
-        upper = int(QUOTE_RAO * (Decimal(1) + PAYMENT_DRIFT_TOLERANCE))
-        ext = _make_extrinsic_info(value=upper)
-        verifier = _make_verifier(extrinsic_info=ext)
-        result = await verifier.verify_payment(_make_proof(), expected_hotkey="5Hotkey")
-        assert result.amount_rao == upper
+        result = await verifier.verify_payment(
+            _make_proof(), expected_hotkey="5Hotkey", expected_amount_rao=QUOTE_RAO
+        )
+        assert result.amount_rao == QUOTE_RAO
 
 
 class TestSignerOwnership:
@@ -272,7 +283,9 @@ class TestSignerOwnership:
         ext = _make_extrinsic_info(signer="5Different")
         verifier = _make_verifier(extrinsic_info=ext, coldkey="5Coldkey")
         with pytest.raises(PaymentSignerMismatch):
-            await verifier.verify_payment(_make_proof(), expected_hotkey="5Hotkey")
+            await verifier.verify_payment(
+                _make_proof(), expected_hotkey="5Hotkey", expected_amount_rao=QUOTE_RAO
+            )
 
     async def test_owner_lookup_not_found_propagates(self):
         """If the hotkey was not registered at the payment block, the
@@ -285,4 +298,6 @@ class TestSignerOwnership:
             coldkey_side_effect=ExtrinsicNotFoundError("no owner")
         )
         with pytest.raises(ExtrinsicNotFoundError):
-            await verifier.verify_payment(_make_proof(), expected_hotkey="5Hotkey")
+            await verifier.verify_payment(
+                _make_proof(), expected_hotkey="5Hotkey", expected_amount_rao=QUOTE_RAO
+            )

@@ -28,8 +28,6 @@ from ditto.api_server.endpoints.upload import (
     MAX_TARBALL_SIZE_BYTES,
 )
 from ditto.api_server.middleware.error_envelope import (
-    ERROR_CODE_MALFORMED_PRICE,
-    ERROR_CODE_ORACLE_UNREACHABLE,
     ERROR_CODE_PAYMENT_AMOUNT_MISMATCH,
     ERROR_CODE_PAYMENT_CALL_TYPE_MISMATCH,
     ERROR_CODE_PAYMENT_DESTINATION_MISMATCH,
@@ -37,7 +35,6 @@ from ditto.api_server.middleware.error_envelope import (
     ERROR_CODE_PAYMENT_NOT_FOUND,
     ERROR_CODE_PAYMENT_REPLAYED,
     ERROR_CODE_PAYMENT_SIGNER_MISMATCH,
-    ERROR_CODE_PRICE_TOO_STALE,
 )
 from ditto.api_server.payment_verifier import (
     PaymentAmountMismatch,
@@ -82,8 +79,18 @@ def _stub_ban_check(monkeypatch: pytest.MonkeyPatch) -> None:
         AsyncMock(return_value=None),
     )
     monkeypatch.setattr(
+        "ditto.api_server.endpoints.upload.get_upload_admission_for_coldkey",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
         "ditto.api_server.endpoints.upload.effective_submission_settings",
-        AsyncMock(return_value=SimpleNamespace(revision=0, cooldown_seconds=3600)),
+        AsyncMock(
+            return_value=SimpleNamespace(
+                revision=0,
+                cooldown_seconds=3600,
+                fee_amount_rao=40_000_000,
+            )
+        ),
     )
     monkeypatch.setattr(
         "ditto.api_server.endpoints.upload.consume_or_enforce_upload_admission",
@@ -119,32 +126,35 @@ def _signed_request_body(
 
 
 class TestEvalPricing:
+    @pytest.fixture(autouse=True)
+    def _session(self, app: FastAPI) -> None:
+        override_get_session(app)
+
     async def test_happy_path(self, app: FastAPI, client: httpx.AsyncClient):
         override_get_price_oracle(app, price_usd=Decimal("400"))
         response = await client.get("/api/v1/upload/eval-pricing")
         assert response.status_code == 200
         body = response.json()
-        # $5 fee × 1.4 buffer / $400 price = 0.0175 TAO = 17_500_000 rao
-        assert body["amount_rao"] == 17_500_000
+        assert body["amount_rao"] == 40_000_000
         assert body["send_address"].startswith("5")
 
-    async def test_oracle_down_returns_503_with_specific_error_code(
+    async def test_oracle_down_does_not_block_tao_quote(
         self, app: FastAPI, client: httpx.AsyncClient
     ):
         override_get_price_oracle(app, raises=OracleUnreachableError("down"))
         response = await client.get("/api/v1/upload/eval-pricing")
-        assert response.status_code == 503
-        assert response.json()["error_code"] == ERROR_CODE_ORACLE_UNREACHABLE
+        assert response.status_code == 200
+        assert response.json()["amount_rao"] == 40_000_000
 
-    async def test_oracle_stale_returns_503_with_specific_error_code(
+    async def test_oracle_stale_does_not_block_tao_quote(
         self, app: FastAPI, client: httpx.AsyncClient
     ):
         override_get_price_oracle(app, raises=PriceTooStaleError("stale"))
         response = await client.get("/api/v1/upload/eval-pricing")
-        assert response.status_code == 503
-        assert response.json()["error_code"] == ERROR_CODE_PRICE_TOO_STALE
+        assert response.status_code == 200
+        assert response.json()["amount_rao"] == 40_000_000
 
-    async def test_zero_amount_rao_returns_malformed_price_envelope(
+    async def test_extreme_usd_price_does_not_change_tao_quote(
         self, app: FastAPI, client: httpx.AsyncClient
     ):
         # An absurdly high TAO/USD price would make the rao math truncate to 0.
@@ -152,8 +162,8 @@ class TestEvalPricing:
 
         override_get_price_oracle(app, price_usd=Decimal("1e30"))
         response = await client.get("/api/v1/upload/eval-pricing")
-        assert response.status_code == 503
-        assert response.json()["error_code"] == ERROR_CODE_MALFORMED_PRICE
+        assert response.status_code == 200
+        assert response.json()["amount_rao"] == 40_000_000
 
     async def test_response_uses_configured_payment_address(
         self, app: FastAPI, client: httpx.AsyncClient

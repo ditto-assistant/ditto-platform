@@ -21,7 +21,6 @@ import logging
 import os
 import uuid
 from datetime import timedelta
-from decimal import Decimal
 from typing import TYPE_CHECKING, Annotated
 
 import bittensor
@@ -44,7 +43,6 @@ from ditto.api_server.dependencies import (
     get_chain_client,
     get_embedder,
     get_payment_verifier,
-    get_price_oracle,
     get_session,
     get_storage_client,
 )
@@ -59,10 +57,6 @@ from ditto.api_server.payment_verifier import (
     PaymentProof,
     PaymentReplayedError,
     PaymentVerifier,
-)
-from ditto.api_server.pricing import (
-    MalformedPriceError,
-    PriceOracle,
 )
 from ditto.api_server.storage import S3StorageClient
 from ditto.chain import ChainError
@@ -84,6 +78,8 @@ from ditto.db.queries.payments import (
 from ditto.db.queries.submission_settings import (
     consume_or_enforce_upload_admission,
     effective_submission_settings,
+    get_upload_admission,
+    get_upload_admission_for_coldkey,
     reserve_upload_admission,
 )
 
@@ -144,7 +140,6 @@ MAX_TARBALL_SIZE_BYTES = _tarball_size_cap_from_env()
 _CHUNK_SIZE_BYTES = 256 * 1024
 
 ChainDep = Annotated["ChainClient", Depends(get_chain_client)]
-OracleDep = Annotated[PriceOracle, Depends(get_price_oracle)]
 PaymentVerifierDep = Annotated[PaymentVerifier, Depends(get_payment_verifier)]
 StorageDep = Annotated[S3StorageClient, Depends(get_storage_client)]
 EmbedderDep = Annotated[Embedder, Depends(get_embedder)]
@@ -152,23 +147,13 @@ SessionDep = Annotated[AsyncSession, Depends(get_session)]
 
 
 @router.get("/eval-pricing", response_model=EvalPricingResponse)
-async def eval_pricing(request: Request, oracle: OracleDep) -> EvalPricingResponse:
-    """Quote the current upload fee in rao.
-
-    ``PricingError`` subclasses propagate so the envelope handler in
-    :mod:`ditto.api_server.middleware.error_envelope` can attach the
-    specific 31xx error code instead of the generic 3002 catch-all.
-    """
+async def eval_pricing(request: Request, session: SessionDep) -> EvalPricingResponse:
+    """Quote the operator-controlled, TAO-denominated upload fee."""
     config = request.app.state.config
-    price_usd = await oracle.get_tao_usd()
-
-    fee_tao = (config.pricing.fee_usd * config.pricing.fee_buffer) / price_usd
-    amount_rao = int(fee_tao * Decimal("1e9"))
-    if amount_rao <= 0:
-        raise MalformedPriceError(f"computed amount_rao is non-positive: {amount_rao}")
+    settings = await effective_submission_settings(session)
 
     return EvalPricingResponse(
-        amount_rao=amount_rao,
+        amount_rao=settings.fee_amount_rao,
         send_address=config.upload_payment_address,
     )
 
@@ -244,6 +229,17 @@ async def check(
                 "Set allow_identical_rescore=true only to purchase another seed."
             )
 
+    settings = await effective_submission_settings(session)
+    reserved_admission = (
+        await get_upload_admission_for_coldkey(session, miner_coldkey=owner_coldkey)
+        if owner_coldkey is not None
+        else None
+    )
+    expected_recovery_amount_rao = (
+        reserved_admission.fee_amount_rao
+        if reserved_admission is not None
+        else settings.fee_amount_rao
+    )
     recovery_payment_verified = False
     if (
         not codes
@@ -279,6 +275,7 @@ async def check(
                         extrinsic_index=body.payment_extrinsic_index,
                     ),
                     expected_hotkey=body.hotkey,
+                    expected_amount_rao=expected_recovery_amount_rao,
                 )
             except ChainError as e:
                 logger.warning(f"chain unreachable during /upload/check recovery: {e}")
@@ -292,7 +289,6 @@ async def check(
                 )
 
     retry_at = None
-    settings = await effective_submission_settings(session)
     if (
         duplicate is None
         and owner_coldkey is not None
@@ -490,6 +486,20 @@ async def upload_agent(
         raise PaymentReplayedError("payment credit belongs to a different hotkey")
     using_credit = bool(payment_record)
     credit_owner_coldkey = payment_record.miner_coldkey if payment_record else None
+    admission = (
+        await get_upload_admission(session, token=admission_token)
+        if admission_token is not None
+        else None
+    )
+    if admission is not None and (
+        admission.miner_hotkey != hotkey or admission.sha256 != sha256
+    ):
+        admission = None
+    if admission is not None:
+        expected_amount_rao = admission.fee_amount_rao
+    else:
+        settings = await effective_submission_settings(session)
+        expected_amount_rao = settings.fee_amount_rao
 
     # The replay lookup autobegan a read transaction. Release that pooled
     # connection before the slow chain/storage/fingerprint work below.
@@ -516,6 +526,7 @@ async def upload_agent(
                     extrinsic_index=payment_extrinsic_index,
                 ),
                 expected_hotkey=hotkey,
+                expected_amount_rao=expected_amount_rao,
             )
         except ChainError as e:
             logger.warning(f"chain unreachable during /upload/agent verify: {e}")
