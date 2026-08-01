@@ -19,6 +19,20 @@ protected operational data, and it does not grant access to admin endpoints.
 
 ---
 
+## Ditto SN118 repositories
+
+| Repository | Purpose |
+| --- | --- |
+| [`ditto-subnet`](https://github.com/ditto-assistant/ditto-subnet) | Miner CLI, validator worker, and on-chain integration |
+| [`ditto-platform`](https://github.com/ditto-assistant/ditto-platform) | Public API, dashboard, submission coordination, and score ledger |
+| [`ditto-screener`](https://github.com/ditto-assistant/ditto-screener) | Platform-operated submission build and health gate |
+| [`ditto-harness`](https://github.com/ditto-assistant/ditto-harness) | Reference memory and agent harness library |
+| [`dittobench-starter-kit`](https://github.com/ditto-assistant/dittobench-starter-kit) | Miner starter project and local practice loop |
+| [`dittobench-api`](https://github.com/ditto-assistant/dittobench-api) | Validator scoring engine and hosted practice API |
+| [`dittobench-datagen`](https://github.com/ditto-assistant/dittobench-datagen) | Deterministic dataset generator and judge-free grader |
+
+---
+
 ## Where this fits
 
 ```
