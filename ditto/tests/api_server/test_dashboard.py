@@ -278,6 +278,9 @@ class TestDashboard:
         assert "Number(activeBench) || Number(currentBench)" in body
         assert "version >= activeVersion" in body
         assert "function pipelineBoardStage(entry)" in body
+        assert "function operationsPipelineActivity(data)" in body
+        assert "data.rollout_queue" in body
+        assert "Cohort #" in body
         assert "(entry.active_benchmarks || []).some(queueRelevantBenchmark)" in body
         assert ".filter(queueRelevantBenchmark)" in body
         assert 'column.status === "evaluating"' in body

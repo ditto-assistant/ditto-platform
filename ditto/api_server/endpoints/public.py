@@ -97,6 +97,7 @@ from ditto.api_models import (
     PublicOperationsResponse,
     PublicOrphanedSlot,
     PublicProvisionalScore,
+    PublicRolloutQueueEntry,
     PublicRunModels,
     PublicScreenerHeartbeat,
     PublicScreenerHeartbeatsResponse,
@@ -3862,6 +3863,9 @@ async def operations(
     active_work = await list_active_validator_work(
         session, now=now, cutoff=now - _VALIDATOR_ONLINE_WINDOW
     )
+    retry_states = await classify_agent_retry_states(
+        session, agents=[row.agent for row in activity_rows], now=now
+    )
     (
         score_continuation_floor,
         provisional_contender_floor,
@@ -3913,9 +3917,7 @@ async def operations(
         ),
         active_bench_version=active_version,
         benchmark_admitted_agent_ids=admitted,
-        retry_states=await classify_agent_retry_states(
-            session, agents=[row.agent for row in activity_rows], now=now
-        ),
+        retry_states=retry_states,
         duplicate_metadata=await _duplicate_submission_metadata(session, activity_rows),
         retired_agent_ids=retired,
         terminal_history_limit=50,
@@ -3931,6 +3933,52 @@ async def operations(
         active_bench_version=active_version,
         slot_settings=await resolve_slot_settings(request.app.state),
     )
+    rows_by_agent = {row.agent.agent_id: row for row in activity_rows}
+    desired_version = cast(int, benchmark_rollout["desired_version"])
+    desired_work: dict[UUID, list[PublicBenchmarkProgress]] = {}
+    for work in active_work:
+        if work.ticket.bench_version != desired_version:
+            continue
+        desired_work.setdefault(work.agent.agent_id, []).append(
+            _public_benchmark_progress(work, now)
+        )
+    rollout_queue: list[PublicRolloutQueueEntry] = []
+    if desired_version > active_version and benchmark_rollout["status"] in {
+        "collecting",
+        "blocked_ineligible",
+    }:
+        for member in benchmark_rollout["members"]:
+            agent_id = UUID(member["agent_id"])
+            row = rows_by_agent.get(agent_id)
+            if row is None:
+                continue
+            progress = sorted(
+                desired_work.get(agent_id, []), key=lambda item: item.slot_id
+            )
+            retry = retry_states.get(agent_id)
+            rollout_queue.append(
+                PublicRolloutQueueEntry(
+                    agent_id=agent_id,
+                    miner_hotkey=row.agent.miner_hotkey,
+                    name=row.agent.name,
+                    version=row.agent.version,
+                    submitted_at=row.agent.created_at,
+                    bench_version=desired_version,
+                    position=int(member["position"]),
+                    status="evaluating" if progress else "waiting_validator",
+                    score_count=int(member["score_count"]),
+                    quorum=SCORING_QUORUM,
+                    # Cohort membership plus its transaction-bound desired-era
+                    # dataset is itself queue admission. Before the first ticket
+                    # there is no retry row to classify, but the truthful state
+                    # is queued rather than unknown.
+                    retry_state=retry.state if retry is not None else "queued",
+                    retry_after=(
+                        retry.earliest_retry_after if retry is not None else None
+                    ),
+                    active_benchmarks=progress,
+                )
+            )
     return PublicOperationsResponse(
         generated_at=now,
         active_bench_version=cast(int, benchmark_rollout["active_version"]),
@@ -3946,6 +3994,7 @@ async def operations(
             benchmark_rollout["status"],
         ),
         activity=activity_snapshot,
+        rollout_queue=rollout_queue,
         validators=validator_snapshot,
     )
 
