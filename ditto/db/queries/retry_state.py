@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ditto.api_models.agent_status import AgentStatus
@@ -26,7 +26,6 @@ from ditto.db.models import (
     SubmissionRetirement,
     ValidatorHeartbeat,
     ValidatorQueueWithdrawal,
-    ValidatorRetryRecovery,
     ValidatorTicket,
 )
 from ditto.db.queries.benchmark_rollout import active_bench_version, open_rollout
@@ -34,9 +33,6 @@ from ditto.db.queries.queue_removal import is_in_force, removal_in_force
 from ditto.db.queries.scores import SCORING_QUORUM
 from ditto.db.queries.tickets import ticket_attempt_cap
 
-# Operators may hand-grant at most this many recoveries to one agent before the
-# stuck submission needs a harder look than another retry.
-MAX_OPERATOR_RECOVERIES_PER_AGENT = 4
 VALIDATOR_RETRY_ONLINE_WINDOW = timedelta(minutes=5)
 
 
@@ -110,7 +106,6 @@ def recovery_gate(
     agent: Agent,
     scores: list[Score],
     tickets: list[ValidatorTicket],
-    recovery_count: int,
     now: datetime,
     bench_version: int,
     rollout_qualification: bool = False,
@@ -163,14 +158,6 @@ def recovery_gate(
             else "automatic validator retry is still cooling down"
         )
         return available, False, reason, []
-
-    # The cap limits minting another operator grant; it must not invalidate
-    # retry budget a previous grant already restored. In particular, the final
-    # allowed recovery can revive the one ticket needed to finish quorum while
-    # an exhausted sibling remains in the ledger. Check that live budget first
-    # so the revived ticket stays visible and dispatchable.
-    if recovery_count >= MAX_OPERATOR_RECOVERIES_PER_AGENT:
-        return False, False, "operator retry limit reached", []
 
     needed = SCORING_QUORUM - score_count
     exhausted = sorted(
@@ -299,10 +286,11 @@ def reinstatement_gate(
     to compensate (``compensate=False``), so if reinstatement handed back
     headroom the pair would become an attempt printer — evict, reinstate, collect
     — which is precisely the amplifier ``MAX_AGENT_INFRA_RETRY_GRANTS`` (12, per
-    agent per era, ditto-platform#522) and ``MAX_OPERATOR_RECOVERIES_PER_AGENT``
-    (3) were introduced to bound. Both counters are keyed on (agent, benchmark
-    version) and this route writes neither, so an evict/reinstate cycle is
-    budget-neutral by construction and no number of cycles changes that.
+    agent per era, ditto-platform#522) was introduced to bound. Operator
+    recoveries remain explicit, snapshot-guarded actions that grant exactly one
+    future lease per selected validator ticket; this route writes none, so an
+    evict/reinstate cycle is budget-neutral by construction and no number of
+    cycles changes that.
 
     The refusals:
 
@@ -445,23 +433,6 @@ async def classify_agent_retry_states(
         await session.scalars(select(Score).where(Score.agent_id.in_(id_subq)))
     ).all():
         scores_by_agent.setdefault(score.agent_id, []).append(score)
-    recovery_counts: dict[tuple[UUID, int], int] = {
-        (agent_id, version): count
-        for agent_id, version, count in (
-            await session.execute(
-                select(
-                    ValidatorRetryRecovery.agent_id,
-                    ValidatorRetryRecovery.bench_version,
-                    func.count(),
-                )
-                .where(ValidatorRetryRecovery.agent_id.in_(id_subq))
-                .group_by(
-                    ValidatorRetryRecovery.agent_id,
-                    ValidatorRetryRecovery.bench_version,
-                )
-            )
-        ).all()
-    }
     withdrawals = set(
         (
             await session.execute(
@@ -521,7 +492,6 @@ async def classify_agent_retry_states(
             agent=agent,
             scores=v_scores,
             tickets=v_tickets,
-            recovery_count=recovery_counts.get((agent_id, bench_version), 0),
             now=now,
             bench_version=bench_version,
             rollout_qualification=(

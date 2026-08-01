@@ -2914,9 +2914,8 @@ class ValidatorQueueReinstatement(Base):
     no attempt and lifts no cap, so a submission returns with exactly the budget
     it was evicted with; the pair of numbers here (the agent's fleet-wide
     ``infra_retry_grants`` at this era, bounded by ``MAX_AGENT_INFRA_RETRY_GRANTS``,
-    and its operator-recovery count, bounded by
-    ``MAX_OPERATOR_RECOVERIES_PER_AGENT``) is what lets a reviewer confirm that
-    an evict/reinstate cycle laundered neither bound.
+    and its append-only operator-recovery count) is what lets a reviewer confirm
+    that an evict/reinstate cycle laundered no attempt budget.
     """
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, server_default=func.now()

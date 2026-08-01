@@ -105,8 +105,8 @@ class AdminReinstatementRetryBudget(BaseModel):
     """Operator-granted attempts already spent on the era's tickets."""
     operator_recoveries: int
     """Recovery grants already issued for this agent and era."""
-    max_operator_recoveries: int
-    """The bound those recoveries are counted against."""
+    max_operator_recoveries: int | None
+    """Always null: recovery actions are audited and snapshot-guarded, not capped."""
 
 
 class AdminValidationQueueReinstatement(BaseModel):

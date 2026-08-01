@@ -99,7 +99,6 @@ from ditto.db.queries.retry_budget import (
     agent_infra_retry_grants,
 )
 from ditto.db.queries.retry_state import (
-    MAX_OPERATOR_RECOVERIES_PER_AGENT,
     classify_agent_retry_states,
     eviction_gate,
     is_exhausted,
@@ -556,7 +555,6 @@ async def get_validation_retry(
         agent=agent,
         scores=scores,
         tickets=tickets,
-        recovery_count=len(recoveries),
         now=now,
         bench_version=bench_version,
         rollout_qualification=await is_open_rollout_qualification(
@@ -707,7 +705,6 @@ async def _apply_recovery(
         agent=agent,
         scores=scores,
         tickets=tickets,
-        recovery_count=len(recoveries),
         now=now,
         bench_version=bench_version,
         rollout_qualification=rollout_qualification,
@@ -1012,7 +1009,7 @@ async def _retry_budget_snapshot(
         max_agent_infra_retry_grants=MAX_AGENT_INFRA_RETRY_GRANTS,
         manual_retry_grants=sum(ticket.manual_retry_grants for ticket in tickets),
         operator_recoveries=recovery_count,
-        max_operator_recoveries=MAX_OPERATOR_RECOVERIES_PER_AGENT,
+        max_operator_recoveries=None,
     )
 
 
@@ -1052,7 +1049,7 @@ async def reinstate_removed_submission_to_validator_queue(
       submissions on the validators' next poll and are not the platform's to
       take back;
     * touch ``attempt_count``, ``manual_retry_grants`` or ``infra_retry_grants``;
-    * reset the operator-recovery count for the era.
+    * delete or rewrite the operator-recovery audit history for the era.
 
     That inertness is the security property, not an omission. Eviction refuses to
     compensate the miner (``compensate=False``) precisely so it cannot raise the
@@ -1065,8 +1062,9 @@ async def reinstate_removed_submission_to_validator_queue(
     keyed on (agent, benchmark version) and this route writes neither, so the
     cycle is budget-neutral however many times it runs. An operator who *does*
     want to hand back attempts still has one route for it, ``/retry``, which is
-    separately bounded at :data:`MAX_OPERATOR_RECOVERIES_PER_AGENT` and audited
-    per grant. The counts as they stood are recorded on the reinstatement row.
+    snapshot-guarded, grants only the minimum budget for one future lease per
+    selected validator ticket, and is audited per action. The counts as they
+    stood are recorded on the reinstatement row.
 
     The eviction record is preserved, never deleted: the leases it revoked each
     carry a ``validator_lease_audit`` row that
