@@ -2565,7 +2565,7 @@ class TestHeartbeat:
 
         response = await client.get("/api/v1/public/operations")
         assert response.status_code == 200
-        assert response.headers["Cache-Control"] == "public, max-age=8"
+        assert response.headers["Cache-Control"] == "public, max-age=5"
         snapshot = response.json()
         # No rollout row at all, so this is the floor: with nothing durable on
         # record ``persisted_active_bench_version`` answers

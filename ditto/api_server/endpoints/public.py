@@ -307,6 +307,7 @@ router = APIRouter(prefix="/public", tags=["public"])
 # instead of showing empty panels for a round trip. The window is deliberately
 # short here, so a stale board is never more than a couple of minutes old.
 _CACHE_CONTROL = "public, max-age=30, stale-while-revalidate=120"
+_OPERATIONS_CACHE_CONTROL = "public, max-age=5"
 _TIMELINE_CACHE_CONTROL = "public, max-age=300, stale-while-revalidate=3600"
 # v1 predates the memory subscore, so it has nothing to plot on this axis.
 _TIMELINE_MIN_BENCH_VERSION = 2
@@ -3843,9 +3844,10 @@ async def operations(
     session: SessionDep,
 ) -> PublicOperationsResponse:
     """Atomic dashboard snapshot for submission pipeline and validator fleet health."""
-    # Short cache so the fleet page can poll on an ~8s cadence and still see fresh
-    # stage transitions now that benchmarks run quickly.
-    response.headers["Cache-Control"] = "public, max-age=8"
+    # Match the validator's five-second progress cadence. Holding this atomic
+    # snapshot longer made a perfectly normal first-report hand-off look frozen
+    # after the signed progress heartbeat had already landed.
+    response.headers["Cache-Control"] = _OPERATIONS_CACHE_CONTROL
     now = datetime.now(UTC)
     benchmark_rollout = await rollout_state(session, now=now)
     active_version = cast(int, benchmark_rollout["active_version"])

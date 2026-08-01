@@ -1224,6 +1224,9 @@ class TestDashboard:
         assert '<progress max="100" value="' in body
         assert "aria-label" in body
         assert "Benchmark progress not reported" in body
+        assert "Starting benchmark · awaiting first progress" in body
+        assert "Date.now() - started < 60000" in body
+        assert "var OPS_REFRESH_MS = 5000" in body
         assert "failed_retrying" in body
         assert "Scoring and finalizing" in body
         assert "Signing and submitting result" in body
