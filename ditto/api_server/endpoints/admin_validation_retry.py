@@ -479,9 +479,7 @@ async def list_validation_retries(
             )
         )
         known = {agent.agent_id for agent in agents}
-        agents.extend(
-            agent for agent in rollout_agents if agent.agent_id not in known
-        )
+        agents.extend(agent for agent in rollout_agents if agent.agent_id not in known)
     classified = await classify_agent_retry_states(
         session,
         agents=agents,

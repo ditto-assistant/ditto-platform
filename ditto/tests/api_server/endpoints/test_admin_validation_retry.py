@@ -2499,9 +2499,7 @@ async def test_rollout_cohort_recovery_keeps_settled_status_and_history(
     listing = await client.get("/api/v1/admin/validation-retries", headers=_HEADERS)
     assert listing.status_code == 200, listing.text
     item = next(
-        row
-        for row in listing.json()["submissions"]
-        if row["agent_id"] == str(agent_id)
+        row for row in listing.json()["submissions"] if row["agent_id"] == str(agent_id)
     )
     assert item["bench_version"] == desired_version
     assert item["retry_state"] == "exhausted"
@@ -2549,8 +2547,7 @@ async def test_rollout_cohort_recovery_keeps_settled_status_and_history(
         "/api/v1/admin/validation-retries", headers=_HEADERS
     )
     assert all(
-        row["agent_id"] != str(agent_id)
-        for row in closed_listing.json()["submissions"]
+        row["agent_id"] != str(agent_id) for row in closed_listing.json()["submissions"]
     )
 
 
