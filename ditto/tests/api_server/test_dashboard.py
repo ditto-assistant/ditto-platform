@@ -1024,6 +1024,33 @@ class TestDashboard:
         assert "<b>Platform</b>" in body
         assert "<b>Heartbeat</b>" in body
 
+    async def test_operations_refresh_keeps_last_successful_snapshot(self) -> None:
+        app = create_api_server(make_api_server_config(dashboard_enabled=True))
+        body = (await _get(app, "/")).text
+        match = re.search(
+            r"(function loadOperations\(\).*?\n    \})"
+            r"\n\n    function loadValidatorNames",
+            body,
+            re.DOTALL,
+        )
+        assert match is not None
+        loader = match.group(1)
+        assert "if (operationsRequest) return operationsRequest" in loader
+        assert "operationsSnapshotAt = data.generated_at || null" in loader
+        assert (
+            "pipelineLoaded && !pipelineUnavailable &&\n"
+            "              fleetReports.validators !== null && "
+            "!fleetUnavailable.validators"
+        ) in loader
+        assert "Refresh delayed · showing last reconciled snapshot" in loader
+        delayed = loader.index("Refresh delayed · showing last reconciled snapshot")
+        assert delayed < loader.index(
+            "fleetUnavailable.validators = true",
+        )
+        assert "renderPipelineBoard(null, true)" in loader
+        assert "operationsRequest = null" in loader
+        assert "operationsRefreshFailed" in body
+
     async def test_benchmark_authority_state_never_promotes_rollout_target(
         self,
     ) -> None:
