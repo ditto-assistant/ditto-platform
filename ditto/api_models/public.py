@@ -2852,6 +2852,32 @@ class PublicValidatorHeartbeatsResponse(BaseModel):
     validators: list[PublicValidatorHeartbeat] = Field(default_factory=list)
 
 
+class PublicRolloutQueueEntry(BaseModel):
+    """One inherited submission waiting on the desired benchmark rollout."""
+
+    agent_id: Annotated[UUID, Field(description="The inherited agent's id.")]
+    miner_hotkey: Annotated[
+        str, Field(pattern=_SS58_PATTERN, description="Submitting miner's SS58 hotkey.")
+    ]
+    name: Annotated[str, Field(description="Miner-provided agent display name.")]
+    version: Annotated[int | None, Field(default=None, ge=1)] = None
+    submitted_at: datetime
+    bench_version: Annotated[int, Field(ge=1)]
+    position: Annotated[
+        int,
+        Field(
+            ge=1,
+            description="Frozen one-based position in the rollout cohort.",
+        ),
+    ]
+    status: Literal["waiting_validator", "evaluating"]
+    score_count: Annotated[int, Field(ge=0)]
+    quorum: Annotated[int, Field(ge=1)]
+    retry_state: RetryState | None = None
+    retry_after: datetime | None = None
+    active_benchmarks: list[PublicBenchmarkProgress] = Field(default_factory=list)
+
+
 class PublicOperationsResponse(BaseModel):
     """One cacheable operations snapshot shared by pipeline and fleet views."""
 
@@ -2862,6 +2888,7 @@ class PublicOperationsResponse(BaseModel):
         "inactive", "collecting", "blocked_ineligible", "activated", "superseded"
     ]
     activity: PublicActivityResponse
+    rollout_queue: list[PublicRolloutQueueEntry] = Field(default_factory=list)
     validators: PublicValidatorHeartbeatsResponse
 
 

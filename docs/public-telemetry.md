@@ -496,6 +496,9 @@ for the deep dive. Sections:
 - **Submission pipeline** — recent agent uploads, miner hotkey, public lifecycle
   stage, screening/review evidence, submission time, and accepted provisional
   composites with reproducibility commands, visible before scoring completes.
+  The atomic operations snapshot also carries the frozen desired-version
+  rollout cohort as `rollout_queue`, so inherited agents remain visible as
+  queue work while their active-version scores continue to drive weights.
   Each submission shows its current source-release embargo and exposes a download
   control once available.
 - **Leaderboard** — rank, miner, composite, category radar sparkline, weight %,

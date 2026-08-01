@@ -21,6 +21,7 @@ from ditto.api_models.screener import SCREENING_POLICY_VERSION
 from ditto.api_models.ticket_status import TicketStatus
 from ditto.db.models import (
     Agent,
+    BenchmarkRolloutMember,
     Score,
     SubmissionRetirement,
     ValidatorHeartbeat,
@@ -28,7 +29,7 @@ from ditto.db.models import (
     ValidatorRetryRecovery,
     ValidatorTicket,
 )
-from ditto.db.queries.benchmark_rollout import active_bench_version
+from ditto.db.queries.benchmark_rollout import active_bench_version, open_rollout
 from ditto.db.queries.queue_removal import is_in_force, removal_in_force
 from ditto.db.queries.scores import SCORING_QUORUM
 from ditto.db.queries.tickets import ticket_attempt_cap
@@ -112,6 +113,7 @@ def recovery_gate(
     recovery_count: int,
     now: datetime,
     bench_version: int,
+    rollout_qualification: bool = False,
     work_available_hotkeys: set[str] | None = None,
 ) -> tuple[bool, bool, str | None, list[ValidatorTicket]]:
     """Decide whether an automatic or operator retry is possible.
@@ -121,7 +123,10 @@ def recovery_gate(
     budget-exhausted tickets an operator grant would revive to restore quorum.
     """
     score_count = len(scores)
-    if agent.status != AgentStatus.EVALUATING:
+    waiting_for_scores = agent.status == AgentStatus.EVALUATING or (
+        rollout_qualification and agent.status in (AgentStatus.SCORED, AgentStatus.LIVE)
+    )
+    if not waiting_for_scores:
         return False, False, "submission is not waiting for validator scores", []
     if agent.screening_policy_version < SCREENING_POLICY_VERSION:
         return False, False, "submission is not on the current screening policy", []
@@ -393,19 +398,33 @@ async def classify_agent_retry_states(
     now: datetime,
     require_work_available_validator: bool = False,
 ) -> dict[UUID, AgentRetryState]:
-    """Classify a batch of agents' retry state in three bulk statements.
+    """Classify a batch of agents' retry state with bounded bulk reads.
 
-    Only ``EVALUATING`` agents below quorum get an entry; a finished, rejected,
-    uploaded, or otherwise-not-waiting agent is omitted (its retry state is
-    meaningless). The public activity feed passes agents of every status, so the
-    non-evaluating ones are filtered out up front — before the bulk load — which
-    also keeps the id list bounded to the (small) evaluating backlog rather than
-    every submission ever made.
+    ``EVALUATING`` agents below quorum get an entry. A scored/live agent also
+    gets one only while it belongs to the open desired-version rollout cohort:
+    its active-era score is settled, but its rollout qualification is still
+    below quorum and consumes the same bounded retry budget.
     """
+    input_by_id = {agent.agent_id: agent for agent in agents}
+    rollout = await open_rollout(session)
+    rollout_member_ids: set[UUID] = set()
+    if rollout is not None and input_by_id:
+        rollout_member_ids = set(
+            await session.scalars(
+                select(BenchmarkRolloutMember.agent_id).where(
+                    BenchmarkRolloutMember.rollout_id == rollout.rollout_id,
+                    BenchmarkRolloutMember.agent_id.in_(list(input_by_id)),
+                )
+            )
+        )
     agent_by_id = {
         agent.agent_id: agent
         for agent in agents
         if agent.status == AgentStatus.EVALUATING
+        or (
+            agent.agent_id in rollout_member_ids
+            and agent.status in (AgentStatus.SCORED, AgentStatus.LIVE)
+        )
     }
     if not agent_by_id:
         return {}
@@ -505,6 +524,11 @@ async def classify_agent_retry_states(
             recovery_count=recovery_counts.get((agent_id, bench_version), 0),
             now=now,
             bench_version=bench_version,
+            rollout_qualification=(
+                rollout is not None
+                and bench_version == rollout.desired_version
+                and agent_id in rollout_member_ids
+            ),
             work_available_hotkeys=available_hotkeys,
         )
         state = classify_retry_state(
@@ -546,3 +570,26 @@ async def classify_agent_retry_states(
             tickets=v_tickets,
         )
     return result
+
+
+async def is_open_rollout_qualification(
+    session: AsyncSession,
+    *,
+    agent_id: UUID,
+    bench_version: int,
+    for_update: bool = False,
+) -> bool:
+    """Whether this settled agent is still waiting on an open rollout quorum."""
+
+    rollout = await open_rollout(session, for_update=for_update)
+    if rollout is None or rollout.desired_version != bench_version:
+        return False
+    return (
+        await session.scalar(
+            select(BenchmarkRolloutMember.agent_id).where(
+                BenchmarkRolloutMember.rollout_id == rollout.rollout_id,
+                BenchmarkRolloutMember.agent_id == agent_id,
+            )
+        )
+        is not None
+    )
