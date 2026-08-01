@@ -231,9 +231,7 @@ async def check(
 
     settings = await effective_submission_settings(session)
     reserved_admission = (
-        await get_upload_admission_for_coldkey(
-            session, miner_coldkey=owner_coldkey
-        )
+        await get_upload_admission_for_coldkey(session, miner_coldkey=owner_coldkey)
         if owner_coldkey is not None
         else None
     )

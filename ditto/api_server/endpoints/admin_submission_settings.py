@@ -79,9 +79,7 @@ async def create_settings_revision(
 ) -> RevisionModel:
     latest = await latest_submission_settings(session)
     current_fee = (
-        latest.fee_amount_rao
-        if latest is not None
-        else DEFAULT_SUBMISSION_FEE_RAO
+        latest.fee_amount_rao if latest is not None else DEFAULT_SUBMISSION_FEE_RAO
     )
     fee_amount_rao = payload.fee_amount_rao or current_fee
     expected_confirmation = (

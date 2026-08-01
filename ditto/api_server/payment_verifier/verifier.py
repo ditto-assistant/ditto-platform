@@ -31,6 +31,7 @@ logger = logging.getLogger(__name__)
 _EXPECTED_CALL_MODULE = "Balances"
 _EXPECTED_CALL_FUNCTION = "transfer_keep_alive"
 
+
 class PaymentVerifier:
     """Verifies a miner-supplied payment proof against the on-chain extrinsic.
 
@@ -172,6 +173,7 @@ class PaymentVerifier:
             f"block_hash={proof.block_hash} idx={proof.extrinsic_index}"
         )
         return verified
+
 
 def _to_ss58(raw: Any) -> str:
     """Normalise a Pylon address arg (dest or signer) to a plain SS58 string.
