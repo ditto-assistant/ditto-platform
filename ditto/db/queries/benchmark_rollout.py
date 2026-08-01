@@ -1225,9 +1225,12 @@ def verified_scorer_for_version(
     ):
         return None
     # V8 accepts arbitrary-language miner images, so a scorer binary claiming
-    # support is insufficient. Require the signed executor boundary as well.
+    # support is insufficient. Require an explicit signed executor boundary as
+    # well. A privileged DinD executor is valid when the scorer's own policy
+    # does not require rootless execution; ``unknown`` remains fail-closed.
     # V7 remains routable during the additive migration.
     if version >= 8 and capabilities.executor_isolation not in {
+        "privileged_dind",
         "rootless_dind",
         "rootless_host",
         "ephemeral_vm",
