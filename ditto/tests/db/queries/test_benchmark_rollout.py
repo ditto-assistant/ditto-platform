@@ -491,7 +491,7 @@ async def test_historical_rescore_cohort_fills_from_exactly_two_prior_eras(
         assert not any("v2" in member.miner_hotkey for member in cohort)
 
 
-async def test_rollout_idles_validator_until_fleet_finishes_priority_five(
+async def test_rollout_uses_tail_when_validator_cannot_advance_priority_five(
     session_maker: async_sessionmaker[AsyncSession],
 ) -> None:
     now = datetime.now(UTC).replace(microsecond=0)
@@ -590,17 +590,17 @@ async def test_rollout_idles_validator_until_fleet_finishes_priority_five(
         # substitute for an unfinished inherited leader.
         assert await active_bench_version(session) == 2
 
-        # Validator A has exhausted its legal top-five work, but the fleet has
-        # not completed those quorums. Rank six must not leak through.
-        assert (
-            await issue_rollout_ticket(
-                session,
-                validator_hotkey="validator-a",
-                now=now,
-                ttl=timedelta(minutes=90),
-            )
-            is None
+        # Validator A has exhausted its legal top-five work, so idling it cannot
+        # advance the activation gate. It may score rank six while validators B
+        # and C retain first choice of the incomplete priority members.
+        tail_ticket = await issue_rollout_ticket(
+            session,
+            validator_hotkey="validator-a",
+            now=now,
+            ttl=timedelta(minutes=90),
         )
+        assert tail_ticket is not None and tail_ticket.agent_id == sixth_id
+        assert await active_bench_version(session) == 2
 
         for priority_id in priority_ids:
             for hotkey in ("validator-b", "validator-c"):

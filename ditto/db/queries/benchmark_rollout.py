@@ -39,6 +39,7 @@ from ditto.db.models import (
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
+    from sqlalchemy.sql import Select
 
 
 # The version a rollout starts FROM when no rollout has ever activated. This
@@ -1504,20 +1505,47 @@ async def issue_rollout_ticket(
             score_count + occupied_count < SCORING_QUORUM,
         )
     )
-    if not priority_complete:
-        # This is deliberately fleet-wide, not validator-local. A validator
-        # that has already scored every incomplete priority member idles until
-        # another validator closes those quorums; it must not skip to rank 6.
-        member_statement = member_statement.where(
-            BenchmarkRolloutMember.position <= priority_target
+
+    def ordered_candidate(statement: Select) -> Select:
+        return (
+            statement.order_by(
+                (score_count + occupied_count).asc(),
+                BenchmarkRolloutMember.position,
+            )
+            .limit(1)
+            .with_for_update(skip_locked=True)
         )
-    member = await session.scalar(
-        member_statement.order_by(
-            (score_count + occupied_count).asc(), BenchmarkRolloutMember.position
+
+    if priority_complete:
+        member = await session.scalar(ordered_candidate(member_statement))
+    else:
+        # Preserve the rollout's priority contract without parking capacity.
+        # Every validator first asks for work in the frozen activation cohort.
+        # If this validator already scored or holds every incomplete priority
+        # member, another lease from it cannot move the activation gate. Let
+        # that otherwise-idle slot score the tail while the validators that can
+        # still close priority quorum continue to receive priority work first.
+        #
+        # Activation remains fleet-wide and still requires every priority
+        # member to reach quorum; this fallback changes issuance only. A locked
+        # priority row is already being assigned by another transaction, so
+        # SKIP LOCKED may also fall through safely instead of idling a sibling
+        # slot behind the same in-flight allocation.
+        member = await session.scalar(
+            ordered_candidate(
+                member_statement.where(
+                    BenchmarkRolloutMember.position <= priority_target
+                )
+            )
         )
-        .limit(1)
-        .with_for_update(skip_locked=True)
-    )
+        if member is None:
+            member = await session.scalar(
+                ordered_candidate(
+                    member_statement.where(
+                        BenchmarkRolloutMember.position > priority_target
+                    )
+                )
+            )
     if member is None:
         return None
     # A rollout can open while this validator still owns an ordinary source-
