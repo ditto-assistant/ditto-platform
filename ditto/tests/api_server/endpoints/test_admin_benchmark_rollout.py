@@ -157,7 +157,9 @@ def _capabilities(now: datetime) -> tuple[dict[str, Any], dict[str, Any]]:
         "sandbox_egress_restricted": True,
         "ticket_inference": True,
         "signed_score_quorum": True,
-        "executor_isolation": "rootless_dind",
+        # Production validators may intentionally use the signed privileged
+        # DinD boundary when the scorer policy does not require rootless.
+        "executor_isolation": "privileged_dind",
         "scorer_benchmarks": {
             "status": "fresh_verified",
             "supported_bench_versions": [2, 3, 7, _TARGET],

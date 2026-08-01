@@ -2248,7 +2248,7 @@ async def test_capability_gate_is_parameterised_per_bench_version() -> None:
     ("executor_isolation", "supports_v8"),
     [
         ("unknown", False),
-        ("privileged_dind", False),
+        ("privileged_dind", True),
         ("rootless_dind", True),
         ("rootless_host", True),
         ("ephemeral_vm", True),
