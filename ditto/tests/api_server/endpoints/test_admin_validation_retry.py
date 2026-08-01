@@ -2442,7 +2442,7 @@ async def test_rollout_cohort_recovery_keeps_settled_status_and_history(
     client: httpx.AsyncClient,
     retry_maker: async_sessionmaker[AsyncSession],
 ) -> None:
-    """A settled active-era agent may recover its exhausted rollout leases."""
+    """A settled rollout agent recovers even after legacy retry-counter churn."""
     agent_id = uuid4()
     rollout_id = uuid4()
     desired_version = _BENCH_VERSION + 1
@@ -2481,6 +2481,8 @@ async def test_rollout_cohort_recovery_keeps_settled_status_and_history(
                 frozen_composite=0.9,
             )
         )
+        attempts = [47, 48, 61, 38]
+        infra_grants = [3, 5, 4, 0]
         for index in range(4):
             session.add(
                 ValidatorTicket(
@@ -2490,7 +2492,8 @@ async def test_rollout_cohort_recovery_keeps_settled_status_and_history(
                     issued_at=_T0 - timedelta(hours=3),
                     deadline=_T0 - timedelta(hours=2),
                     bench_version=desired_version,
-                    attempt_count=MAX_ATTEMPTS_PER_VERSION,
+                    attempt_count=attempts[index],
+                    infra_retry_grants=infra_grants[index],
                     retry_after=_PAST,
                 )
             )
@@ -2526,7 +2529,11 @@ async def test_rollout_cohort_recovery_keeps_settled_status_and_history(
             )
         )
     assert agent is not None and agent.status == AgentStatus.SCORED
-    assert [ticket.manual_retry_grants for ticket in tickets] == [1, 1, 1, 0]
+    assert [ticket.manual_retry_grants for ticket in tickets] == [43, 42, 56, 0]
+    assert all(
+        ticket.attempt_count < ticket_attempt_cap(ticket) for ticket in tickets[:3]
+    )
+    assert tickets[3].attempt_count >= ticket_attempt_cap(tickets[3])
 
     async with retry_maker() as session, session.begin():
         rollout = await session.get(BenchmarkRollout, rollout_id)
