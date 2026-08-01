@@ -899,16 +899,18 @@ async def ranked_quorum_agent_ids(
             return set()
         score_scope = score_scope.where(Score.agent_id.in_(agent_ids))
     per_version = score_scope.subquery()
-    qualifying = select(per_version.c.agent_id).join(
-        Agent, Agent.agent_id == per_version.c.agent_id
-    ).where(
-        Agent.status == AgentStatus.SCORED,
-        per_version.c.cnt >= SCORING_QUORUM,
-        per_version.c.eligible,
-        or_(
-            per_version.c.srn * 2 == per_version.c.cnt,
-            per_version.c.srn * 2 == per_version.c.cnt + 1,
-        ),
+    qualifying = (
+        select(per_version.c.agent_id)
+        .join(Agent, Agent.agent_id == per_version.c.agent_id)
+        .where(
+            Agent.status == AgentStatus.SCORED,
+            per_version.c.cnt >= SCORING_QUORUM,
+            per_version.c.eligible,
+            or_(
+                per_version.c.srn * 2 == per_version.c.cnt,
+                per_version.c.srn * 2 == per_version.c.cnt + 1,
+            ),
+        )
     )
     return set(await session.scalars(qualifying))
 
