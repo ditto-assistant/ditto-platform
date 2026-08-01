@@ -6480,6 +6480,33 @@ class TestSubmitScore:
             assert agent is not None
             assert agent.status == AgentStatus.SCORED
 
+    async def test_score_commit_does_not_activate_operator_retest_queue(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A finished score never widens into validator-wide re-test locks."""
+        activate = AsyncMock(
+            side_effect=AssertionError("score commit entered the re-test lock lane")
+        )
+        monkeypatch.setattr(
+            "ditto.api_server.endpoints.validator.activate_next_score_retest",
+            activate,
+        )
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
+        _install_db(app, session_maker)
+        _install_chain(app)
+        await _seed_ticket(session_maker, agent_id)
+        response = await client.post(
+            f"/api/v1/validator/agent/{agent_id}/score",
+            json=_score_payload(agent_id),
+        )
+
+        assert response.status_code == 200, response.text
+        activate.assert_not_awaited()
+
     async def test_finalized_score_retest_hot_swaps_without_leaving_finalized_state(
         self,
         app: FastAPI,

@@ -5136,19 +5136,15 @@ async def submit_score(
             bench_version=ticket.bench_version,
         )
         await revoke_ticket_inference(session, ticket=ticket, now=audit_now)
-        heartbeat = await session.get(ValidatorHeartbeat, payload.validator_hotkey)
-        await activate_next_score_retest(
-            session,
-            validator_hotkey=payload.validator_hotkey,
-            now=audit_now,
-            supports_version=lambda version: (
-                heartbeat is not None
-                and heartbeat_supports_version(
-                    heartbeat, now=audit_now, version=version
-                )
-            ),
-            slot_id=ticket.slot_id,
-        )
+        # Never activate the operator re-test queue from the score transaction.
+        # This transaction already owns the agent and completed ticket rows;
+        # activation deliberately locks the validator and all of its issued
+        # tickets. Validators with historical re-test lifecycle entries would
+        # therefore recreate the agent/ticket lock-order inversion fixed in
+        # #558 and lose a finished benchmark to Postgres deadlock recovery.
+        # The validator's immediate next job poll activates the queue under its
+        # normal issuance lock, and admin queue actions activate it directly, so
+        # removing this eager handoff delays nothing and leaves one lock owner.
         result_status = agent.status
 
     # Both a completed v3 quorum and a newly finalized v2 contender can change
