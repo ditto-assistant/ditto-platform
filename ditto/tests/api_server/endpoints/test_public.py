@@ -73,6 +73,7 @@ from ditto.db.models import (
     BenchmarkDataset,
     BenchmarkRollout,
     BenchmarkRolloutAudit,
+    BenchmarkRolloutMember,
     EvaluationPayment,
     Score,
     ScreeningAttempt,
@@ -3807,6 +3808,72 @@ class TestPublicFleet:
 
 
 class TestPublicActivity:
+    async def test_operations_lists_desired_rollout_members_as_queue_work(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """A settled agent remains visible while the next benchmark collects."""
+        await _activate_era(session_maker)
+        member_id = await _seed_agent(
+            session_maker,
+            miner=_MINER_A,
+            status=AgentStatus.SCORED,
+            name="rollout-member",
+            created_at=datetime(2026, 7, 31, 20, 0, tzinfo=UTC),
+            screening_policy_version=SCREENING_POLICY_VERSION,
+        )
+        rollout_id = uuid4()
+        async with session_maker() as session, session.begin():
+            session.add(
+                BenchmarkRollout(
+                    rollout_id=rollout_id,
+                    from_version=_ERA,
+                    desired_version=_NEXT_ERA,
+                    status="collecting",
+                    cohort_size=5,
+                    rescore_cohort_target=5,
+                    priority_cohort_target=5,
+                    created_at=datetime(2026, 7, 31, 21, 0, tzinfo=UTC),
+                )
+            )
+            session.add(
+                BenchmarkRolloutMember(
+                    rollout_id=rollout_id,
+                    agent_id=UUID(member_id),
+                    position=1,
+                    frozen_miner_hotkey=_MINER_A,
+                    frozen_composite=0.9,
+                )
+            )
+            session.add(_dataset_pin(UUID(member_id), bench_version=_NEXT_ERA))
+        _install_db(app, session_maker)
+
+        response = await client.get("/api/v1/public/operations")
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["active_bench_version"] == _ERA
+        assert body["desired_bench_version"] == _NEXT_ERA
+        assert body["rollout_queue"] == [
+            {
+                "agent_id": member_id,
+                "miner_hotkey": _MINER_A,
+                "name": "rollout-member",
+                "version": None,
+                "submitted_at": "2026-07-31T20:00:00Z",
+                "bench_version": _NEXT_ERA,
+                "position": 1,
+                "status": "waiting_validator",
+                "score_count": 0,
+                "quorum": 3,
+                "retry_state": "queued",
+                "retry_after": None,
+                "active_benchmarks": [],
+            }
+        ]
+
     async def test_lists_all_stages_newest_first_without_sensitive_fields(
         self,
         app: FastAPI,

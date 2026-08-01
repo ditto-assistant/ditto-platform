@@ -7926,8 +7926,44 @@
     }
 
     function validatorQueueCompare(a, b) {
-      return Number(a.entry.validator_queue_rank || Number.MAX_SAFE_INTEGER) -
-        Number(b.entry.validator_queue_rank || Number.MAX_SAFE_INTEGER);
+      var aRank = Number(a.entry.validator_queue_rank || Number.MAX_SAFE_INTEGER);
+      var bRank = Number(b.entry.validator_queue_rank || Number.MAX_SAFE_INTEGER);
+      if (aRank !== bRank) return aRank - bRank;
+      return Number(a.entry.rollout_position || Number.MAX_SAFE_INTEGER) -
+        Number(b.entry.rollout_position || Number.MAX_SAFE_INTEGER);
+    }
+
+    function operationsPipelineActivity(data) {
+      var activity = data && data.activity ? data.activity : {};
+      var rollout = data && Array.isArray(data.rollout_queue) ? data.rollout_queue : [];
+      if (!rollout.length) return activity;
+      var rolloutIds = Object.create(null);
+      rollout.forEach(function (entry) { rolloutIds[String(entry.agent_id)] = true; });
+      var entries = (activity.entries || []).filter(function (entry) {
+        return !rolloutIds[String(entry.agent_id)];
+      });
+      rollout.forEach(function (entry) {
+        entries.push({
+          agent_id: entry.agent_id,
+          miner_hotkey: entry.miner_hotkey,
+          name: entry.name,
+          version: entry.version,
+          submitted_at: entry.submitted_at,
+          status: entry.status,
+          score_count: entry.score_count,
+          quorum: entry.quorum,
+          retry_state: entry.retry_state,
+          retry_after: entry.retry_after,
+          active_benchmarks: entry.active_benchmarks || [],
+          rollout_position: entry.position,
+          queue_bench_version: entry.bench_version
+        });
+      });
+      var counts = Object.assign({}, activity.status_counts || {});
+      rollout.forEach(function (entry) {
+        counts[entry.status] = Number(counts[entry.status] || 0) + 1;
+      });
+      return Object.assign({}, activity, { entries: entries, status_counts: counts });
     }
 
     function queueRelevantBenchmark(progress) {
@@ -8082,8 +8118,12 @@
             && Number(entry.validator_queue_rank) === 1
             && !queueGate;
           var rescore = column.status === "evaluating" ? pipelineRescoreState(entry) : null;
+          var rolloutVersion = Number(entry.queue_bench_version) || null;
+          var rolloutPosition = Number(entry.rollout_position) || null;
           var meta = column.status === "waiting_validator" || column.status === "evaluating" || entry.status === "below_score_floor"
-            ? (rescore
+            ? (rolloutVersion
+              ? "Bench v" + rolloutVersion + " · " + validationProgress(entry)
+              : rescore
               ? (rescore.isQualification
                 ? "Bench v" + rescore.targetVersion + " qualification"
                 : "Bench v" + rescore.targetVersion + " rescore")
@@ -8105,10 +8145,12 @@
             '<span class="pipeline-item-heading"><span class="pipeline-item-name">' + esc(agentName(entry.name)) + '</span>' +
               (isUpNext ? '<span class="pipeline-next-badge" title="Highest current priority; validator eligibility can vary">Up next</span>' : '') +
               (queueGate ? '<span class="pipeline-gate-badge" title="' + esc(queueGate.title) + '">' + esc(queueGate.label) + '</span>' : '') +
+              (rolloutPosition ? '<span class="pipeline-qualification-badge" title="Frozen inherited benchmark rollout position">Cohort #' + esc(rolloutPosition) + ' → v' + esc(rolloutVersion) + '</span>' : '') +
               (rescore && rescore.isQualification ? '<span class="pipeline-qualification-badge" title="Existing score remains authoritative while this inherited cohort agent qualifies on the next benchmark">Cohort → v' + esc(rescore.targetVersion) + '</span>' : '') + '</span>' +
             agentVersionBadge(entry.version) +
             '<span class="pipeline-item-meta"><span>' + esc(String(entry.agent_id || "").slice(0, 8)) + '</span><span>' + esc(meta) + '</span></span>' +
-            (rescore && rescore.isQualification ? '<span class="pipeline-item-qualification-detail">v' + esc(rescore.sourceVersion) + ' score stays live until v' + esc(rescore.targetVersion) + ' quorum</span>' : '') +
+            (rolloutPosition ? '<span class="pipeline-item-qualification-detail">v' + esc(activeBench || currentBench) + ' score stays live until v' + esc(rolloutVersion) + ' quorum</span>' :
+              (rescore && rescore.isQualification ? '<span class="pipeline-item-qualification-detail">v' + esc(rescore.sourceVersion) + ' score stays live until v' + esc(rescore.targetVersion) + ' quorum</span>' : '')) +
             (provisionalScore ? '<span class="pipeline-item-priority-detail">' + esc(provisionalScore) + '</span>' : '') +
             (policyLabel ? '<span class="pipeline-item-policy">' + esc(policyLabel) + '</span>' : '') +
             retryStateChip(entry) +
@@ -9466,7 +9508,7 @@
           fleetReports.validators = data.validators;
           fleetUnavailable.validators = false;
           document.getElementById("h-validators").textContent = data.validators.reported_count;
-          renderPipelineBoard(data.activity, false);
+          renderPipelineBoard(operationsPipelineActivity(data), false);
           renderFleet();
           var visibleHistory = data.activity.count < data.activity.total
             ? " · recent history shown; full history in Activity"
