@@ -376,13 +376,16 @@ async def historical_rescore_cohort(
     """Freeze the prior-era rescore cohort without admitting the whole ledger.
 
     The immediately previous benchmark owns the cohort. If it has fewer than
-    ``limit`` finalized distinct miners, the next older scored benchmark fills
-    the remaining positions. No third historical era is consulted: this is the
-    explicit "combine two previous benchmark iterations" fallback, not an
-    unbounded backfill of every legacy submission. That contract is enforced by
-    the ``.limit(2)`` on the version query below and is independent of
-    ``limit`` -- widening the cohort to twenty-five can only return fewer
-    members from the same two eras, never reach into a third.
+    ``limit`` finalized distinct miner families, the next older scored benchmark
+    fills the remaining positions. Family identity is the same payment-coldkey
+    plus active mutual-attestation graph used by the public ledger; the frozen
+    member rows preserve that point-in-time decision if an attestation later
+    changes. No third historical era is consulted: this is the explicit
+    "combine two previous benchmark iterations" fallback, not an unbounded
+    backfill of every legacy submission. That contract is enforced by the
+    ``.limit(2)`` on the version query below and is independent of ``limit`` --
+    widening the cohort to twenty-five can only return fewer members from the
+    same two eras, never reach into a third.
 
     The upper bound is the storage ceiling, not the default cohort size: an
     operator may configure any size in ``[5, 25]``, so validating against the
@@ -428,9 +431,32 @@ async def historical_rescore_cohort(
         ).append(score)
 
     from ditto.db.queries.payments import get_miner_coldkeys_for_agents
+    from ditto.db.queries.scores import (
+        attested_emission_owner_roots,
+        emission_owner,
+    )
 
     coldkeys = await get_miner_coldkeys_for_agents(
         session, agent_ids={agent.agent_id for agent in agents}
+    )
+    owner_roots = dict(
+        zip(
+            (agent.agent_id for agent in agents),
+            await attested_emission_owner_roots(
+                session,
+                [
+                    (
+                        agent.miner_hotkey,
+                        emission_owner(
+                            miner_hotkey=agent.miner_hotkey,
+                            miner_coldkey=coldkeys.get(agent.agent_id),
+                        ),
+                    )
+                    for agent in agents
+                ],
+            ),
+            strict=True,
+        )
     )
     agent_by_id = {agent.agent_id: agent for agent in agents}
     selected: list[RolloutSnapshotMember] = []
@@ -452,11 +478,7 @@ async def historical_rescore_cohort(
             ranked.append((agent_by_id[agent_id], float(middle.composite)))
         ranked.sort(key=lambda item: (-item[1], item[0].created_at, item[0].agent_id))
         for agent, composite in ranked:
-            owner = (
-                f"coldkey:{coldkeys[agent.agent_id]}"
-                if agent.agent_id in coldkeys
-                else f"hotkey:{agent.miner_hotkey}"
-            )
+            owner = owner_roots[agent.agent_id]
             if agent.agent_id in seen_agents or owner in seen_owners:
                 continue
             seen_agents.add(agent.agent_id)
