@@ -843,6 +843,88 @@ async def test_parallel_rollout_slots_stay_distinct_inside_frozen_priority_five(
         assert {slot0.agent_id, slot1.agent_id}.issubset(set(priority_ids))
 
 
+async def test_ath_hold_keeps_frozen_member_scoreable_and_retains_progress(
+    session_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """An ATH hold pauses authority, not the benchmark competition itself."""
+    now = datetime.now(UTC).replace(microsecond=0)
+    async with _seeded_rollout_session(session_maker, now) as (
+        session,
+        priority_ids,
+        rollout,
+    ):
+        held = await session.get(Agent, priority_ids[0])
+        assert held is not None
+        held.status = AgentStatus.ATH_PENDING_REVIEW
+        # Put the rest of the priority cohort one coverage round ahead so the
+        # issuer's balanced ordering returns to this member after its clear.
+        for index, agent_id in enumerate(priority_ids[1:], start=1):
+            session.add(
+                Score(
+                    agent_id=agent_id,
+                    bench_version=rollout.desired_version,
+                    validator_hotkey="coverage-a",
+                    run_id=f"coverage-a-{index}",
+                    signature="aa",
+                    seed=index,
+                    composite=0.8,
+                    tool_mean=0.8,
+                    memory_mean=0.8,
+                    median_ms=1,
+                    n=114,
+                    details={"bench_version": rollout.desired_version},
+                    generated_at=now,
+                )
+            )
+        await session.flush()
+
+        first = await issue_rollout_ticket(
+            session,
+            validator_hotkey="validator-a",
+            now=now,
+            ttl=timedelta(minutes=90),
+        )
+        assert first is not None
+        assert first.agent_id == held.agent_id
+
+        first.status = TicketStatus.SCORED
+        session.add(
+            Score(
+                agent_id=held.agent_id,
+                bench_version=rollout.desired_version,
+                validator_hotkey="validator-a",
+                run_id="held-validator-a",
+                signature="aa",
+                seed=1,
+                composite=0.8,
+                tool_mean=0.8,
+                memory_mean=0.8,
+                median_ms=1,
+                n=114,
+                details={"bench_version": rollout.desired_version},
+                generated_at=now,
+            )
+        )
+        await session.flush()
+
+        # The accepted score does not make a suspected copy authoritative.
+        assert await active_bench_version(session) == 2
+        assert not await maybe_activate_rollout(session, rollout, now=now)
+
+        # A human clear makes the retained score immediately useful; the next
+        # validator continues at 1/3 instead of restarting after the hold.
+        held.status = AgentStatus.SCORED
+        await session.flush()
+        second = await issue_rollout_ticket(
+            session,
+            validator_hotkey="validator-b",
+            now=now,
+            ttl=timedelta(minutes=90),
+        )
+        assert second is not None
+        assert second.agent_id == held.agent_id
+
+
 async def test_five_agents_remain_v2_at_two_of_three_then_activate_atomically(
     session_maker: async_sessionmaker[AsyncSession],
 ) -> None:

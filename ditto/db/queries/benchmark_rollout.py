@@ -1420,8 +1420,18 @@ async def issue_rollout_ticket(
         .limit(1)
         .with_for_update()
     )
+    # ATH review is an emissions hold, not a scoring hold. The score endpoint
+    # deliberately accepts reports for ATH_PENDING_REVIEW so evidence gathered
+    # during review survives a later clear. Keep leasing the frozen member here
+    # as well; authority/activation still excludes it until an operator clears
+    # the hold via count_ranked_quorum_agents and maybe_activate_rollout.
+    rollout_scoreable_statuses = (
+        AgentStatus.SCORED,
+        AgentStatus.LIVE,
+        AgentStatus.ATH_PENDING_REVIEW,
+    )
     existing_statement = existing_statement.where(
-        Agent.status.in_((AgentStatus.SCORED, AgentStatus.LIVE)),
+        Agent.status.in_(rollout_scoreable_statuses),
         Agent.screening_policy_version >= contract.minimum_screening_policy_version,
         complete_screened_image,
     )
@@ -1486,7 +1496,7 @@ async def issue_rollout_ticket(
         .join(Agent, Agent.agent_id == BenchmarkRolloutMember.agent_id)
         .where(
             BenchmarkRolloutMember.rollout_id == rollout.rollout_id,
-            Agent.status.in_((AgentStatus.SCORED, AgentStatus.LIVE)),
+            Agent.status.in_(rollout_scoreable_statuses),
             Agent.screening_policy_version >= contract.minimum_screening_policy_version,
             complete_screened_image,
             ~already_scored,
