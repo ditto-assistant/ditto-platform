@@ -25,6 +25,7 @@ from ditto.db.models import (
     Agent,
     BenchmarkDataset,
     BenchmarkRollout,
+    BenchmarkRolloutMember,
     Score,
     ScoreAuditEntry,
     ValidatorHeartbeat,
@@ -2434,6 +2435,123 @@ async def test_list_snapshot_matches_single_agent_detail(
         },
     )
     assert accepted.status_code == 200, accepted.text
+
+
+async def test_rollout_cohort_recovery_keeps_settled_status_and_history(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    retry_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """A settled active-era agent may recover its exhausted rollout leases."""
+    agent_id = uuid4()
+    rollout_id = uuid4()
+    desired_version = _BENCH_VERSION + 1
+    async with retry_maker() as session, session.begin():
+        await _activate_current_era(session)
+        session.add(
+            BenchmarkRollout(
+                rollout_id=rollout_id,
+                from_version=_BENCH_VERSION,
+                desired_version=desired_version,
+                status="collecting",
+                cohort_size=5,
+                rescore_cohort_target=5,
+                priority_cohort_target=5,
+                created_at=_T0,
+            )
+        )
+        session.add(
+            Agent(
+                agent_id=agent_id,
+                miner_hotkey="5RolloutMiner",
+                name="settled-rollout-member",
+                version=1,
+                sha256=agent_id.hex * 2,
+                status=AgentStatus.SCORED,
+                screening_policy_version=SCREENING_POLICY_VERSION,
+                created_at=_T0 - timedelta(days=1),
+            )
+        )
+        session.add(
+            BenchmarkRolloutMember(
+                rollout_id=rollout_id,
+                agent_id=agent_id,
+                position=1,
+                frozen_miner_hotkey="5RolloutMiner",
+                frozen_composite=0.9,
+            )
+        )
+        for index in range(4):
+            session.add(
+                ValidatorTicket(
+                    agent_id=agent_id,
+                    validator_hotkey=f"rollout-validator-{index}",
+                    status=TicketStatus.EXPIRED,
+                    issued_at=_T0 - timedelta(hours=3),
+                    deadline=_T0 - timedelta(hours=2),
+                    bench_version=desired_version,
+                    attempt_count=MAX_ATTEMPTS_PER_VERSION,
+                    retry_after=_PAST,
+                )
+            )
+    _install(app, retry_maker)
+
+    listing = await client.get("/api/v1/admin/validation-retries", headers=_HEADERS)
+    assert listing.status_code == 200, listing.text
+    item = next(
+        row
+        for row in listing.json()["submissions"]
+        if row["agent_id"] == str(agent_id)
+    )
+    assert item["bench_version"] == desired_version
+    assert item["retry_state"] == "exhausted"
+    assert item["recovery_allowed"] is True
+
+    response = await client.post(
+        f"/api/v1/admin/validation-retries/{agent_id}/retry",
+        headers=_HEADERS,
+        json={
+            "request_id": str(uuid4()),
+            "expected_snapshot": item["snapshot"],
+            "reason": "repaired rollout validator infrastructure is serving again",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    async with retry_maker() as session:
+        agent = await session.get(Agent, agent_id)
+        tickets = list(
+            await session.scalars(
+                select(ValidatorTicket)
+                .where(ValidatorTicket.agent_id == agent_id)
+                .order_by(ValidatorTicket.validator_hotkey)
+            )
+        )
+    assert agent is not None and agent.status == AgentStatus.SCORED
+    assert [ticket.manual_retry_grants for ticket in tickets] == [1, 1, 1, 0]
+
+    async with retry_maker() as session, session.begin():
+        rollout = await session.get(BenchmarkRollout, rollout_id)
+        assert rollout is not None
+        rollout.status = "activated"
+        rollout.activated_at = _T0 + timedelta(hours=1)
+
+    closed_detail = await client.get(
+        f"/api/v1/admin/validation-retries/{agent_id}", headers=_HEADERS
+    )
+    assert closed_detail.status_code == 200
+    assert closed_detail.json()["recovery_allowed"] is False
+    assert (
+        closed_detail.json()["blocking_reason"]
+        == "submission is not waiting for validator scores"
+    )
+    closed_listing = await client.get(
+        "/api/v1/admin/validation-retries", headers=_HEADERS
+    )
+    assert all(
+        row["agent_id"] != str(agent_id)
+        for row in closed_listing.json()["submissions"]
+    )
 
 
 async def test_list_sorts_exhausted_before_queued(

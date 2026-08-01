@@ -61,6 +61,7 @@ from ditto.api_server.dependencies import get_session
 from ditto.api_server.endpoints.admin_quarantine import require_admin
 from ditto.db.models import (
     Agent,
+    BenchmarkRolloutMember,
     Score,
     ScoreAuditEntry,
     ValidatorHeartbeat,
@@ -81,6 +82,7 @@ from ditto.db.queries.benchmark_rollout import (
     MIN_SCOREABLE_BENCH_VERSION,
     active_bench_version,
     heartbeat_supports_version,
+    open_rollout,
 )
 from ditto.db.queries.lease_liveness import (
     ACTION_OPERATOR_EVICTED,
@@ -101,6 +103,7 @@ from ditto.db.queries.retry_state import (
     classify_agent_retry_states,
     eviction_gate,
     is_exhausted,
+    is_open_rollout_qualification,
     recovery_gate,
     reinstatement_gate,
     resolve_bench_version,
@@ -459,6 +462,26 @@ async def list_validation_retries(
     agents = await list_agents_by_status(
         session, statuses=[AgentStatus.EVALUATING], limit=_STUCK_SCAN_LIMIT
     )
+    rollout = await open_rollout(session)
+    if rollout is not None:
+        rollout_agents = list(
+            await session.scalars(
+                select(Agent)
+                .join(
+                    BenchmarkRolloutMember,
+                    BenchmarkRolloutMember.agent_id == Agent.agent_id,
+                )
+                .where(
+                    BenchmarkRolloutMember.rollout_id == rollout.rollout_id,
+                    Agent.status.in_((AgentStatus.SCORED, AgentStatus.LIVE)),
+                )
+                .order_by(BenchmarkRolloutMember.position)
+            )
+        )
+        known = {agent.agent_id for agent in agents}
+        agents.extend(
+            agent for agent in rollout_agents if agent.agent_id not in known
+        )
     classified = await classify_agent_retry_states(
         session,
         agents=agents,
@@ -538,6 +561,9 @@ async def get_validation_retry(
         recovery_count=len(recoveries),
         now=now,
         bench_version=bench_version,
+        rollout_qualification=await is_open_rollout_qualification(
+            session, agent_id=agent.agent_id, bench_version=bench_version
+        ),
         work_available_hotkeys=await work_available_validator_hotkeys(session, now=now),
     )
     # The most recent removal, reversed or not: the operator surface has to be
@@ -635,6 +661,10 @@ async def _apply_recovery(
     aborting the whole set. ``status`` is ``granted`` | ``idempotent`` |
     ``skipped``; ``detail`` explains a skip.
     """
+    # Ticket issuance locks the rollout before a ticket row. Preserve that lock
+    # order here so an operator grant cannot deadlock a validator claim while
+    # also preventing the rollout from activating underneath the grant.
+    rollout = await open_rollout(session, for_update=True)
     agent, bench_version, scores, tickets, recoveries = await _load(
         session, agent_id=agent_id, for_update=True
     )
@@ -665,6 +695,16 @@ async def _apply_recovery(
     current_snapshot = _snapshot(agent=agent, scores=scores, tickets=tickets)
     if current_snapshot != expected_snapshot:
         return "skipped", "validation state changed", None
+    rollout_qualification = bool(
+        rollout is not None
+        and rollout.desired_version == bench_version
+        and await session.scalar(
+            select(BenchmarkRolloutMember.agent_id).where(
+                BenchmarkRolloutMember.rollout_id == rollout.rollout_id,
+                BenchmarkRolloutMember.agent_id == agent.agent_id,
+            )
+        )
+    )
     _, allowed, gate_reason, selected = recovery_gate(
         agent=agent,
         scores=scores,
@@ -672,6 +712,7 @@ async def _apply_recovery(
         recovery_count=len(recoveries),
         now=now,
         bench_version=bench_version,
+        rollout_qualification=rollout_qualification,
         work_available_hotkeys=await work_available_validator_hotkeys(session, now=now),
     )
     if not allowed:
