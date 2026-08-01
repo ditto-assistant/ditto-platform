@@ -870,13 +870,56 @@ async def list_miner_composite_history(
     return {hotkey: series[-limit_per:] for hotkey, series in out.items()}
 
 
+async def ranked_quorum_agent_ids(
+    session: AsyncSession,
+    *,
+    bench_version: int,
+    agent_ids: set[UUID] | None = None,
+) -> set[UUID]:
+    """Eligible agent IDs holding a complete, RANKED quorum at ``bench_version``.
+
+    Unlike :func:`count_ranked_quorum_agents`, this deliberately does not fold
+    linked emission-owner families. Rollout activation uses it to prove that
+    every frozen member completed a rankable full benchmark even when a legacy
+    snapshot contains two members from one family.
+    """
+    score_scope = select(
+        Score.agent_id.label("agent_id"),
+        _is_ranked().label("eligible"),
+        func.count(Score.agent_id).over(partition_by=Score.agent_id).label("cnt"),
+        func.row_number()
+        .over(
+            partition_by=Score.agent_id,
+            order_by=(Score.composite.asc(), Score.validator_hotkey.asc()),
+        )
+        .label("srn"),
+    ).where(Score.bench_version == bench_version)
+    if agent_ids is not None:
+        if not agent_ids:
+            return set()
+        score_scope = score_scope.where(Score.agent_id.in_(agent_ids))
+    per_version = score_scope.subquery()
+    qualifying = select(per_version.c.agent_id).join(
+        Agent, Agent.agent_id == per_version.c.agent_id
+    ).where(
+        Agent.status == AgentStatus.SCORED,
+        per_version.c.cnt >= SCORING_QUORUM,
+        per_version.c.eligible,
+        or_(
+            per_version.c.srn * 2 == per_version.c.cnt,
+            per_version.c.srn * 2 == per_version.c.cnt + 1,
+        ),
+    )
+    return set(await session.scalars(qualifying))
+
+
 async def count_ranked_quorum_agents(
     session: AsyncSession,
     *,
     bench_version: int,
     agent_ids: set[UUID] | None = None,
 ) -> int:
-    """How many eligible agents hold a complete, RANKED quorum at ``bench_version``.
+    """How many owner families hold a complete, RANKED quorum at ``bench_version``.
 
     One definition, two consumers — they must agree or the guarantee they
     implement has a hole:
@@ -898,44 +941,21 @@ async def count_ranked_quorum_agents(
     consensus-critical decision: the same DB state must give every reader the
     same answer.
     """
-    score_scope = select(
-        Score.agent_id.label("agent_id"),
-        _is_ranked().label("eligible"),
-        func.count(Score.agent_id).over(partition_by=Score.agent_id).label("cnt"),
-        func.row_number()
-        .over(
-            partition_by=Score.agent_id,
-            order_by=(Score.composite.asc(), Score.validator_hotkey.asc()),
-        )
-        .label("srn"),
-    ).where(Score.bench_version == bench_version)
-    if agent_ids is not None:
-        if not agent_ids:
-            return 0
-        score_scope = score_scope.where(Score.agent_id.in_(agent_ids))
-    per_version = score_scope.subquery()
-    # Same median arithmetic as the ledger (see list_eligible_ledger): the
-    # lower-middle row by ascending composite represents the agent.
+    ranked_ids = await ranked_quorum_agent_ids(
+        session, bench_version=bench_version, agent_ids=agent_ids
+    )
+    if not ranked_ids:
+        return 0
     qualifying = (
         select(
-            per_version.c.agent_id,
             Agent.miner_hotkey.label("miner_hotkey"),
             _emission_owner_key().label("emission_owner"),
         )
-        .join(Agent, Agent.agent_id == per_version.c.agent_id)
         .outerjoin(
             EvaluationPayment,
-            EvaluationPayment.agent_id == per_version.c.agent_id,
+            EvaluationPayment.agent_id == Agent.agent_id,
         )
-        .where(
-            Agent.status == AgentStatus.SCORED,
-            per_version.c.cnt >= SCORING_QUORUM,
-            per_version.c.eligible,
-            or_(
-                per_version.c.srn * 2 == per_version.c.cnt,
-                per_version.c.srn * 2 == per_version.c.cnt + 1,
-            ),
-        )
+        .where(Agent.agent_id.in_(ranked_ids))
     )
     identities = [
         (row.miner_hotkey, row.emission_owner)

@@ -589,7 +589,10 @@ async def append_rollout_member(
 async def active_bench_version(session: AsyncSession) -> int:
     open_transition = await open_rollout(session)
     if open_transition is not None:
-        from ditto.db.queries.scores import count_ranked_quorum_agents
+        from ditto.db.queries.scores import (
+            count_ranked_quorum_agents,
+            ranked_quorum_agent_ids,
+        )
 
         # The gate width is the target this rollout FROZE at start, not the live
         # operator setting: re-gating a transition already in flight would move
@@ -603,10 +606,22 @@ async def active_bench_version(session: AsyncSession) -> int:
                 )
             )
         )
-        ready = await count_ranked_quorum_agents(
+        member_ids = set(
+            await session.scalars(
+                select(BenchmarkRolloutMember.agent_id).where(
+                    BenchmarkRolloutMember.rollout_id == open_transition.rollout_id
+                )
+            )
+        )
+        ranked_priority_ids = await ranked_quorum_agent_ids(
             session,
             bench_version=open_transition.desired_version,
             agent_ids=priority_ids,
+        )
+        ready = await count_ranked_quorum_agents(
+            session,
+            bench_version=open_transition.desired_version,
+            agent_ids=member_ids,
         )
         # MIN_DESIRED_AUTHORITY_AGENTS stays a constant on purpose. It is the
         # KOTH emission-set size, so it is a consensus quantity, not queue
@@ -614,6 +629,7 @@ async def active_bench_version(session: AsyncSession) -> int:
         # emission split expects. The priority target above is the tunable half.
         if (
             len(priority_ids) == priority_target
+            and ranked_priority_ids == priority_ids
             and ready >= MIN_DESIRED_AUTHORITY_AGENTS
         ):
             if (
@@ -1724,14 +1740,24 @@ async def maybe_activate_rollout(
     # The raw counts above do not imply rankability: a smoke-profile 3/3 can
     # satisfy them without ever being eligible for weights. Require every
     # frozen cohort member to hold a ranked quorum before closing the rollout.
-    from ditto.db.queries.scores import count_ranked_quorum_agents
+    from ditto.db.queries.scores import (
+        count_ranked_quorum_agents,
+        ranked_quorum_agent_ids,
+    )
 
+    ranked_member_ids = await ranked_quorum_agent_ids(
+        session,
+        bench_version=rollout.desired_version,
+        agent_ids=member_ids,
+    )
     ranked_cohort_agents = await count_ranked_quorum_agents(
         session,
         bench_version=rollout.desired_version,
         agent_ids=member_ids,
     )
-    if ranked_cohort_agents != len(member_ids):
+    if ranked_member_ids != member_ids:
+        return False
+    if ranked_cohort_agents < MIN_DESIRED_AUTHORITY_AGENTS:
         return False
     if not await inference_activation_ready(
         session,
@@ -1859,13 +1885,10 @@ async def rollout_state(
     qualified_ids = {member.agent_id for member in members}
     # This rollout's frozen activation gate width.
     priority_target = rollout.priority_cohort_target
-    priority_member_ids = {
-        member.agent_id for member in members if member.position <= priority_target
-    }
     ranked_quorum_agents = await count_ranked_quorum_agents(
         session,
         bench_version=rollout.desired_version,
-        agent_ids=priority_member_ids,
+        agent_ids={member.agent_id for member in members},
     )
     cohort_ready_count = sum(
         counts.get(member.agent_id, 0) >= SCORING_QUORUM for member in members
