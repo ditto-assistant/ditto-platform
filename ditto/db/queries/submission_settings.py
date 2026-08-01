@@ -233,11 +233,11 @@ async def consume_or_enforce_upload_admission(
         await session.delete(existing)
         await session.flush()
 
-    retry_at = await get_submission_retry_at(
+    submission_retry_at = await get_submission_retry_at(
         session,
         miner_coldkey=miner_coldkey,
         cooldown=timedelta(seconds=settings.cooldown_seconds),
         now=current,
     )
-    if retry_at is not None:
-        raise SubmissionCooldownError(retry_at)
+    if submission_retry_at is not None:
+        raise SubmissionCooldownError(submission_retry_at)
