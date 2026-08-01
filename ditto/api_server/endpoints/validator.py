@@ -982,9 +982,11 @@ async def _issue_prev_gen_carryover_ticket(
 
     Deliberately confined to the **cohort lane**. The fresh-submission lane
     exists to keep new miners from starving behind a transition, and diluting it
-    with a backlog drain would undo that. The caller therefore only reaches here
-    when the validator's lane slot is not a fresh-submission slot and both the
-    fresh lane and the inherited cohort had nothing to give.
+    with a backlog drain would undo that. Under strict priority the caller
+    reaches here only after the desired-era lanes have nothing to give. When an
+    operator explicitly sets ``require_desired_era_drained=False``, it reaches
+    here first on a cohort-lane poll so bounded carryover can actually
+    interleave instead of starving behind a continuously ready queue.
 
     By default it also waits for the inherited cohort to settle, on the same
     precedent as :func:`_issue_source_backfill_ticket` ("use otherwise-idle
@@ -1024,6 +1026,28 @@ async def _issue_prev_gen_carryover_ticket(
         owner_concurrent_submission_limit=owner_concurrent_submission_limit,
         similarity_policy=similarity_policy,
         similarity_concurrent_submission_limit=(similarity_concurrent_submission_limit),
+    )
+
+
+def _prev_gen_carryover_precedes_desired_era(
+    *, fresh_lane_due: bool, settings: PrevGenCarryoverSettings
+) -> bool:
+    """Whether this cohort-lane poll may interleave adopted carryover first.
+
+    ``require_desired_era_drained=False`` is the operator's explicit choice to
+    give adopted work bounded capacity before the desired-era queue empties.
+    The request path must therefore consult carryover before its normal cohort
+    and fresh fallbacks on a non-fresh slot; consulting it last makes the knob
+    ineffective whenever ordinary desired-era work stays continuously ready.
+
+    Fresh-lane slots remain reserved for new submissions regardless of this
+    setting.  The carryover helper still enforces capability, cohort-completion,
+    admission, owner, and similarity gates before it can issue anything.
+    """
+    return (
+        not fresh_lane_due
+        and settings.enabled
+        and not settings.require_desired_era_drained
     )
 
 
@@ -2269,18 +2293,20 @@ async def request_job(
                     settings=queue_policy,
                 )
             )
+            relaxed_carryover_due = _prev_gen_carryover_precedes_desired_era(
+                fresh_lane_due=fresh_lane_due,
+                settings=queue_policy.prev_gen_carryover,
+            )
             ticket = (
-                await issue_ticket(
+                await _issue_prev_gen_carryover_ticket(
                     session,
+                    rollout=rollout,
+                    heartbeat=heartbeat,
                     validator_hotkey=payload.validator_hotkey,
                     now=now,
-                    ttl=_TICKET_TTL,
-                    bench_version=rollout.desired_version,
-                    artifact_mode="screened_only",
+                    settings=queue_policy.prev_gen_carryover,
+                    target_inference_ready=target_inference_ready,
                     validator_running_benchmark=slot_running_benchmark,
-                    submitted_at_or_after=rollout.created_at,
-                    fifo_start_at=rollout.created_at,
-                    completion_first=True,
                     slot_id=slot_id,
                     owner_concurrent_submission_limit=(
                         queue_policy.owner_concurrent_submission_limit
@@ -2292,9 +2318,36 @@ async def request_job(
                         queue_policy.similarity_budget.concurrent_submission_limit
                     ),
                 )
-                if fresh_lane_due
+                if relaxed_carryover_due
                 else None
             )
+            if ticket is None:
+                ticket = (
+                    await issue_ticket(
+                        session,
+                        validator_hotkey=payload.validator_hotkey,
+                        now=now,
+                        ttl=_TICKET_TTL,
+                        bench_version=rollout.desired_version,
+                        artifact_mode="screened_only",
+                        validator_running_benchmark=slot_running_benchmark,
+                        submitted_at_or_after=rollout.created_at,
+                        fifo_start_at=rollout.created_at,
+                        completion_first=True,
+                        slot_id=slot_id,
+                        owner_concurrent_submission_limit=(
+                            queue_policy.owner_concurrent_submission_limit
+                        ),
+                        similarity_policy=policy_from_settings(
+                            queue_policy.similarity_budget
+                        ),
+                        similarity_concurrent_submission_limit=(
+                            queue_policy.similarity_budget.concurrent_submission_limit
+                        ),
+                    )
+                    if fresh_lane_due
+                    else None
+                )
             if ticket is None:
                 ticket = (
                     await issue_rollout_ticket(
@@ -2332,7 +2385,7 @@ async def request_job(
                         queue_policy.similarity_budget.concurrent_submission_limit
                     ),
                 )
-            if ticket is None and not fresh_lane_due:
+            if ticket is None and not fresh_lane_due and not relaxed_carryover_due:
                 ticket = await _issue_prev_gen_carryover_ticket(
                     session,
                     rollout=rollout,

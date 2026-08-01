@@ -23,11 +23,48 @@ from uuid import uuid4
 import pytest
 
 from ditto.api_models.queue_policy_settings import PrevGenCarryoverSettings
-from ditto.api_server.endpoints.validator import _issue_prev_gen_carryover_ticket
+from ditto.api_server.endpoints.validator import (
+    _issue_prev_gen_carryover_ticket,
+    _prev_gen_carryover_precedes_desired_era,
+)
 
 _NOW = datetime.now(UTC)
 _ENABLED = PrevGenCarryoverSettings(enabled=True)
 _ADOPTED = [uuid4(), uuid4()]
+
+
+@pytest.mark.parametrize(
+    ("fresh_lane_due", "settings", "expected"),
+    [
+        (
+            False,
+            PrevGenCarryoverSettings(enabled=True, require_desired_era_drained=False),
+            True,
+        ),
+        (
+            True,
+            PrevGenCarryoverSettings(enabled=True, require_desired_era_drained=False),
+            False,
+        ),
+        (False, PrevGenCarryoverSettings(enabled=True), False),
+        (
+            False,
+            PrevGenCarryoverSettings(require_desired_era_drained=False),
+            False,
+        ),
+    ],
+)
+def test_only_explicitly_relaxed_cohort_slots_interleave_carryover_first(
+    fresh_lane_due: bool,
+    settings: PrevGenCarryoverSettings,
+    expected: bool,
+) -> None:
+    assert (
+        _prev_gen_carryover_precedes_desired_era(
+            fresh_lane_due=fresh_lane_due, settings=settings
+        )
+        is expected
+    )
 
 
 def _rollout() -> MagicMock:
