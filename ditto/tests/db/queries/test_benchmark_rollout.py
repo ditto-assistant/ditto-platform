@@ -21,6 +21,7 @@ from ditto.api_models.benchmark_contract import (
     latest_benchmark_contract,
 )
 from ditto.api_models.ticket_status import TicketPurpose, TicketStatus
+from ditto.api_server.attestation import expected_netuid
 from ditto.api_server.benchmark_rollout import (
     ensure_rolling_qualification,
     refresh_rolling_qualification,
@@ -48,6 +49,7 @@ from ditto.db.models import (
     EvaluationPayment,
     InferenceProviderRoute,
     InferenceRoutingPolicy,
+    OwnerAttestation,
     Score,
     ValidatorHeartbeat,
     ValidatorLeaseAudit,
@@ -489,6 +491,94 @@ async def test_historical_rescore_cohort_fills_from_exactly_two_prior_eras(
         ]
         assert len(cohort) == 10
         assert not any("v2" in member.miner_hotkey for member in cohort)
+
+
+async def test_historical_rescore_cohort_collapses_attested_owner_family(
+    session_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """Rollout membership uses the same linked-owner roots as the ledger."""
+    now = datetime.now(UTC).replace(microsecond=0)
+    rows = [
+        ("miner-linked-high", "coldkey-linked-high", 0.99),
+        ("miner-linked-low", "coldkey-linked-low", 0.98),
+        ("miner-independent-1", "coldkey-independent-1", 0.97),
+        ("miner-independent-2", "coldkey-independent-2", 0.96),
+        ("miner-independent-3", "coldkey-independent-3", 0.95),
+        ("miner-independent-4", "coldkey-independent-4", 0.94),
+    ]
+    agent_ids: list[UUID] = []
+    async with (
+        session_maker() as session,
+        retired_era_writes_allowed(session),
+        session.begin(),
+    ):
+        for index, (hotkey, coldkey, composite) in enumerate(rows):
+            agent_id = uuid4()
+            agent_ids.append(agent_id)
+            session.add(
+                Agent(
+                    agent_id=agent_id,
+                    miner_hotkey=hotkey,
+                    name=hotkey,
+                    sha256=f"{index + 1:x}" * 64,
+                    status=AgentStatus.SCORED,
+                    screening_policy_version=9,
+                    created_at=now + timedelta(seconds=index),
+                )
+            )
+            session.add(
+                EvaluationPayment(
+                    block_hash=f"0x{agent_id.hex}",
+                    extrinsic_index=0,
+                    agent_id=agent_id,
+                    miner_hotkey=hotkey,
+                    miner_coldkey=coldkey,
+                    amount_rao=1,
+                    dest_address="destination",
+                    timestamp=now,
+                )
+            )
+            for validator in range(3):
+                session.add(
+                    Score(
+                        agent_id=agent_id,
+                        bench_version=7,
+                        validator_hotkey=f"validator-{validator}",
+                        run_id=f"run-{index}-{validator}",
+                        signature="aa",
+                        seed=index,
+                        composite=composite,
+                        tool_mean=0.5,
+                        memory_mean=0.5,
+                        median_ms=1,
+                        n=114,
+                        details={"bench_version": 7},
+                        generated_at=now,
+                    )
+                )
+        session.add(
+            OwnerAttestation(
+                netuid=expected_netuid(),
+                hotkey_lo="miner-linked-high",
+                hotkey_hi="miner-linked-low",
+                nonce=uuid4(),
+                issued_at=now,
+                lo_key_kind="hotkey",
+                lo_signer="miner-linked-high",
+                lo_signature="a" * 128,
+                hi_key_kind="hotkey",
+                hi_signer="miner-linked-low",
+                hi_signature="b" * 128,
+            )
+        )
+        await session.flush()
+
+        cohort = await historical_rescore_cohort(session, source_version=7, limit=5)
+
+        assert [member.agent_id for member in cohort] == [
+            agent_ids[0],
+            *agent_ids[2:],
+        ]
 
 
 async def test_rollout_uses_tail_when_validator_cannot_advance_priority_five(
@@ -3007,6 +3097,97 @@ async def test_activation_at_five_ranked_quorums_keeps_a_full_emission_set(
         assert {row.agent_id for row in ledger} == set(agent_ids)
         assert {row.bench_version for row in ledger} == {CANARY_BENCH_VERSION}
         assert all(row.eligible for row in ledger)
+
+
+async def test_activation_recovers_legacy_cohort_with_linked_priority_family(
+    session_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """A malformed frozen cohort can finish without weakening either gate.
+
+    Older rollout selection could put two attested-family members in the first
+    five. The priority members must still each finish a ranked quorum, while a
+    ranked independent tail member supplies the fifth emission-owner family.
+    """
+    now = datetime.now(UTC).replace(microsecond=0)
+    async with _seeded_session(
+        session_maker, lambda s: _seed_desired_quorum_cohort(s, now)
+    ) as (session, (agent_ids, rollout)):
+        tail_id = uuid4()
+        session.add(
+            Agent(
+                agent_id=tail_id,
+                miner_hotkey="miner-6",
+                name="agent-6",
+                sha256="6" * 64,
+                status=AgentStatus.SCORED,
+                screening_policy_version=9,
+                created_at=now + timedelta(seconds=6),
+            )
+        )
+        session.add(
+            BenchmarkRolloutMember(
+                rollout_id=rollout.rollout_id,
+                agent_id=tail_id,
+                position=6,
+                frozen_miner_hotkey="miner-6",
+                frozen_composite=0.94,
+            )
+        )
+        rollout.cohort_size = 6
+        for validator in range(3):
+            session.add(
+                Score(
+                    agent_id=tail_id,
+                    bench_version=CANARY_BENCH_VERSION,
+                    validator_hotkey=f"validator-{validator}",
+                    run_id=f"v4-6-{validator}",
+                    signature="bb",
+                    seed=6,
+                    composite=0.76,
+                    tool_mean=0.7,
+                    memory_mean=0.7,
+                    median_ms=1,
+                    n=114,
+                    details={"bench_version": CANARY_BENCH_VERSION},
+                    generated_at=now,
+                )
+            )
+        session.add(
+            OwnerAttestation(
+                netuid=expected_netuid(),
+                hotkey_lo="miner-1",
+                hotkey_hi="miner-2",
+                nonce=uuid4(),
+                issued_at=now,
+                lo_key_kind="hotkey",
+                lo_signer="miner-1",
+                lo_signature="a" * 128,
+                hi_key_kind="hotkey",
+                hi_signer="miner-2",
+                hi_signature="b" * 128,
+            )
+        )
+        await session.flush()
+
+        assert (
+            await count_ranked_quorum_agents(
+                session,
+                bench_version=CANARY_BENCH_VERSION,
+                agent_ids={*agent_ids, tail_id},
+            )
+            == MIN_DESIRED_AUTHORITY_AGENTS
+        )
+        state = await rollout_state(session, now=now)
+        assert state["priority_complete"] is True
+        assert state["ranked_quorum_agents"] == MIN_DESIRED_AUTHORITY_AGENTS
+        assert await active_bench_version(session) == CANARY_BENCH_VERSION
+        assert await maybe_activate_rollout(
+            session,
+            rollout,
+            now=now,
+            inference_requirements=_activation_requirements(),
+        )
+        assert rollout.status == "activated"
 
 
 @pytest.mark.parametrize(
