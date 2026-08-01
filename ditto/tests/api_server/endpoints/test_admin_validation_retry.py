@@ -496,17 +496,17 @@ async def test_manual_grant_allows_exactly_one_more_same_version_issue(
     assert ticket.manual_retry_grants == 1
 
 
-async def test_final_operator_grant_remains_retryable_with_exhausted_sibling(
+async def test_many_operator_grants_do_not_block_fresh_audited_recovery(
     app: FastAPI,
     client: httpx.AsyncClient,
     retry_maker: async_sessionmaker[AsyncSession],
 ) -> None:
-    """A spent recovery cap cannot erase budget the final grant just restored."""
+    """Audit history never becomes a lifetime ban on guarded recovery."""
     agent_id = await _seed(retry_maker, score_count=2)
     await _seed_online_heartbeat(retry_maker, hotkey="validator-2")
     _install(app, retry_maker)
     async with retry_maker() as session, session.begin():
-        for index in range(3):
+        for index in range(20):
             session.add(
                 ValidatorRetryRecovery(
                     recovery_id=uuid4(),
@@ -518,7 +518,7 @@ async def test_final_operator_grant_remains_retryable_with_exhausted_sibling(
                     bench_version=_BENCH_VERSION,
                     ticket_snapshot=[],
                     granted_validator_hotkeys=["validator-2"],
-                    created_at=_T0 - timedelta(days=3 - index),
+                    created_at=_T0 - timedelta(days=20 - index),
                 )
             )
 
@@ -534,7 +534,7 @@ async def test_final_operator_grant_remains_retryable_with_exhausted_sibling(
         json={
             "request_id": str(uuid4()),
             "expected_snapshot": detail.json()["snapshot"],
-            "reason": "Final verified validator infrastructure recovery",
+            "reason": "Fresh verified validator infrastructure recovery",
         },
     )
     assert granted.status_code == 200, granted.text
@@ -544,6 +544,7 @@ async def test_final_operator_grant_remains_retryable_with_exhausted_sibling(
         f"/api/v1/admin/validation-retries/{agent_id}", headers=_HEADERS
     )
     assert after.status_code == 200, after.text
+    assert len(after.json()["recoveries"]) == 21
     assert after.json()["automatic_retry_available"] is True
     assert after.json()["recovery_allowed"] is False
     assert after.json()["blocking_reason"] == (
@@ -685,7 +686,7 @@ async def test_withdraw_fails_closed_when_snapshot_moves_or_ticket_is_active(
     assert denied.status_code == 409
 
 
-async def test_withdraw_remains_available_after_operator_retry_limit(
+async def test_withdraw_remains_available_after_many_operator_recoveries(
     app: FastAPI,
     client: httpx.AsyncClient,
     retry_maker: async_sessionmaker[AsyncSession],
@@ -712,7 +713,7 @@ async def test_withdraw_remains_available_after_operator_retry_limit(
         f"/api/v1/admin/validation-retries/{agent_id}", headers=_HEADERS
     )
     assert detail.status_code == 200
-    assert detail.json()["recovery_allowed"] is False
+    assert detail.json()["recovery_allowed"] is True
     assert detail.json()["withdrawal_allowed"] is True
 
 
@@ -1630,10 +1631,9 @@ async def test_reinstatement_cannot_launder_the_retry_budget(
     raise the attempt cap on the artifact it just evicted. If reinstatement gave
     that cap back, the pair would be an attempt printer: evict, reinstate,
     collect, repeat — free leases past ``MAX_AGENT_INFRA_RETRY_GRANTS`` (12 per
-    agent per era, #522) and a reset of ``MAX_OPERATOR_RECOVERIES_PER_AGENT``,
-    rebuilding the amplifier that took ``mnemox-v55`` to nine attempts against a
-    base budget of two. So the cycle is run three times and every counter is
-    asserted unchanged across all of it.
+    agent per era, #522), rebuilding the amplifier that took ``mnemox-v55`` to
+    nine attempts against a base budget of two. So the cycle is run three times
+    and every counter is asserted unchanged across all of it.
     """
     agent_id = await _seed(retry_maker, ticket_count=0)
     await _seed_live_lease(retry_maker, agent_id)
@@ -1698,7 +1698,7 @@ async def test_reinstatement_cannot_launder_the_retry_budget(
         assert recorded["max_agent_infra_retry_grants"] == 12
         assert recorded["manual_retry_grants"] == before[2]
         assert recorded["operator_recoveries"] == before[3]
-        assert recorded["max_operator_recoveries"] == 4
+        assert recorded["max_operator_recoveries"] is None
         assert await _budget() == before
         # Each cycle needs its own live lease to evict; the reinstated one is
         # expired, and re-leasing it is the validator's job, not the operator's.
