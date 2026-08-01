@@ -3114,6 +3114,9 @@
     var pipelineShowStuck = false;
     var pipelineLoaded = false;
     var pipelineUnavailable = false;
+    var operationsRequest = null;
+    var operationsRefreshFailed = false;
+    var operationsSnapshotAt = null;
     var activityUnavailable = false;
     var athReviewCache = null;
     var athReviewLoading = false;
@@ -9497,8 +9500,14 @@
     }
 
     function loadOperations() {
-      getJSON("/public/operations")
+      // The page-level 30 s refresh and the operations-only 5 s poll can land
+      // together. Share one request so a slower duplicate cannot fail after a
+      // successful response and replace the live board with an error state.
+      if (operationsRequest) return operationsRequest;
+      operationsRequest = getJSON("/public/operations")
         .then(function (data) {
+          operationsRefreshFailed = false;
+          operationsSnapshotAt = data.generated_at || null;
           if (data.active_bench_version) currentBench = data.active_bench_version;
           if (data.active_bench_version) activeBench = data.active_bench_version;
           desiredBench = data.desired_bench_version || currentBench;
@@ -9517,13 +9526,28 @@
             "Pipeline and fleet reconciled" + visibleHistory + " · " + relTime(data.generated_at);
         })
         .catch(function () {
+          operationsRefreshFailed = true;
+          // A refresh failure does not invalidate the last reconciled snapshot.
+          // Keep it visible while the next poll retries; only a cold start has
+          // no trustworthy data and should render the unavailable placeholders.
+          if (pipelineLoaded && !pipelineUnavailable &&
+              fleetReports.validators !== null && !fleetUnavailable.validators) {
+            document.getElementById("operations-snapshot").textContent =
+              "Refresh delayed · showing last reconciled snapshot" +
+              (operationsSnapshotAt ? " · " + relTime(operationsSnapshotAt) : "");
+            return;
+          }
           fleetUnavailable.validators = true;
           document.getElementById("h-validators").textContent = "–";
           renderPipelineBoard(null, true);
           renderFleet();
           document.getElementById("operations-snapshot").textContent =
             "Shared operations snapshot unavailable";
+        })
+        .then(function () {
+          operationsRequest = null;
         });
+      return operationsRequest;
     }
 
     function loadValidatorNames() {
@@ -9730,7 +9754,7 @@
       // even when its page is inactive, so a failed boot seed keeps retrying
       // each tick until the search corpus is complete.
       var wantOps = all || page === "operations" ||
-        !pipelineLoaded || pipelineUnavailable ||
+        !pipelineLoaded || pipelineUnavailable || operationsRefreshFailed ||
         fleetUnavailable.validators || fleetUnavailable.screeners ||
         (entity && (entity.kind === "validators" || entity.kind === "screeners"));
       var wantActivity = all || page === "submissions" || activityUnavailable ||
