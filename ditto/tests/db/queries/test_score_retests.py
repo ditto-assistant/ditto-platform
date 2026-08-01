@@ -1,11 +1,11 @@
 """What a score submission is allowed to lock on its way out.
 
-``activate_next_score_retest`` runs at the tail of every ``submit_score``
-transaction, long after that transaction has taken the agent row and its own
-ticket row. Until this test existed it *always* finished by taking two more
-locks -- an advisory lock keyed on the validator hotkey, then a validator-wide
-``SELECT ... FOR UPDATE`` over every issued ticket that hotkey holds -- whether
-or not the validator had ever had a re-test to promote.
+``activate_next_score_retest`` used to run at the tail of every ``submit_score``
+transaction, long after that transaction had taken the agent row and its own
+ticket row. It now belongs only to job issuance and explicit admin queue actions,
+where its validator-wide serialization is the primary lock order. These query-
+level tests retain the narrower guarantee that callers with no re-test lifecycle
+also return before touching either lock.
 
 That is a lock-order inversion, and it is not theoretical. Ticket issuance
 guards a narrower key (``validator:slot``), so the two paths do not exclude each
