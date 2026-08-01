@@ -1248,10 +1248,59 @@ def _public_screening_reason(detail: str, reason_code: str | None = None) -> str
             "Rust source under src/."
         )
     normalized = detail.strip().casefold()
+    if reason_code == "docker-build-infrastructure":
+        return (
+            "Docker build infrastructure failed before screening completed. This "
+            "is an operator-owned, retryable failure."
+        )
+    if reason_code == "docker-build" or normalized.startswith("build failed"):
+        if (
+            "couldn't read" in normalized or "could not read" in normalized
+        ) and "no such file or directory" in normalized:
+            return (
+                "Docker image build failed: source code referenced by the build is "
+                "missing from the submitted archive."
+            )
+        if "failed to calculate checksum" in normalized and "not found" in normalized:
+            return (
+                "Docker image build failed: Dockerfile COPY references a path that "
+                "is missing from the submitted archive."
+            )
+        if any(
+            marker in normalized
+            for marker in (
+                "dockerfile parse error",
+                "failed to parse dockerfile",
+                "unknown instruction",
+            )
+        ):
+            return "Docker image build failed: Dockerfile syntax is invalid."
+        if any(
+            marker in normalized
+            for marker in (
+                "pull access denied",
+                "manifest unknown",
+                "no match for platform in manifest",
+            )
+        ):
+            return (
+                "Docker image build failed: a base image is unavailable, private, "
+                "or incompatible with the screener platform."
+            )
+        if any(
+            marker in normalized
+            for marker in (
+                "could not compile",
+                "compilation terminated",
+                "error: aborting due to",
+            )
+        ):
+            return "Docker image build failed while compiling the submitted source."
+        if "failed to solve: process" in normalized:
+            return "Docker image build failed because a Dockerfile command exited."
+        return "Docker image build failed"
     if "no dockerfile at tarball root" in normalized:
         return "Dockerfile missing from archive root"
-    if normalized.startswith("build failed"):
-        return "Docker image build failed"
     if normalized.startswith("serve check failed"):
         return "Container failed the health check"
     if "tarball exceeds" in normalized:

@@ -151,6 +151,42 @@ def test_unknown_container_contract_detail_stays_public_safe() -> None:
     assert "SECRET_FROM_UNTRUSTED_DETAIL" not in reason
 
 
+@pytest.mark.parametrize(
+    ("detail", "reason_code", "expected"),
+    [
+        (
+            "build failed: error: couldn't read `src/private-name.rs`: No such "
+            "file or directory (os error 2)\nSECRET_FROM_BUILD",
+            "docker-build",
+            "Docker image build failed: source code referenced by the build is "
+            "missing from the submitted archive.",
+        ),
+        (
+            "build failed: failed to calculate checksum: /private-name: not found",
+            "docker-build",
+            "Docker image build failed: Dockerfile COPY references a path that is "
+            "missing from the submitted archive.",
+        ),
+        (
+            "screener error: Docker build infrastructure: failed to Lchown "
+            "Dockerfile for UID 197108",
+            "docker-build-infrastructure",
+            "Docker build infrastructure failed before screening completed. This "
+            "is an operator-owned, retryable failure.",
+        ),
+    ],
+)
+def test_public_docker_build_reason_is_actionable_and_redacted(
+    detail: str, reason_code: str, expected: str
+) -> None:
+    reason = _public_screening_reason(detail, reason_code)
+
+    assert reason == expected
+    assert "private-name" not in reason
+    assert "SECRET_FROM_BUILD" not in reason
+    assert "197108" not in reason
+
+
 def _result_payload(
     agent_id: UUID,
     *,
