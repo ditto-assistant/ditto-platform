@@ -718,7 +718,12 @@ async def _apply_recovery(
 
     ticket_snapshot = [_ticket_wire(ticket) for ticket in tickets]
     for ticket in selected:
-        ticket.manual_retry_grants += 1
+        # Old retry loops could advance attempt_count far beyond the cap before
+        # issuance started enforcing it. Preserve that history, but raise the
+        # cap by the minimum amount that restores exactly one future lease.
+        ticket.manual_retry_grants += (
+            ticket.attempt_count - ticket_attempt_cap(ticket) + 1
+        )
         ticket.retry_after = now
     recovery = ValidatorRetryRecovery(
         recovery_id=request_id,
