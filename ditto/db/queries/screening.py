@@ -25,6 +25,11 @@ from ditto.db.models import (
     ScreeningAttempt,
     ScreeningQuarantine,
 )
+from ditto.db.queries.benchmark_admission import (
+    activated_rollout_for_version,
+    benchmark_admission_predicate,
+    validator_queue_admission_predicate,
+)
 from ditto.db.queries.benchmark_rollout import active_bench_version, open_rollout
 from ditto.db.queries.scores import SCORING_QUORUM
 
@@ -147,16 +152,27 @@ def screening_priority_order() -> tuple[ColumnElement[Any], ...]:
     )
 
 
-async def missing_required_benchmark_dataset(
+async def prerequisite_screening_predicates(
     session: AsyncSession,
-) -> ColumnElement[bool]:
-    """Whether the agent lacks the dataset its next score would consume.
+) -> tuple[ColumnElement[bool], ColumnElement[bool]]:
+    """Return missing-prerequisite and validator-admission predicates.
 
     Effective benchmark authority can move to an open rollout's desired version
     before that rollout's durable row becomes ``activated``. New submissions
     created during an open rollout also enter its desired version immediately,
     even before the authority guard flips. Mirror those two rules here instead
     of treating the most recent literal ``activated`` row as current authority.
+
+    Current-policy ``EVALUATING`` agents only return to screening to rebuild a
+    missing benchmark dataset or screened image. Apply the same benchmark-era
+    admission boundary as the validator allocator before spending screener
+    capacity on that rebuild. In particular, merely generating a newer dataset
+    must never self-admit a historical submission.
+
+    While a rollout is open, the persisted version and desired version can both
+    accept work: existing agents remain on the former while new arrivals and
+    explicit rollout admissions enter the latter. Once effective authority has
+    flipped to the desired version, only that rollout's boundary remains valid.
     """
     effective_version = await active_bench_version(session)
     rollout = await open_rollout(session)
@@ -177,7 +193,60 @@ async def missing_required_benchmark_dataset(
             BenchmarkDataset.bench_version == required_version,
         )
     )
-    return activation_exists & ~versioned_dataset_exists
+    missing_dataset = activation_exists & ~versioned_dataset_exists
+
+    def admitted_for(
+        *, bench_version: int, authority: BenchmarkRollout | None
+    ) -> ColumnElement[bool]:
+        admitted = validator_queue_admission_predicate(bench_version=bench_version)
+        if authority is not None:
+            admitted &= benchmark_admission_predicate(
+                rollout=authority,
+                bench_version=bench_version,
+            )
+        return admitted
+
+    if rollout is not None and effective_version == rollout.desired_version:
+        return (
+            missing_dataset,
+            admitted_for(
+                bench_version=rollout.desired_version,
+                authority=rollout,
+            ),
+        )
+
+    active_rollout = await activated_rollout_for_version(
+        session,
+        bench_version=effective_version,
+    )
+    active_admission = admitted_for(
+        bench_version=effective_version,
+        authority=active_rollout,
+    )
+    if rollout is None:
+        return missing_dataset, active_admission
+    return (
+        missing_dataset,
+        or_(
+            and_(
+                Agent.created_at >= rollout.created_at,
+                admitted_for(
+                    bench_version=rollout.desired_version,
+                    authority=rollout,
+                ),
+            ),
+            and_(
+                Agent.created_at < rollout.created_at,
+                or_(
+                    active_admission,
+                    admitted_for(
+                        bench_version=rollout.desired_version,
+                        authority=rollout,
+                    ),
+                ),
+            ),
+        ),
+    )
 
 
 def missing_active_screened_image() -> ColumnElement[bool]:
@@ -376,7 +445,9 @@ async def claim_screening_attempts(
         | Agent.screened_image_upload_id.is_(None)
         | Agent.screened_image_verified_at.is_(None)
     )
-    missing_dataset = await missing_required_benchmark_dataset(session)
+    missing_dataset, prerequisite_admitted = await prerequisite_screening_predicates(
+        session
+    )
     eligible = or_(
         Agent.status == AgentStatus.UPLOADED,
         Agent.status == AgentStatus.SCREENING_FAILED,
@@ -389,11 +460,19 @@ async def claim_screening_attempts(
             & rolling_qualified
             & missing_v3_screen
         ),
-        ((Agent.status == AgentStatus.EVALUATING) & missing_dataset),
+        (
+            (Agent.status == AgentStatus.EVALUATING)
+            & prerequisite_admitted
+            & missing_dataset
+        ),
         # A submission released from an anti-cheat quarantine back to EVALUATING
         # but without a complete screened image the active version needs is
         # otherwise stuck forever — validators skip it and nothing re-screens it.
-        ((Agent.status == AgentStatus.EVALUATING) & missing_active_screened_image()),
+        (
+            (Agent.status == AgentStatus.EVALUATING)
+            & prerequisite_admitted
+            & missing_active_screened_image()
+        ),
     )
     candidate_payment = aliased(EvaluationPayment)
     earlier = aliased(Agent)

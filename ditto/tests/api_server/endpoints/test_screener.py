@@ -71,6 +71,7 @@ from ditto.db.models import (
     ArtifactReleaseSettingsRevision,
     BenchmarkDataset,
     BenchmarkRollout,
+    BenchmarkRolloutMember,
     EvaluationPayment,
     Score,
     ScoreAuditEntry,
@@ -1086,6 +1087,40 @@ class TestHeartbeat:
 
 
 class TestQueue:
+    async def test_excludes_historical_agent_without_current_era_admission(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        now = datetime.now(UTC)
+        agent_id = await _seed_agent(
+            session_maker,
+            status=AgentStatus.EVALUATING,
+            name="historical-unadmitted",
+            created_at=now - timedelta(hours=2),
+        )
+        async with session_maker() as session, session.begin():
+            session.add(
+                BenchmarkRollout(
+                    rollout_id=uuid4(),
+                    from_version=_TARGET_VERSION - 1,
+                    desired_version=_TARGET_VERSION,
+                    status="activated",
+                    cohort_size=5,
+                    created_at=now - timedelta(hours=1),
+                    activated_at=now,
+                )
+            )
+        _install_db(app, session_maker)
+
+        response = await client.get("/api/v1/screener/queue")
+
+        assert response.status_code == 200, response.text
+        assert agent_id not in {
+            UUID(item["agent_id"]) for item in response.json()["items"]
+        }
+
     async def test_lists_only_uploaded_oldest_first(
         self,
         app: FastAPI,
@@ -2232,6 +2267,7 @@ class TestQuarantineAdmin:
         )
         agent_id = await _seed_agent(session_maker, status=AgentStatus.UPLOADED)
         now = datetime.now(UTC)
+        rollout_id = uuid4()
         async with session_maker() as session, session.begin():
             agent = await session.get(Agent, agent_id)
             assert agent is not None
@@ -2253,13 +2289,22 @@ class TestQuarantineAdmin:
             )
             session.add(
                 BenchmarkRollout(
-                    rollout_id=uuid4(),
+                    rollout_id=rollout_id,
                     from_version=_SOURCE_VERSION,
                     desired_version=_TARGET_VERSION,
                     status="activated",
                     cohort_size=5,
                     created_at=now,
                     activated_at=now,
+                )
+            )
+            session.add(
+                BenchmarkRolloutMember(
+                    rollout_id=rollout_id,
+                    agent_id=agent_id,
+                    position=1,
+                    frozen_miner_hotkey=agent.miner_hotkey,
+                    frozen_composite=0.9,
                 )
             )
         _install_db(app, session_maker)
@@ -2822,6 +2867,7 @@ class TestQuarantineAdmin:
             screening_policy_version=SCREENING_POLICY_VERSION,
         )
         now = datetime.now(UTC)
+        rollout_id = uuid4()
         attempt_id = uuid4()
         image_upload_id = uuid5(
             NAMESPACE_URL, f"{agent_id}:{attempt_id}:stale-screened-image"
@@ -2830,13 +2876,22 @@ class TestQuarantineAdmin:
         async with session_maker() as session, session.begin():
             session.add(
                 BenchmarkRollout(
-                    rollout_id=uuid4(),
+                    rollout_id=rollout_id,
                     from_version=_SOURCE_VERSION,
                     desired_version=_TARGET_VERSION,
                     status="activated",
                     cohort_size=5,
                     created_at=now,
                     activated_at=now,
+                )
+            )
+            session.add(
+                BenchmarkRolloutMember(
+                    rollout_id=rollout_id,
+                    agent_id=agent_id,
+                    position=1,
+                    frozen_miner_hotkey=_MINER_HOTKEY,
+                    frozen_composite=0.9,
                 )
             )
             session.add(
@@ -4382,6 +4437,7 @@ class TestSubmitResult:
             screening_policy_version=9,
         )
         now = datetime.now(UTC)
+        rollout_id = uuid4()
         async with session_maker() as session, session.begin():
             agent = await session.get(Agent, agent_id)
             assert agent is not None
@@ -4403,13 +4459,22 @@ class TestSubmitResult:
             )
             session.add(
                 BenchmarkRollout(
-                    rollout_id=uuid4(),
+                    rollout_id=rollout_id,
                     from_version=_SOURCE_VERSION,
                     desired_version=_TARGET_VERSION,
                     status="activated",
                     cohort_size=5,
                     created_at=now,
                     activated_at=now,
+                )
+            )
+            session.add(
+                BenchmarkRolloutMember(
+                    rollout_id=rollout_id,
+                    agent_id=agent_id,
+                    position=1,
+                    frozen_miner_hotkey=agent.miner_hotkey,
+                    frozen_composite=0.9,
                 )
             )
         _install_db(app, session_maker)
