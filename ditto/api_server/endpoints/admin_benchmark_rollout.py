@@ -19,6 +19,7 @@ from ditto.api_models.benchmark_contract import (
 )
 from ditto.api_models.validator_capabilities import ValidatorCapabilities
 from ditto.api_server.benchmark_rollout import (
+    expand_rolling_qualification,
     inference_activation_requirements,
     qualification_candidate,
     refresh_rolling_qualification,
@@ -89,6 +90,16 @@ class AdminRolloutStartRequest(BaseModel):
     actor: _Actor = "admin_api"
     confirmation: str
     expected_active_version: int
+
+
+class AdminRolloutExpandRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    reason: _Reason
+    actor: _Actor = "admin_api"
+    confirmation: str
+    expected_active_version: int
+    expected_current_target: int
+    new_target: int
 
 
 class AdminActiveContractRequest(BaseModel):
@@ -390,6 +401,48 @@ async def supersede_rollout(
         )
     await session.commit()
     return await rollout_state(session, capability_version=target)
+
+
+@router.post("/{desired_version}/expand")
+async def expand_rollout(
+    _: AdminDep,
+    session: SessionDep,
+    generator: GeneratorDep,
+    desired_version: str,
+    payload: AdminRolloutExpandRequest,
+) -> dict[str, object]:
+    """Explicitly append a larger ordered suffix to one open rollout."""
+    target = _parse_desired_version(desired_version)
+    expected_confirmation = f"EXPAND BENCHMARK V{target} TO {payload.new_target}"
+    if payload.confirmation != expected_confirmation:
+        raise HTTPException(
+            status_code=409,
+            detail=f'type "{expected_confirmation}" exactly to confirm this operation',
+        )
+    try:
+        result = await expand_rolling_qualification(
+            session,
+            generator=generator,
+            now=datetime.now(UTC),
+            desired_version=target,
+            expected_active_version=payload.expected_active_version,
+            expected_current_target=payload.expected_current_target,
+            new_target=payload.new_target,
+            actor=payload.actor,
+            reason=payload.reason,
+        )
+    except DataPipelineError as exc:
+        raise _generator_unavailable(target, exc) from exc
+    except RolloutConflictError as exc:
+        await session.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    state = await rollout_state(session, capability_version=target)
+    state["expansion"] = {
+        "previous_target": result.previous_target,
+        "new_target": result.new_target,
+        "appended_members": result.appended_members,
+    }
+    return state
 
 
 @router.post("/{desired_version}/select-active")
