@@ -6937,7 +6937,19 @@
     }
 
     function benchmarkProgressText(progress) {
-      if (!progress || !progress.stage) return "Benchmark progress not reported";
+      if (!progress || !progress.stage) {
+        // Ticket issuance and the validator's first signed slot heartbeat are
+        // separate writes. During the platform's one-minute assignment handoff
+        // grace this is an expected transition, not missing telemetry. Keep the
+        // stronger warning for a lease that remains silent past that window.
+        var started = progress && progress.started_at
+          ? new Date(progress.started_at).getTime()
+          : NaN;
+        if (Number.isFinite(started) && Date.now() - started < 60000) {
+          return "Starting benchmark · awaiting first progress";
+        }
+        return "Benchmark progress not reported";
+      }
       if (progress.stage === "failed_retrying") return "Failed · a new attempt will start shortly";
       if (progress.stalled) {
         // Say what the run has actually done, not just how long it has been
@@ -9880,11 +9892,11 @@
       load(false);
     }, REFRESH_MS);
     // The fleet page is the live one: benchmarks now move through their stages in
-    // seconds, so poll just the shared operations snapshot on a tighter cadence
+    // seconds, so poll just the shared operations snapshot on the same cadence
     // (the endpoint's cache is short enough to return fresh data) while a viewer
     // is actually on that page. Every OPS_REFRESH_MS also coincides with a
     // REFRESH_MS tick, which harmlessly refetches the same cached snapshot.
-    var OPS_REFRESH_MS = 8000;
+    var OPS_REFRESH_MS = 5000;
     setInterval(function () {
       if (document.hidden) return;
       if (currentPageName() === "operations") loadOperations();
