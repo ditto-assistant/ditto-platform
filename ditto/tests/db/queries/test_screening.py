@@ -19,6 +19,7 @@ from ditto.db.models import (
     AgentStatus,
     BenchmarkDataset,
     BenchmarkRollout,
+    BenchmarkRolloutMember,
     ScreeningAttempt,
     ScreeningQuarantine,
 )
@@ -734,6 +735,96 @@ def _complete_screened_image(agent: Agent) -> None:
     agent.screened_image_ref = "registry/agent:screened"
     agent.screened_image_upload_id = uuid4()
     agent.screened_image_verified_at = datetime.now(UTC)
+
+
+async def test_historical_unadmitted_agent_is_not_reclaimed_for_prerequisites(
+    session: AsyncSession,
+) -> None:
+    """A rebuild that cannot lead to a validator lease must not consume a screen."""
+    now = datetime.now(UTC)
+    agent = Agent(
+        agent_id=uuid4(),
+        miner_hotkey="5HK-historical-unadmitted",
+        name="historical-unadmitted",
+        sha256=uuid4().hex * 2,
+        status=AgentStatus.EVALUATING,
+        created_at=now - timedelta(hours=2),
+    )
+    agent.screening_policy_version = SCREENING_POLICY_VERSION
+    _complete_screened_image(agent)
+    async with session.begin():
+        session.add(agent)
+        session.add(
+            BenchmarkRollout(
+                rollout_id=uuid4(),
+                from_version=_ACTIVE_VERSION - 1,
+                desired_version=_ACTIVE_VERSION,
+                status="activated",
+                cohort_size=5,
+                created_at=now - timedelta(hours=1),
+                activated_at=now,
+            )
+        )
+
+    claimed = await _claim(session)
+
+    assert agent.agent_id not in {
+        claimed_agent.agent_id for claimed_agent, _, _ in claimed
+    }
+    refreshed = await session.get(Agent, agent.agent_id)
+    assert refreshed is not None and refreshed.status == AgentStatus.EVALUATING
+
+
+async def test_historical_rollout_member_is_reclaimed_for_prerequisites(
+    session: AsyncSession,
+) -> None:
+    """Frozen rollout admission still authorizes a missing-dataset rebuild."""
+    now = datetime.now(UTC)
+    rollout_id = uuid4()
+    agent = Agent(
+        agent_id=uuid4(),
+        miner_hotkey="5HK-historical-member",
+        name="historical-member",
+        sha256=uuid4().hex * 2,
+        status=AgentStatus.EVALUATING,
+        created_at=now - timedelta(hours=2),
+    )
+    agent.screening_policy_version = SCREENING_POLICY_VERSION
+    _complete_screened_image(agent)
+    async with session.begin():
+        session.add(agent)
+        session.add(
+            BenchmarkRollout(
+                rollout_id=rollout_id,
+                from_version=_ACTIVE_VERSION - 1,
+                desired_version=_ACTIVE_VERSION,
+                status="activated",
+                cohort_size=10,
+                created_at=now - timedelta(hours=1),
+                activated_at=now,
+            )
+        )
+        session.add(
+            BenchmarkRolloutMember(
+                rollout_id=rollout_id,
+                agent_id=agent.agent_id,
+                position=1,
+                frozen_miner_hotkey=agent.miner_hotkey,
+                frozen_composite=0.9,
+            )
+        )
+
+    claimed = await _claim(session)
+
+    attempt = next(
+        (
+            attempt
+            for claimed_agent, attempt, _ in claimed
+            if claimed_agent.agent_id == agent.agent_id
+        ),
+        None,
+    )
+    assert attempt is not None and attempt.build_only is True
 
 
 async def test_evaluating_agent_missing_screened_image_is_reclaimed(
