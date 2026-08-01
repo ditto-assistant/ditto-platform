@@ -1370,7 +1370,11 @@ async def issue_rollout_ticket(
     # Retained as a keyword-compatible parameter for mixed platform callers;
     # the version contract, not an operator-wide routing flag, governs this.
     _ = artifact_mode
-    from ditto.db.queries.tickets import expire_overdue_tickets
+    from ditto.db.queries.tickets import (
+        expire_overdue_tickets,
+        retry_budget_spent,
+        ticket_attempt_cap,
+    )
 
     rollout = await open_rollout(session, for_update=True)
     if rollout is None:
@@ -1459,7 +1463,13 @@ async def issue_rollout_ticket(
             ValidatorTicket.agent_id == BenchmarkRolloutMember.agent_id,
             ValidatorTicket.bench_version == rollout.desired_version,
             ValidatorTicket.validator_hotkey == validator_hotkey,
-            ValidatorTicket.status.in_((TicketStatus.ISSUED, TicketStatus.SCORED)),
+            (
+                ValidatorTicket.status.in_((TicketStatus.ISSUED, TicketStatus.SCORED))
+                | (
+                    (ValidatorTicket.status == TicketStatus.EXPIRED)
+                    & ((ValidatorTicket.retry_after > now) | retry_budget_spent())
+                )
+            ),
         )
         .exists()
     )
@@ -1545,9 +1555,14 @@ async def issue_rollout_ticket(
             requested_bench_version=rollout.desired_version,
         ):
             return None
-    ticket = await session.get(
-        ValidatorTicket,
-        (member.agent_id, rollout.desired_version, validator_hotkey),
+    ticket = await session.scalar(
+        select(ValidatorTicket)
+        .where(
+            ValidatorTicket.agent_id == member.agent_id,
+            ValidatorTicket.bench_version == rollout.desired_version,
+            ValidatorTicket.validator_hotkey == validator_hotkey,
+        )
+        .with_for_update()
     )
     if ticket is None:
         ticket = ValidatorTicket(
@@ -1565,6 +1580,19 @@ async def issue_rollout_ticket(
         )
         session.add(ticket)
     else:
+        retry_after = ticket.retry_after
+        if retry_after is not None and retry_after.tzinfo is None:
+            retry_after = retry_after.replace(tzinfo=UTC)
+        # The candidate predicate above is the fast path, but fail_job can
+        # mutate the ticket between that read and this row lock. Re-check the
+        # bounded retry contract under the lock so a rollout lease cannot skip
+        # its cooldown or mint attempts past its cap during that race.
+        if (
+            ticket.status != TicketStatus.EXPIRED
+            or (retry_after is not None and retry_after > now)
+            or ticket.attempt_count >= ticket_attempt_cap(ticket)
+        ):
+            return None
         ticket.status = TicketStatus.ISSUED
         ticket.purpose = TicketPurpose.CANONICAL_QUORUM
         ticket.purpose_revision += 1

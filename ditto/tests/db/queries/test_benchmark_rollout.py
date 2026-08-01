@@ -1130,6 +1130,61 @@ async def test_rollout_screened_only_skips_and_releases_source_only_work(
         assert running.status == TicketStatus.ISSUED
 
 
+async def test_rollout_ticket_respects_retry_cooldown_and_attempt_cap(
+    session_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    now = datetime.now(UTC).replace(microsecond=0)
+    async with _inherited_era_session(session_maker, now) as (
+        session,
+        agent_ids,
+        _rollout,
+    ):
+        exhausted = await issue_rollout_ticket(
+            session,
+            validator_hotkey="validator-a",
+            now=now,
+            ttl=timedelta(minutes=90),
+        )
+        assert exhausted is not None and exhausted.agent_id == agent_ids[0]
+        exhausted.status = TicketStatus.EXPIRED
+        exhausted.deadline = now
+        exhausted.retry_after = now
+        exhausted.attempt_count = 2
+
+        cooling = await issue_rollout_ticket(
+            session,
+            validator_hotkey="validator-a",
+            now=now,
+            ttl=timedelta(minutes=90),
+        )
+        assert cooling is not None and cooling.agent_id == agent_ids[1]
+        cooling.status = TicketStatus.EXPIRED
+        cooling.deadline = now
+        cooling.retry_after = now + timedelta(minutes=10)
+
+        replacement = await issue_rollout_ticket(
+            session,
+            validator_hotkey="validator-a",
+            now=now,
+            ttl=timedelta(minutes=90),
+        )
+        assert replacement is not None and replacement.agent_id == agent_ids[2]
+
+        # An audited grant makes the first ticket eligible again; the rollout
+        # lane must use the same cap arithmetic as ordinary ticket issuance.
+        exhausted.manual_retry_grants = 1
+        granted = await issue_rollout_ticket(
+            session,
+            validator_hotkey="validator-a",
+            now=now,
+            ttl=timedelta(minutes=90),
+            slot_id="slot-1",
+        )
+        assert granted is exhausted
+        assert granted.status == TicketStatus.ISSUED
+        assert granted.attempt_count == 3
+
+
 async def test_rollout_preempts_idle_source_lease_only_when_target_work_exists(
     session_maker: async_sessionmaker[AsyncSession],
 ) -> None:
