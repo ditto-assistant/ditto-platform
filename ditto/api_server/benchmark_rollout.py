@@ -36,7 +36,10 @@ from ditto.db.queries.benchmark_rollout import (
     PRIORITY_COHORT_SIZE,
     DatasetPin,
     InferenceActivationRequirements,
+    RolloutConflictError,
     RolloutSnapshotMember,
+    active_bench_version,
+    append_rollout_audit,
     append_rollout_member,
     historical_rescore_cohort,
     maybe_activate_rollout,
@@ -101,8 +104,18 @@ class PendingCarryover:
     qualification: PendingQualification
 
 
+@dataclass(frozen=True)
+class RolloutExpansionResult:
+    previous_target: int
+    new_target: int
+    appended_members: int
+
+
 async def _rollout_rescore_cohort(
-    session: AsyncSession, *, rollout: BenchmarkRollout
+    session: AsyncSession,
+    *,
+    rollout: BenchmarkRollout,
+    target_override: int | None = None,
 ) -> list[RolloutSnapshotMember]:
     """Preserve already-frozen members, then fill the rollout to ITS OWN target.
 
@@ -136,7 +149,9 @@ async def _rollout_rescore_cohort(
     )
     if len(existing) > MAX_PERSISTED_RESCORE_COHORT_SIZE:
         raise RuntimeError("existing benchmark rollout exceeds the top-25 bound")
-    target = rollout.rescore_cohort_target
+    target = (
+        rollout.rescore_cohort_target if target_override is None else target_override
+    )
     if not PRIORITY_COHORT_SIZE <= target <= MAX_PERSISTED_RESCORE_COHORT_SIZE:
         # A CHECK constraint already guarantees this; fail loudly rather than
         # silently rescoring an unbounded cohort if a row is ever hand-edited.
@@ -167,6 +182,198 @@ async def _rollout_rescore_cohort(
         if len(cohort) == target:
             break
     return cohort
+
+
+async def expand_rolling_qualification(
+    session: AsyncSession,
+    *,
+    generator: DatasetGenerator,
+    now: datetime,
+    desired_version: int,
+    expected_active_version: int,
+    expected_current_target: int,
+    new_target: int,
+    actor: str,
+    reason: str,
+) -> RolloutExpansionResult:
+    """Explicitly expand one open rollout after rendering every new dataset.
+
+    Unlike changing the queue-policy default, this action names and guards the
+    already-open rollout. Dataset generation happens before the rollout row is
+    changed; the second transaction rechecks every input and either appends the
+    full ordered suffix or rolls back without moving the target.
+    """
+    if not PRIORITY_COHORT_SIZE <= expected_current_target < new_target:
+        raise RolloutConflictError(
+            "rollout expansion must increase the current target within the "
+            f"top-{MAX_PERSISTED_RESCORE_COHORT_SIZE} bound"
+        )
+    if new_target > MAX_PERSISTED_RESCORE_COHORT_SIZE:
+        raise RolloutConflictError(
+            f"rollout expansion target {new_target} exceeds "
+            f"{MAX_PERSISTED_RESCORE_COHORT_SIZE}"
+        )
+
+    pending: list[PendingQualification] = []
+    async with session.begin():
+        active_version = await active_bench_version(session)
+        if active_version != expected_active_version:
+            raise RolloutConflictError(
+                "active benchmark changed: expected "
+                f"v{expected_active_version}, found v{active_version}"
+            )
+        rollout = await open_rollout(session)
+        if rollout is None or rollout.desired_version != desired_version:
+            raise RolloutConflictError(
+                f"no open benchmark v{desired_version} rollout is available"
+            )
+        if rollout.rescore_cohort_target != expected_current_target:
+            raise RolloutConflictError(
+                "rollout rescore target changed: expected "
+                f"{expected_current_target}, found {rollout.rescore_cohort_target}"
+            )
+        cohort = await _rollout_rescore_cohort(
+            session, rollout=rollout, target_override=new_target
+        )
+        if len(cohort) != new_target:
+            raise RolloutConflictError(
+                f"benchmark v{desired_version} has only {len(cohort)} qualified "
+                f"distinct historical members for a target of {new_target}"
+            )
+        existing_ids = set(
+            await session.scalars(
+                select(BenchmarkRolloutMember.agent_id).where(
+                    BenchmarkRolloutMember.rollout_id == rollout.rollout_id
+                )
+            )
+        )
+        for member in cohort:
+            if member.agent_id in existing_ids:
+                continue
+            candidate, blocker = await qualification_candidate(
+                session,
+                source_bench_version=rollout.from_version,
+                target_bench_version=rollout.desired_version,
+                member=member,
+                generator_run_size=generator.run_size,
+            )
+            if candidate is None:
+                raise RolloutConflictError(
+                    f"cohort agent {member.agent_id} cannot qualify for "
+                    f"v{desired_version}: {blocker}"
+                )
+            pending.append(candidate)
+        if len(existing_ids) + len(pending) != new_target:
+            raise RolloutConflictError(
+                "rollout membership changed while expansion was prepared"
+            )
+        rollout_id = rollout.rollout_id
+
+    rendered = [
+        (
+            candidate,
+            candidate.existing_sha256
+            or await generator.generate(candidate.seed, bench_version=desired_version),
+        )
+        for candidate in pending
+    ]
+
+    async with session.begin():
+        current_active_version = await active_bench_version(session)
+        if current_active_version != expected_active_version:
+            raise RolloutConflictError(
+                "active benchmark changed while expansion datasets were rendered: "
+                f"expected v{expected_active_version}, found v{current_active_version}"
+            )
+        rollout = await session.get(BenchmarkRollout, rollout_id, with_for_update=True)
+        if (
+            rollout is None
+            or rollout.status not in ("collecting", "blocked_ineligible")
+            or rollout.desired_version != desired_version
+            or rollout.rescore_cohort_target != expected_current_target
+        ):
+            raise RolloutConflictError(
+                "open rollout changed while expansion datasets were rendered"
+            )
+        current_cohort = {
+            member.agent_id: member
+            for member in await _rollout_rescore_cohort(
+                session, rollout=rollout, target_override=new_target
+            )
+        }
+        if len(current_cohort) != new_target:
+            raise RolloutConflictError(
+                "rollout ranking changed while expansion datasets were rendered"
+            )
+        for candidate, _sha256 in rendered:
+            current_member = current_cohort.get(candidate.member.agent_id)
+            if current_member is None:
+                raise RolloutConflictError(
+                    "rollout ranking changed while expansion datasets were rendered"
+                )
+            current_candidate, _blocker = await qualification_candidate(
+                session,
+                source_bench_version=rollout.from_version,
+                target_bench_version=rollout.desired_version,
+                member=current_member,
+                generator_run_size=generator.run_size,
+            )
+            if current_candidate != candidate:
+                raise RolloutConflictError(
+                    "rollout qualification changed while expansion datasets "
+                    "were rendered"
+                )
+
+        rollout.rescore_cohort_target = new_target
+        appended = 0
+        for candidate, sha256 in rendered:
+            appended += await append_rollout_member(
+                session,
+                rollout=rollout,
+                member=candidate.member,
+                dataset=DatasetPin(
+                    seed=candidate.seed,
+                    sha256=sha256,
+                    run_size=candidate.run_size,
+                    seed_block=candidate.seed_block,
+                    seed_block_hash=candidate.seed_block_hash,
+                ),
+                now=now,
+                audit_context={
+                    "origin": "operator_expansion",
+                    "actor": actor,
+                    "reason": reason,
+                    "previous_rescore_cohort_target": expected_current_target,
+                    "new_rescore_cohort_target": new_target,
+                    "seed_source": candidate.seed_source,
+                },
+            )
+        if appended != len(rendered):
+            raise RolloutConflictError(
+                "rollout membership changed while expansion was committed"
+            )
+        rollout.cohort_size = new_target
+        await append_rollout_audit(
+            session,
+            rollout,
+            "cohort_expanded",
+            {
+                "origin": "operator",
+                "actor": actor,
+                "reason": reason,
+                "previous_rescore_cohort_target": expected_current_target,
+                "new_rescore_cohort_target": new_target,
+                "appended_members": appended,
+            },
+            now=now,
+        )
+        await session.flush()
+
+    return RolloutExpansionResult(
+        previous_target=expected_current_target,
+        new_target=new_target,
+        appended_members=len(rendered),
+    )
 
 
 async def qualification_candidate(

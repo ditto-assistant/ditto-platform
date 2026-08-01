@@ -32,6 +32,8 @@ from ditto.api_server.middleware.error_envelope import (
 from ditto.db.models import (
     Agent,
     BenchmarkRollout,
+    BenchmarkRolloutAudit,
+    BenchmarkRolloutMember,
     InferenceProviderRoute,
     InferenceRoutingPolicy,
     Score,
@@ -380,12 +382,58 @@ async def _rollout_count(maker: async_sessionmaker[AsyncSession]) -> int:
         )
 
 
+async def _seed_expandable_rollout(
+    maker: async_sessionmaker[AsyncSession], now: datetime
+) -> list[RolloutSnapshotMember]:
+    members = await _seed_start_ready(maker, now)
+    async with maker() as session, session.begin():
+        members.extend(
+            _add_cohort_agent(
+                session,
+                position=position,
+                composite=0.5 - position / 100,
+                now=now,
+                bench_version=7,
+            )
+            for position in range(6, 16)
+        )
+        await create_rollout_snapshot(
+            session,
+            members=members[:10],
+            datasets={
+                member.agent_id: DatasetPin(
+                    seed=index, sha256=f"{index:064x}", run_size="full"
+                )
+                for index, member in enumerate(members[:10], start=1)
+            },
+            now=now,
+            from_version=7,
+            desired_version=_TARGET,
+            rescore_cohort_target=10,
+            priority_cohort_target=5,
+        )
+    return members
+
+
 def _start_payload() -> dict[str, Any]:
     return {
         "reason": f"start the v{_TARGET} rollout",
         "actor": "backroom:test",
         "confirmation": f"START BENCHMARK V{_TARGET}",
         "expected_active_version": 7,
+    }
+
+
+def _expand_payload(
+    *, expected_target: int = 10, new_target: int = 15
+) -> dict[str, Any]:
+    return {
+        "reason": "expand the current v8 rollout to the intended top fifteen",
+        "actor": "backroom:test",
+        "confirmation": f"EXPAND BENCHMARK V{_TARGET} TO {new_target}",
+        "expected_active_version": 7,
+        "expected_current_target": expected_target,
+        "new_target": new_target,
     }
 
 
@@ -619,6 +667,126 @@ async def test_start_requires_full_guard_payload_and_exact_confirmation(
     )
     assert unsupported.status_code == 409
     assert "no shipped contract" in unsupported.json()["message"]
+
+
+async def test_expand_open_rollout_appends_ordered_suffix_atomically(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    session_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    _install(app, session_maker)
+    now = datetime.now(UTC).replace(microsecond=0)
+    members = await _seed_expandable_rollout(session_maker, now)
+    generator = _StubGenerator()
+    app.state.dataset_generator = generator
+
+    response = await client.post(
+        f"/api/v1/admin/benchmark-rollout/{_TARGET}/expand",
+        headers=_HEADERS,
+        json=_expand_payload(),
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["rescore_cohort_target"] == 15
+    assert body["cohort_size"] == 15
+    assert body["expansion"] == {
+        "previous_target": 10,
+        "new_target": 15,
+        "appended_members": 5,
+    }
+    assert [UUID(member["agent_id"]) for member in body["members"]] == [
+        member.agent_id for member in members
+    ]
+    assert [version for _seed, version in generator.calls] == [_TARGET] * 5
+
+    async with session_maker() as session:
+        rollout = await session.scalar(
+            select(BenchmarkRollout).where(BenchmarkRollout.desired_version == _TARGET)
+        )
+        assert rollout is not None
+        positions = list(
+            await session.scalars(
+                select(BenchmarkRolloutMember.position)
+                .where(BenchmarkRolloutMember.rollout_id == rollout.rollout_id)
+                .order_by(BenchmarkRolloutMember.position)
+            )
+        )
+        assert positions == list(range(1, 16))
+        audit = await session.scalar(
+            select(BenchmarkRolloutAudit).where(
+                BenchmarkRolloutAudit.rollout_id == rollout.rollout_id,
+                BenchmarkRolloutAudit.event == "cohort_expanded",
+            )
+        )
+        assert audit is not None
+        assert audit.payload["previous_rescore_cohort_target"] == 10
+        assert audit.payload["new_rescore_cohort_target"] == 15
+        assert audit.payload["appended_members"] == 5
+
+
+async def test_expand_open_rollout_refuses_stale_target_guard_without_rendering(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    session_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    _install(app, session_maker)
+    now = datetime.now(UTC).replace(microsecond=0)
+    await _seed_expandable_rollout(session_maker, now)
+    generator = _StubGenerator()
+    app.state.dataset_generator = generator
+    payload = _expand_payload(expected_target=9)
+
+    response = await client.post(
+        f"/api/v1/admin/benchmark-rollout/{_TARGET}/expand",
+        headers=_HEADERS,
+        json=payload,
+    )
+
+    assert response.status_code == 409, response.text
+    assert "expected 9, found 10" in response.json()["message"]
+    assert generator.calls == []
+    async with session_maker() as session:
+        rollout = await session.scalar(
+            select(BenchmarkRollout).where(BenchmarkRollout.desired_version == _TARGET)
+        )
+        assert rollout is not None
+        assert rollout.rescore_cohort_target == 10
+        assert rollout.cohort_size == 10
+
+
+async def test_expand_open_rollout_keeps_target_frozen_when_rendering_fails(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    session_maker: async_sessionmaker[AsyncSession],
+) -> None:
+    _install(app, session_maker)
+    now = datetime.now(UTC).replace(microsecond=0)
+    await _seed_expandable_rollout(session_maker, now)
+    generator = _StubGenerator(DataPipelineError(_LAGGING))
+    app.state.dataset_generator = generator
+
+    response = await client.post(
+        f"/api/v1/admin/benchmark-rollout/{_TARGET}/expand",
+        headers=_HEADERS,
+        json=_expand_payload(),
+    )
+
+    assert response.status_code == 502, response.text
+    assert generator.calls
+    async with session_maker() as session:
+        rollout = await session.scalar(
+            select(BenchmarkRollout).where(BenchmarkRollout.desired_version == _TARGET)
+        )
+        assert rollout is not None
+        assert rollout.rescore_cohort_target == 10
+        assert rollout.cohort_size == 10
+        member_count = await session.scalar(
+            select(func.count())
+            .select_from(BenchmarkRolloutMember)
+            .where(BenchmarkRolloutMember.rollout_id == rollout.rollout_id)
+        )
+        assert member_count == 10
 
 
 async def test_start_reports_a_lagging_generate_service_as_a_named_502(
