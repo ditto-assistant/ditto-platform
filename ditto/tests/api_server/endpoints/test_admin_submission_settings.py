@@ -32,13 +32,18 @@ def _install(app: FastAPI, maker: async_sessionmaker[AsyncSession]) -> None:
 # `Base.metadata.create_all` left the table empty -- a baseline that only
 # reaches `effective_submission_settings`'s `latest is None` fallback, which
 # production has not been able to hit since that migration landed.
-def _payload(seconds: int, expected: int = 1) -> dict[str, object]:
+def _payload(
+    seconds: int, expected: int = 1, fee_amount_rao: int = 40_000_000
+) -> dict[str, object]:
     return {
         "expected_revision": expected,
         "cooldown_seconds": seconds,
+        "fee_amount_rao": fee_amount_rao,
         "reason": f"set miner submission cooldown to {seconds} seconds",
         "actor": "operator@example.com",
-        "confirmation": f"SET SUBMISSION COOLDOWN {seconds} SECONDS",
+        "confirmation": (
+            f"SET SUBMISSION COOLDOWN {seconds} SECONDS FEE {fee_amount_rao} RAO"
+        ),
     }
 
 
@@ -51,14 +56,16 @@ async def test_defaults_to_one_hour_and_appends_audited_revision(
     initial = await client.get("/api/v1/admin/submission-settings", headers=_HEADERS)
     assert initial.status_code == 200
     assert initial.json()["current"]["cooldown_seconds"] == 3600
+    assert initial.json()["current"]["fee_amount_rao"] == 40_000_000
 
     updated = await client.post(
         "/api/v1/admin/submission-settings",
         headers=_HEADERS,
-        json=_payload(1800),
+        json=_payload(1800, fee_amount_rao=50_000_000),
     )
     assert updated.status_code == 200, updated.text
     assert updated.json()["cooldown_seconds"] == 1800
+    assert updated.json()["fee_amount_rao"] == 50_000_000
     assert updated.json()["actor"] == "operator@example.com"
 
 

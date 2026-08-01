@@ -49,8 +49,8 @@ pytestmark = pytest.mark.integration
 
 _TAR_BYTES = b"\x1f\x8b" + b"x" * 1024
 _TAR_SHA = hashlib.sha256(_TAR_BYTES).hexdigest()
-# 17_500_000 rao = $5 fee * 1.4 buffer / $400 oracle price.
-_QUOTE_RAO = 17_500_000
+# Operator-controlled 0.04 TAO fee.
+_QUOTE_RAO = 40_000_000
 _COLDKEY = "5DhaT8U7LVwnnJNUU8VL1XEipicatoaDVVq7cHo227gogVZm"
 
 
@@ -87,7 +87,10 @@ def _build_fake_verifier(
     """
     verifier = MagicMock()
 
-    async def _verify(_proof, *, expected_hotkey: str) -> VerifiedPayment:
+    async def _verify(
+        _proof, *, expected_hotkey: str, expected_amount_rao: int
+    ) -> VerifiedPayment:
+        assert expected_amount_rao == _QUOTE_RAO
         return VerifiedPayment(
             block_hash=block_hash,
             extrinsic_index=ext_idx,

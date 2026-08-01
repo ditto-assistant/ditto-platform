@@ -5,23 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
-from typing import Final
-
-PAYMENT_DRIFT_TOLERANCE: Final[Decimal] = Decimal("0.02")
-"""Allowed band on ``amount_rao`` around the recomputed quote.
-
-Source constant rather than env var: the band determines whether a
-miner's payment is accepted and lives next to the payment-acceptance
-logic that consults it. Changes are PR-reviewed + versioned in source
-rather than ops-tunable, mirroring how scoring weights are handled.
-
-Default 2% covers the typical TTL-boundary window where the oracle
-cache might tip from quote-time price to a fresh fetch in the seconds
-between miner finalization and server verify. Sub-percent drift in a
-30-60 s window is the norm; 2% gives margin without inviting sybil
-under-payment beyond the buffer the upload-pricing formula already
-bakes in.
-"""
 
 
 @dataclass(frozen=True)
@@ -70,15 +53,10 @@ class VerifiedPayment:
     verifier asserts equality before populating this field."""
 
     amount_rao: int
-    """Payment amount in rao (1 TAO = 1e9 rao). Validated against the
-    recomputed quote ±``PAYMENT_DRIFT_TOLERANCE``."""
+    """Payment amount in rao (1 TAO = 1e9 rao)."""
 
-    tao_usd_rate: Decimal
-    """TAO/USD rate already fetched to validate this payment.
-
-    Persisting the verifier's existing oracle value adds no extra external
-    request and captures the rate used at acceptance time.
-    """
+    tao_usd_rate: Decimal | None
+    """Best-effort TAO/USD rate captured solely for revenue reporting."""
 
     dest_address: str
     """SS58 destination of the transfer. Equals the configured upload

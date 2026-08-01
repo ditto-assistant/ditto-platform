@@ -17,12 +17,12 @@ Usage:
     verifier = create_payment_verifier(
         chain=chain_client,
         oracle=price_oracle,
-        pricing_config=pricing_config,
         send_address=config.upload_payment_address,
     )
     verified = await verifier.verify_payment(
         PaymentProof(block_hash=h, block_number=n, extrinsic_index=i),
         expected_hotkey=hotkey,
+        expected_amount_rao=40_000_000,
     )
 """
 
@@ -39,11 +39,7 @@ from ditto.api_server.payment_verifier.errors import (
     PaymentVerifierError,
 )
 from ditto.api_server.payment_verifier.factory import create_payment_verifier
-from ditto.api_server.payment_verifier.models import (
-    PAYMENT_DRIFT_TOLERANCE,
-    PaymentProof,
-    VerifiedPayment,
-)
+from ditto.api_server.payment_verifier.models import PaymentProof, VerifiedPayment
 from ditto.api_server.payment_verifier.verifier import PaymentVerifier
 
 __all__ = [
@@ -52,8 +48,6 @@ __all__ = [
     # Inputs / outputs
     "PaymentProof",
     "VerifiedPayment",
-    # Constants
-    "PAYMENT_DRIFT_TOLERANCE",
     # Errors
     "PaymentVerifierError",
     "PaymentNotFoundOnChain",

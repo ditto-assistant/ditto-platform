@@ -1809,13 +1809,14 @@ class ArtifactReleaseSettingsRevision(Base):
 
 
 class SubmissionSettingsRevision(Base):
-    """Append-only, operator-audited miner submission cooldown revision."""
+    """Append-only, operator-audited miner submission settings revision."""
 
     __tablename__ = "submission_settings_revisions"
 
     revision: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     parent_revision: Mapped[int] = mapped_column(Integer, nullable=False)
     cooldown_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+    fee_amount_rao: Mapped[int] = mapped_column(BigInteger, nullable=False)
     reason: Mapped[str] = mapped_column(Text, nullable=False)
     actor: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
@@ -1826,6 +1827,10 @@ class SubmissionSettingsRevision(Base):
         CheckConstraint(
             "cooldown_seconds BETWEEN 60 AND 86400",
             name="submission_settings_cooldown_seconds_check",
+        ),
+        CheckConstraint(
+            "fee_amount_rao BETWEEN 1 AND 1000000000000",
+            name="submission_settings_fee_amount_rao_check",
         ),
         CheckConstraint(
             "parent_revision >= 0",
@@ -1859,6 +1864,7 @@ class UploadAdmissionReservation(Base):
     sha256: Mapped[str] = mapped_column(Text, nullable=False)
     settings_revision: Mapped[int] = mapped_column(Integer, nullable=False)
     cooldown_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+    fee_amount_rao: Mapped[int] = mapped_column(BigInteger, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
     )
@@ -1870,6 +1876,10 @@ class UploadAdmissionReservation(Base):
         CheckConstraint(
             "cooldown_seconds BETWEEN 60 AND 86400",
             name="upload_admission_cooldown_seconds_check",
+        ),
+        CheckConstraint(
+            "fee_amount_rao BETWEEN 1 AND 1000000000000",
+            name="upload_admission_fee_amount_rao_check",
         ),
         CheckConstraint(
             "length(sha256) = 64",
