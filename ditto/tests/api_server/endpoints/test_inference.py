@@ -24,6 +24,7 @@ from ditto.api_server.endpoints.inference import (
     _locked_grant_model,
     _locked_upstream_payload,
     _max_chargeable_tokens,
+    _openrouter_headers,
     _output_token_limit,
     _post_provider_with_retry,
     _provider_preferences,
@@ -454,19 +455,36 @@ def test_tool_result_name_must_be_a_non_empty_string(name: object) -> None:
     assert raised.value.detail == "invalid tool name"
 
 
-def test_aggregate_route_is_speed_sorted_private_and_fallback_enabled() -> None:
+def test_aggregate_route_is_reliability_ordered_private_and_fallback_enabled() -> None:
     assert _provider_preferences(
         routing_mode="aggregate_throughput",
         provider="openrouter",
         quantization=None,
     ) == {
-        "sort": "throughput",
+        "order": ["coreweave", "deepinfra", "groq"],
+        "ignore": ["amazon-bedrock"],
         "allow_fallbacks": True,
         "data_collection": "deny",
         "zdr": True,
     }
     assert _bounded_provider_cost({"usage": {"cost": 0.012345}}) == 12_345
     assert _bounded_provider_cost({"usage": {"cost": float("nan")}}) is None
+
+
+def test_openrouter_headers_attribute_chat_and_embedding_traffic() -> None:
+    assert _openrouter_headers("secret") == {
+        "Authorization": "Bearer secret",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://heyditto.ai/",
+        "X-OpenRouter-Title": "Ditto",
+    }
+    assert _openrouter_headers("secret", include_metadata=True) == {
+        "Authorization": "Bearer secret",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://heyditto.ai/",
+        "X-OpenRouter-Title": "Ditto",
+        "X-OpenRouter-Metadata": "enabled",
+    }
 
 
 def test_v7_upstream_profile_pins_medium_reasoning_without_changing_v6() -> None:

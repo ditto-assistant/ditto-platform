@@ -28,6 +28,8 @@ class AggregateRouteView(BaseModel):
     provider: str
     profile_revision: str
     provider_sort: str
+    provider_order: list[str]
+    ignored_providers: list[str]
     allow_fallbacks: bool
 
 
@@ -105,7 +107,10 @@ class ProviderTelemetryView(BaseModel):
     provider: str
     request_count: int = Field(ge=0)
     completed_count: int = Field(ge=0)
+    failed_count: int = Field(ge=0)
+    inflight_count: int = Field(ge=0)
     timeout_count: int = Field(ge=0)
+    upstream_attempt_count: int = Field(ge=0)
     prompt_tokens: int = Field(ge=0)
     completion_tokens: int = Field(ge=0)
     cost_microusd: int = Field(ge=0)

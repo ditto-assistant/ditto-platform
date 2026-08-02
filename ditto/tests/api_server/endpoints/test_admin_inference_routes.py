@@ -284,6 +284,7 @@ async def test_aggregate_mode_blocks_adaptive_controls_but_allows_logical_route(
                 completion_tokens=20,
                 cost_microusd=123,
                 upstream_provider="WandB",
+                upstream_attempts=1,
                 timed_out=False,
                 latency_ms=250,
                 started_at=datetime.now(UTC),
@@ -296,7 +297,9 @@ async def test_aggregate_mode_blocks_adaptive_controls_but_allows_logical_route(
         "model": _MODEL,
         "provider": "openrouter",
         "profile_revision": profile,
-        "provider_sort": "throughput",
+        "provider_sort": "operator_order",
+        "provider_order": ["CoreWeave", "DeepInfra", "Groq"],
+        "ignored_providers": ["Amazon Bedrock"],
         "allow_fallbacks": True,
     }
     assert listing.json()["provider_telemetry"] == [
@@ -304,7 +307,10 @@ async def test_aggregate_mode_blocks_adaptive_controls_but_allows_logical_route(
             "provider": "WandB",
             "request_count": 1,
             "completed_count": 1,
+            "failed_count": 0,
+            "inflight_count": 0,
             "timeout_count": 0,
+            "upstream_attempt_count": 1,
             "prompt_tokens": 80,
             "completion_tokens": 20,
             "cost_microusd": 123,
@@ -379,22 +385,26 @@ async def test_provider_telemetry_aggregates_are_json_numbers_not_strings(
     now = datetime.now(UTC)
     async with session_maker() as session, session.begin():
         grant_id = await _seed_grant(session)
-        for index, (provider, latency) in enumerate(
-            (("Groq", 200), ("Groq", 300), ("WandB", None))
+        for provider, latency, status, timed_out, attempts in (
+            ("Groq", 200, "completed", False, 1),
+            ("Groq", 300, "completed", False, 1),
+            (None, 400, "failed", False, 1),
+            ("WandB", None, "failed", True, 2),
         ):
             session.add(
                 InferenceRequest(
                     grant_id=grant_id,
                     nonce=uuid4(),
                     generation=1,
-                    status="completed",
+                    status=status,
                     model=_MODEL,
                     reserved_tokens=100,
                     prompt_tokens=80,
                     completion_tokens=20,
                     cost_microusd=123,
                     upstream_provider=provider,
-                    timed_out=index == 2,
+                    upstream_attempts=attempts,
+                    timed_out=timed_out,
                     latency_ms=latency,
                     started_at=now,
                     completed_at=now,
@@ -409,17 +419,36 @@ async def test_provider_telemetry_aggregates_are_json_numbers_not_strings(
             "provider": "Groq",
             "request_count": 2,
             "completed_count": 2,
+            "failed_count": 0,
+            "inflight_count": 0,
             "timeout_count": 0,
+            "upstream_attempt_count": 2,
             "prompt_tokens": 160,
             "completion_tokens": 40,
             "cost_microusd": 246,
             "average_latency_ms": 250.0,
         },
         {
+            "provider": "Unknown upstream",
+            "request_count": 1,
+            "completed_count": 0,
+            "failed_count": 1,
+            "inflight_count": 0,
+            "timeout_count": 0,
+            "upstream_attempt_count": 1,
+            "prompt_tokens": 80,
+            "completion_tokens": 20,
+            "cost_microusd": 123,
+            "average_latency_ms": 400.0,
+        },
+        {
             "provider": "WandB",
             "request_count": 1,
-            "completed_count": 1,
+            "completed_count": 0,
+            "failed_count": 1,
+            "inflight_count": 0,
             "timeout_count": 1,
+            "upstream_attempt_count": 2,
             "prompt_tokens": 80,
             "completion_tokens": 20,
             "cost_microusd": 123,
@@ -428,17 +457,21 @@ async def test_provider_telemetry_aggregates_are_json_numbers_not_strings(
             "average_latency_ms": None,
         },
     ]
-    groq, wandb = telemetry
+    groq, unknown, wandb = telemetry
     for field in (
         "request_count",
         "completed_count",
+        "failed_count",
+        "inflight_count",
         "timeout_count",
+        "upstream_attempt_count",
         "prompt_tokens",
         "completion_tokens",
         "cost_microusd",
     ):
         assert isinstance(groq[field], int), (field, groq[field])
     assert isinstance(groq["average_latency_ms"], float)
+    assert unknown["provider"] == "Unknown upstream"
     assert wandb["average_latency_ms"] is None
     # Nothing numeric arrives quoted, whatever the column type behind it.
     assert '"160"' not in listing.text
