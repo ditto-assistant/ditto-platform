@@ -3553,6 +3553,7 @@ def _public_activity_response(
             "waiting_validator",
             "below_score_floor",
             "evaluating",
+            "under_review",
         }
         page_rows = _operations_activity_rows(
             projected,
@@ -3656,6 +3657,11 @@ def _public_activity_response(
                 required_screening_policy_version=SCREENING_POLICY_VERSION,
                 screening_attempt_id=(
                     row.screening_attempt.attempt_id
+                    if row.screening_attempt is not None
+                    else None
+                ),
+                screening_build_only=(
+                    row.screening_attempt.build_only
                     if row.screening_attempt is not None
                     else None
                 ),

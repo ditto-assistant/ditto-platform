@@ -1969,6 +1969,17 @@ class PublicActivityEntry(BaseModel):
     screening_attempt_id: Annotated[
         UUID | None, Field(default=None, description="Active screening lease, if any.")
     ]
+    screening_build_only: Annotated[
+        bool | None,
+        Field(
+            default=None,
+            description=(
+                "Whether the active screener lease is mechanical image admission "
+                "only. False means the source-review path; null means no active "
+                "screener lease."
+            ),
+        ),
+    ] = None
     screening_started_at: Annotated[
         datetime | None, Field(default=None, description="Active attempt start time.")
     ]
