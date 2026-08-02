@@ -3910,10 +3910,26 @@ async def request_top5_confirmation_job(
         # accumulating samples.
         wave_member_ids = tuple(member.agent_id for member in wave_members)
         emission_member_ids = frozenset(member.agent_id for member in emission_members)
-        if not members or members[0].agent_id != payload.champion_agent_id:
+        if not members:
             raise HTTPException(
                 status_code=409,
-                detail="the claimed champion is not the current KOTH incumbent",
+                detail="the current retest cohort is empty",
+            )
+        # The validator signs the champion it observed in the scoring ledger,
+        # but that ledger and the authoritative continual fold are read in
+        # separate requests. A completed wave may legitimately change the king
+        # between them. Treat the signed value as an observation, not routing
+        # authority: membership is still checked against the current cohort and
+        # every seed decision below is anchored to Platform's current king.
+        champion_agent_id = members[0].agent_id
+        if champion_agent_id != payload.champion_agent_id:
+            logger.info(
+                "continual retest resolving stale champion validator=%s "
+                "claimed=%s authoritative=%s member=%s",
+                payload.validator_hotkey,
+                payload.champion_agent_id,
+                champion_agent_id,
+                payload.member_agent_id,
             )
         if payload.member_agent_id not in {member.agent_id for member in members}:
             raise HTTPException(
@@ -3927,7 +3943,7 @@ async def request_top5_confirmation_job(
                     f"(top {len(members)})"
                 ),
             )
-        champion = await get_agent_by_id(session, agent_id=payload.champion_agent_id)
+        champion = await get_agent_by_id(session, agent_id=champion_agent_id)
         assert champion is not None
         crown_block = champion.dataset_seed_block or block.number
         scheduled_round = top5_round_is_due(
@@ -3965,7 +3981,7 @@ async def request_top5_confirmation_job(
             )
         seeds = await _top5_confirmation_seed_plan(
             session,
-            champion_agent_id=payload.champion_agent_id,
+            champion_agent_id=champion_agent_id,
             member_agent_id=payload.member_agent_id,
             wave_member_ids=wave_member_ids,
             cohort_member_ids=tuple(member.agent_id for member in members),
@@ -4021,7 +4037,7 @@ async def request_top5_confirmation_job(
             emission_member_ids=emission_member_ids,
             catchup_member_ids=await _unserved_catchup_members(
                 session,
-                champion_agent_id=payload.champion_agent_id,
+                champion_agent_id=champion_agent_id,
                 emission_member_ids=tuple(
                     member.agent_id for member in emission_members
                 ),
@@ -4144,7 +4160,7 @@ async def request_top5_confirmation_job(
         )
     logger.info(
         "issued top-5 rescore job champion=%s member=%s validator=%s",
-        payload.champion_agent_id,
+        champion_agent_id,
         payload.member_agent_id,
         payload.validator_hotkey,
     )

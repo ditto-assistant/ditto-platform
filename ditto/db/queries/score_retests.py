@@ -37,14 +37,23 @@ REPLACEMENT_TICKET_TTL = timedelta(minutes=90)
 _FINALIZED_STATUSES = (AgentStatus.SCORED, AgentStatus.LIVE)
 
 
-async def lock_validator(session: AsyncSession, validator_hotkey: str) -> None:
-    """Serialize ticket ownership changes for one validator."""
-    if session.get_bind().dialect.name == "postgresql":
-        await session.execute(
-            select(
-                func.pg_advisory_xact_lock(func.hashtextextended(validator_hotkey, 0))
-            )
+async def try_lock_validator(session: AsyncSession, validator_hotkey: str) -> bool:
+    """Try to serialize ticket ownership changes for one validator.
+
+    Job issuance can reach this queue after it has already locked ordinary
+    ticket rows. Waiting here for a transaction that owns this advisory lock
+    and is itself waiting for one of those rows creates a classic lock-order
+    cycle. A busy queue lock is not lost work: the queued re-test remains
+    append-only and the next poll retries promotion.
+    """
+    if session.get_bind().dialect.name != "postgresql":
+        return True
+    locked = await session.scalar(
+        select(
+            func.pg_try_advisory_xact_lock(func.hashtextextended(validator_hotkey, 0))
         )
+    )
+    return bool(locked)
 
 
 async def latest_retest_events_for_validator(
@@ -149,7 +158,8 @@ async def activate_next_score_retest(
     ):
         return None
 
-    await lock_validator(session, validator_hotkey)
+    if not await try_lock_validator(session, validator_hotkey):
+        return None
     # Re-read under the lock; the unlocked probe above decides only whether
     # there is anything worth locking for, never what to do with it.
     latest = await latest_retest_events_for_validator(
@@ -340,7 +350,7 @@ __all__ = [
     "EVENT_SCORE_INVALIDATED",
     "REPLACEMENT_TICKET_TTL",
     "activate_next_score_retest",
-    "lock_validator",
+    "try_lock_validator",
     "retest_is_active",
     "retest_is_open",
     "retest_is_queued",
