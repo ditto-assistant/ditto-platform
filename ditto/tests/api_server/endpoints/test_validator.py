@@ -8173,6 +8173,36 @@ class TestTop5ConfirmationLane:
         )
         assert third_claim.status_code == 200, third_claim.text
 
+    async def test_stale_champion_hint_uses_authoritative_current_incumbent(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """A ledger race must not stop otherwise-valid continual work.
+
+        The signed champion is the validator's observation. Platform owns the
+        current fold, so it validates the requested member against that cohort
+        and anchors the issued seed to the current incumbent instead.
+        """
+        from ditto.api_server.crn import champion_anchored_seeds
+
+        champion, stale_champion, *_ = await _seed_top5_emission_set(session_maker)
+        _install_db(app, session_maker)
+        _install_chain_with_block(app, block_number=1)
+
+        response = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_AUTH_HEADER,
+            json=_top5_job_payload(stale_champion, champion),
+        )
+
+        assert response.status_code == 200, response.text
+        pins = response.json()["confirmation_datasets"]
+        assert [pin["seed"] for pin in pins] == [
+            champion_anchored_seeds(champion, version=_BENCH_VERSION, max_seeds=16)[0]
+        ]
+
     async def test_protocol_13_validator_without_canonical_score_can_claim(
         self,
         app: FastAPI,

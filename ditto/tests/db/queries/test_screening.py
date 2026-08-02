@@ -21,6 +21,7 @@ from ditto.db.models import (
     BenchmarkDataset,
     BenchmarkRollout,
     BenchmarkRolloutMember,
+    ScreenerHeartbeat,
     ScreeningAttempt,
     ScreeningQuarantine,
 )
@@ -254,6 +255,105 @@ async def _claim(
             limit=limit,
             deferred_review_mode=deferred_review_mode,
         )
+
+
+async def test_claim_releases_heartbeat_proven_orphan_without_expiry_penalty(
+    session: AsyncSession,
+) -> None:
+    now = datetime.now(UTC)
+    agent = Agent(
+        agent_id=uuid4(),
+        miner_hotkey="5HK-orphaned-build",
+        name="orphaned-build",
+        sha256=uuid4().hex * 2,
+        status=AgentStatus.SCREENING,
+    )
+    orphan = ScreeningAttempt(
+        attempt_id=uuid4(),
+        agent_id=agent.agent_id,
+        screener_hotkey=_SCREENER,
+        policy_version=SCREENING_POLICY_VERSION,
+        status="running",
+        started_at=now - timedelta(minutes=10),
+        deadline=now + timedelta(minutes=35),
+        build_only=True,
+    )
+    async with session.begin():
+        session.add_all(
+            [
+                agent,
+                orphan,
+                ScreenerHeartbeat(
+                    screener_hotkey=_SCREENER,
+                    instance_id="screener-a",
+                    software_version="0.21.0",
+                    protocol_version=4,
+                    policy_version=SCREENING_POLICY_VERSION,
+                    state="polling",
+                    active_agent_id=None,
+                    first_seen_at=now - timedelta(days=1),
+                    reported_at=now - timedelta(seconds=5),
+                    seen_at=now - timedelta(seconds=5),
+                    signature="ab" * 64,
+                ),
+            ]
+        )
+
+    claimed = await _claim(session, limit=1, deferred_review_mode="enforce")
+
+    assert len(claimed) == 1
+    assert claimed[0][0].agent_id == agent.agent_id
+    assert claimed[0][1].attempt_id != orphan.attempt_id
+    assert orphan.status == "failed"
+    assert orphan.reason_code == "worker-lease-orphaned"
+
+
+async def test_claim_preserves_attempt_reported_active_by_a_fresh_worker(
+    session: AsyncSession,
+) -> None:
+    now = datetime.now(UTC)
+    agent = Agent(
+        agent_id=uuid4(),
+        miner_hotkey="5HK-active-build",
+        name="active-build",
+        sha256=uuid4().hex * 2,
+        status=AgentStatus.SCREENING,
+    )
+    attempt = ScreeningAttempt(
+        attempt_id=uuid4(),
+        agent_id=agent.agent_id,
+        screener_hotkey=_SCREENER,
+        policy_version=SCREENING_POLICY_VERSION,
+        status="running",
+        started_at=now - timedelta(minutes=10),
+        deadline=now + timedelta(minutes=35),
+        build_only=True,
+    )
+    async with session.begin():
+        session.add_all(
+            [
+                agent,
+                attempt,
+                ScreenerHeartbeat(
+                    screener_hotkey=_SCREENER,
+                    instance_id="screener-a",
+                    software_version="0.21.0",
+                    protocol_version=4,
+                    policy_version=SCREENING_POLICY_VERSION,
+                    state="screening",
+                    active_agent_id=agent.agent_id,
+                    first_seen_at=now - timedelta(days=1),
+                    reported_at=now - timedelta(seconds=5),
+                    seen_at=now - timedelta(seconds=5),
+                    signature="ab" * 64,
+                ),
+            ]
+        )
+
+    claimed = await _claim(session, limit=1, deferred_review_mode="enforce")
+
+    assert claimed == []
+    assert attempt.status == "running"
 
 
 @pytest.mark.parametrize("mode", ["off", "observe"])

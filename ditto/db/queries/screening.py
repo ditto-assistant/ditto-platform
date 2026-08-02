@@ -23,6 +23,7 @@ from ditto.db.models import (
     EvaluationPayment,
     OwnerAttestation,
     Score,
+    ScreenerHeartbeat,
     ScreeningAttempt,
     ScreeningQuarantine,
     ScreeningRetryOverride,
@@ -81,6 +82,15 @@ _EXHAUSTED_PUBLIC_REASON = (
     "Screening was inconclusive repeatedly; held for operator review"
 )
 _DEFERRED_MECHANICAL_REASON = "deferred-mechanical-admission"
+_ORPHANED_ATTEMPT_REASON_CODE = "worker-lease-orphaned"
+_ORPHANED_ATTEMPT_REASON = (
+    "Screening worker stopped reporting this attempt; retry scheduled"
+)
+# Active workers report at least every two minutes. Wait through two complete
+# heartbeat intervals before inferring an orphan, and only act on heartbeat
+# observations fresh enough to classify that worker as online publicly.
+_ORPHANED_ATTEMPT_GRACE = timedelta(minutes=5)
+_SCREENER_HEARTBEAT_FRESHNESS = timedelta(minutes=5)
 _EXHAUSTED_MANIFEST_DIGEST = hashlib.sha256(
     b"ditto:repeatedly-inconclusive:v1"
 ).hexdigest()
@@ -309,6 +319,84 @@ async def expire_screening_attempts(session: AsyncSession, *, now: datetime) -> 
     return len(attempts)
 
 
+async def fail_orphaned_screening_attempts(
+    session: AsyncSession,
+    *,
+    screener_hotkey: str,
+    now: datetime,
+) -> int:
+    """Release leases that no live worker still reports as active.
+
+    Verdict delivery is idempotent, but a transient failure after a completed
+    build used to leave the attempt ``running`` for its full 70-minute TTL. The
+    shared screener hotkey cannot identify the claiming instance directly, so
+    this uses only positive fleet evidence: the attempt is past a two-heartbeat
+    grace, at least one fresh heartbeat was observed after it started, and no
+    fresh instance reports that agent as its active work.
+
+    These are infrastructure failures, not inconclusive reviews. Mark them
+    ``failed`` so they retry immediately without consuming the five-expiry
+    adjudication budget.
+    """
+    attempts = list(
+        await session.scalars(
+            select(ScreeningAttempt)
+            .where(
+                ScreeningAttempt.screener_hotkey == screener_hotkey,
+                ScreeningAttempt.status == "running",
+                ScreeningAttempt.started_at <= now - _ORPHANED_ATTEMPT_GRACE,
+                ScreeningAttempt.deadline > now,
+            )
+            .with_for_update()
+        )
+    )
+    if not attempts:
+        return 0
+    heartbeats = list(
+        await session.scalars(
+            select(ScreenerHeartbeat).where(
+                ScreenerHeartbeat.screener_hotkey == screener_hotkey,
+                ScreenerHeartbeat.seen_at >= now - _SCREENER_HEARTBEAT_FRESHNESS,
+            )
+        )
+    )
+    if not heartbeats:
+        return 0
+
+    failed = 0
+    for attempt in attempts:
+        started_at = attempt.started_at
+        if started_at.tzinfo is None:
+            started_at = started_at.replace(tzinfo=UTC)
+        observed_after_claim = any(
+            (
+                heartbeat.seen_at
+                if heartbeat.seen_at.tzinfo is not None
+                else heartbeat.seen_at.replace(tzinfo=UTC)
+            )
+            > started_at
+            for heartbeat in heartbeats
+        )
+        still_active = any(
+            heartbeat.state == "screening"
+            and heartbeat.active_agent_id == attempt.agent_id
+            for heartbeat in heartbeats
+        )
+        if not observed_after_claim or still_active:
+            continue
+        attempt.status = "failed"
+        attempt.finished_at = now
+        attempt.public_reason = _ORPHANED_ATTEMPT_REASON
+        attempt.reason_code = _ORPHANED_ATTEMPT_REASON_CODE
+        agent = await session.get(Agent, attempt.agent_id)
+        if agent is not None and agent.status == AgentStatus.SCREENING:
+            agent.status = AgentStatus.SCREENING_FAILED
+            agent.screening_reason = _ORPHANED_ATTEMPT_REASON
+            agent.screening_reason_code = _ORPHANED_ATTEMPT_REASON_CODE
+        failed += 1
+    return failed
+
+
 async def _expired_attempt_count(session: AsyncSession, *, agent_id: UUID) -> int:
     """Count expired screening leases under the current policy **since the
     agent's most recent operator clear**.
@@ -417,6 +505,11 @@ async def claim_screening_attempts(
     # stated reason, so a refused artifact could return under a newer policy that
     # never re-derived the original finding.
     await expire_screening_attempts(session, now=now)
+    await fail_orphaned_screening_attempts(
+        session,
+        screener_hotkey=screener_hotkey,
+        now=now,
+    )
     has_running_or_backoff = exists(
         select(ScreeningAttempt.attempt_id).where(
             ScreeningAttempt.agent_id == Agent.agent_id,
