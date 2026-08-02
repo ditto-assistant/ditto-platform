@@ -43,14 +43,15 @@ class PaymentVerifier:
 
     Verification flow (single async path):
 
-    1. Fetch the extrinsic via Pylon by ``(block_number, extrinsic_index)``.
-    2. Confirm the call is ``Balances.transfer_keep_alive``.
-    3. Confirm the chain emitted ``ExtrinsicSuccess`` at the matching index.
-    4. Confirm the destination equals the configured upload-payment address.
-    5. Confirm the paid ``amount_rao`` equals the admission's TAO-denominated fee.
-    6. Confirm the extrinsic signer equals the on-chain coldkey owner of
+    1. Resolve ``block_number`` and require its canonical hash to match the proof.
+    2. Fetch the extrinsic via Pylon by ``(block_number, extrinsic_index)``.
+    3. Confirm the call is ``Balances.transfer_keep_alive``.
+    4. Confirm the chain emitted ``ExtrinsicSuccess`` at the matching index.
+    5. Confirm the destination equals the configured upload-payment address.
+    6. Confirm the paid ``amount_rao`` equals the admission's TAO-denominated fee.
+    7. Confirm the extrinsic signer equals the on-chain coldkey owner of
        the claimed hotkey at the payment block.
-    7. Pull the block timestamp and return a :class:`VerifiedPayment`
+    8. Return a :class:`VerifiedPayment` with best-effort USD reporting metadata
        ready for the orchestrator to bind into ``evaluation_payments``.
 
     Each failure path raises a distinct
@@ -86,7 +87,18 @@ class PaymentVerifier:
         legacy_amount_cutoff_at: datetime | None = None,
     ) -> VerifiedPayment:
         """Verify a payment proof end-to-end. See class docstring for flow."""
-        # 1. Pylon: fetch the extrinsic.
+        # 1. Bind the miner-supplied number/hash pair before combining Pylon's
+        # number-keyed extrinsic data with hash-keyed Substrate events/storage.
+        canonical_block_hash = (
+            await self._chain.get_block_hash(proof.block_number)
+        ).lower()
+        if canonical_block_hash != proof.block_hash.lower():
+            raise PaymentNotFoundOnChain(
+                f"block number {proof.block_number} resolves to "
+                f"{canonical_block_hash}, not {proof.block_hash}"
+            )
+
+        # 2. Pylon: fetch the extrinsic.
         try:
             ext = await self._chain.get_extrinsic(
                 proof.block_number, proof.extrinsic_index
@@ -97,7 +109,7 @@ class PaymentVerifier:
                 f"index={proof.extrinsic_index} not found on chain"
             ) from e
 
-        # 2. Call must be Balances.transfer_keep_alive.
+        # 3. Call must be Balances.transfer_keep_alive.
         if (
             ext.call_module != _EXPECTED_CALL_MODULE
             or ext.call_function != _EXPECTED_CALL_FUNCTION
@@ -107,17 +119,17 @@ class PaymentVerifier:
                 f"got {ext.call_module}.{ext.call_function}"
             )
 
-        # 3. Substrate event read: confirm success.
+        # 4. Substrate event read: confirm success.
         succeeded = await self._chain.check_extrinsic_success(
-            proof.block_hash, proof.extrinsic_index
+            canonical_block_hash, proof.extrinsic_index
         )
         if not succeeded:
             raise PaymentExtrinsicFailed(
-                f"extrinsic at block_hash={proof.block_hash} "
+                f"extrinsic at block_hash={canonical_block_hash} "
                 f"index={proof.extrinsic_index} emitted ExtrinsicFailed"
             )
 
-        # 4. Destination address.
+        # 5. Destination address.
         dest = _to_ss58(ext.call_args.get("dest"))
         if dest != self._send_address:
             raise PaymentDestinationMismatch(
@@ -125,7 +137,7 @@ class PaymentVerifier:
                 f"send_address {self._send_address!r}"
             )
 
-        # 5. Amount must equal the operator-controlled TAO fee reserved before
+        # 6. Amount must equal the operator-controlled TAO fee reserved before
         # payment. USD never decides admission; it is reporting metadata only.
         try:
             value = int(ext.call_args["value"])
@@ -133,7 +145,7 @@ class PaymentVerifier:
             raise PaymentCallTypeMismatch(
                 f"extrinsic call_args missing or non-integer value: {ext.call_args!r}"
             ) from e
-        block_ts_seconds = await self._chain.get_block_timestamp(proof.block_hash)
+        block_ts_seconds = await self._chain.get_block_timestamp(canonical_block_hash)
         block_ts = datetime.fromtimestamp(block_ts_seconds, tz=UTC)
         legacy_cutoff = (
             legacy_amount_cutoff_at.replace(tzinfo=UTC)
@@ -152,15 +164,15 @@ class PaymentVerifier:
                 f"paid {value} rao, expected {expected_amount_rao} rao"
             )
 
-        # 6. Signer must equal the on-chain coldkey owner of the hotkey.
+        # 7. Signer must equal the on-chain coldkey owner of the hotkey.
         on_chain_coldkey = await self._chain.get_coldkey_for_hotkey(
-            expected_hotkey, proof.block_hash
+            expected_hotkey, canonical_block_hash
         )
         if _to_ss58(ext.signer_address) != _to_ss58(on_chain_coldkey):
             raise PaymentSignerMismatch(
                 f"extrinsic signer {ext.signer_address!r} does not match "
                 f"on-chain coldkey {on_chain_coldkey!r} for hotkey "
-                f"{expected_hotkey} at block {proof.block_hash}"
+                f"{expected_hotkey} at block {canonical_block_hash}"
             )
 
         try:
@@ -170,7 +182,7 @@ class PaymentVerifier:
             tao_usd_rate = None
 
         verified = VerifiedPayment(
-            block_hash=proof.block_hash,
+            block_hash=canonical_block_hash,
             extrinsic_index=proof.extrinsic_index,
             miner_hotkey=expected_hotkey,
             miner_coldkey=on_chain_coldkey,
@@ -188,13 +200,13 @@ class PaymentVerifier:
                 expected_hotkey,
                 value,
                 expected_amount_rao,
-                proof.block_hash,
+                canonical_block_hash,
                 proof.extrinsic_index,
                 legacy_cutoff.isoformat(),
             )
         logger.info(
             f"payment verified hotkey={expected_hotkey} amount_rao={value} "
-            f"block_hash={proof.block_hash} idx={proof.extrinsic_index}"
+            f"block_hash={canonical_block_hash} idx={proof.extrinsic_index}"
         )
         return verified
 

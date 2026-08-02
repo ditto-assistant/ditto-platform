@@ -82,6 +82,7 @@ from ditto.db.queries.submission_settings import (
     effective_submission_settings,
     get_upload_admission,
     get_upload_admission_for_coldkey,
+    release_upload_admission_for_exact_retry,
     reserve_upload_admission,
 )
 
@@ -233,6 +234,7 @@ async def check(
         and registered
         and not banned
         and not body.allow_identical_rescore
+        and body.payment_block_hash is None
     ):
         duplicate = await get_same_hotkey_agent_by_sha(
             session, miner_hotkey=body.hotkey, sha256=body.sha256
@@ -278,13 +280,25 @@ async def check(
         )
         if payment_record is not None:
             if payment_record.agent_id is not None:
-                raise PaymentReplayedError("payment proof already used")
-            if payment_record.miner_hotkey != body.hotkey:
+                existing = await get_agent_for_payment_proof(
+                    session,
+                    block_hash=body.payment_block_hash,
+                    extrinsic_index=body.payment_extrinsic_index,
+                )
+                if not (
+                    existing is not None
+                    and existing.miner_hotkey == body.hotkey
+                    and existing.sha256 == body.sha256
+                ):
+                    raise PaymentReplayedError("payment proof already used")
+                recovery_payment_verified = True
+            elif payment_record.miner_hotkey != body.hotkey:
                 raise PaymentReplayedError(
                     "payment credit belongs to a different hotkey"
                 )
-            _ensure_payment_recovery_fresh(payment_record.timestamp)
-            recovery_payment_verified = True
+            else:
+                _ensure_payment_recovery_fresh(payment_record.timestamp)
+                recovery_payment_verified = True
         else:
             # The replay lookup autobegins a read transaction. Do not hold a
             # pooled connection across the recovery proof's chain reads.
@@ -420,7 +434,7 @@ async def upload_agent(
     5. Resolve the proof as an idempotent retry or an available duplicate-upload
        credit. Reusing an assigned proof for different upload data remains a
        3207 replay rejection.
-    6. For a fresh proof, run ``PaymentVerifier.verify_payment`` (4 chain calls;
+    6. For a fresh proof, run ``PaymentVerifier.verify_payment`` (5 chain calls;
        3201-3206 on payment rejection, 503 if chain unreachable).
     7. Detect byte-identical source under the immutable payment-time coldkey.
        Unless explicitly opted into another seed, preserve the fresh proof as a
@@ -499,17 +513,28 @@ async def upload_agent(
             and existing.sha256 == sha256
         ):
             assert existing.version is not None
+            existing_agent_id = existing.agent_id
+            existing_version = existing.version
+            existing_status = existing.status
+            if admission_token is not None:
+                await release_upload_admission_for_exact_retry(
+                    session,
+                    token=admission_token,
+                    miner_hotkey=hotkey,
+                    sha256=sha256,
+                )
+                await session.commit()
             logger.info(
                 "upload retry recovered hotkey=%s agent_id=%s version=%s block_hash=%s",
                 hotkey,
-                existing.agent_id,
-                existing.version,
+                existing_agent_id,
+                existing_version,
                 payment_block_hash,
             )
             return UploadAgentResponse(
-                agent_id=existing.agent_id,
-                version=existing.version,
-                status=existing.status,
+                agent_id=existing_agent_id,
+                version=existing_version,
+                status=existing_status,
             )
         raise PaymentReplayedError("payment proof already used by a different upload")
 
@@ -553,8 +578,9 @@ async def upload_agent(
     # 6. Chain-side verification. Typed PaymentVerifierError subclasses
     # are mapped to 3201-3206 by the envelope handler; we re-raise them
     # unchanged. A bare ChainError surfaces when one of the verifier's
-    # four chain reads cannot reach Pylon, which we treat as a 503 to
-    # match the shipped /upload/check pattern around chain.is_registered.
+    # five chain reads cannot reach the configured backends, which we treat as
+    # a 503 to match the shipped /upload/check pattern around
+    # chain.is_registered.
     verified = None
     if using_credit:
         assert credit_owner_coldkey is not None
@@ -583,6 +609,10 @@ async def upload_agent(
         session, miner_coldkey=owner_coldkey, sha256=sha256
     )
     if duplicate and not allow_identical_rescore:
+        assert duplicate.version is not None
+        duplicate_agent_id = duplicate.agent_id
+        duplicate_version = duplicate.version
+        duplicate_status = duplicate.status
         if not using_credit:
             assert verified is not None
             if session.in_transaction():
@@ -594,7 +624,7 @@ async def upload_agent(
                     await insert_evaluation_payment(
                         session,
                         verified=verified,
-                        credit_for_agent_id=duplicate.agent_id,
+                        credit_for_agent_id=duplicate_agent_id,
                     )
             except PaymentReplayedError:
                 raced = await get_evaluation_payment_for_proof(
@@ -606,13 +636,12 @@ async def upload_agent(
                     raced and raced.agent_id is None and raced.miner_hotkey == hotkey
                 ):
                     raise
-        assert duplicate.version is not None
         return UploadAgentResponse(
-            agent_id=duplicate.agent_id,
-            version=duplicate.version,
-            status=duplicate.status,
+            agent_id=duplicate_agent_id,
+            version=duplicate_version,
+            status=duplicate_status,
             payment_disposition="reusable_credit",
-            credit_for_agent_id=duplicate.agent_id,
+            credit_for_agent_id=duplicate_agent_id,
         )
 
     # The duplicate lookup autobegan a read transaction. Do not pin a pooled

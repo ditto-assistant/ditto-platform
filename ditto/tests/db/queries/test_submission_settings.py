@@ -11,6 +11,7 @@ from ditto.db.queries.agents import SubmissionCooldownError
 from ditto.db.queries.submission_settings import (
     EffectiveSubmissionSettings,
     consume_or_enforce_upload_admission,
+    release_upload_admission_for_exact_retry,
     reserve_upload_admission,
 )
 
@@ -142,6 +143,40 @@ async def test_matching_token_is_consumed_and_legacy_upload_cannot_steal_slot(
             settings=settings,
             now=now + timedelta(seconds=2),
         )
+
+
+async def test_exact_retry_releases_only_its_matching_reservation(
+    session: AsyncSession,
+) -> None:
+    now = datetime(2026, 7, 24, 20, 0, tzinfo=UTC)
+    settings = EffectiveSubmissionSettings(revision=1, cooldown_seconds=3600)
+    async with session.begin():
+        admission = await reserve_upload_admission(
+            session,
+            miner_coldkey="coldkey",
+            miner_hotkey="hotkey",
+            sha256="a" * 64,
+            settings=settings,
+            now=now,
+        )
+    async with session.begin():
+        await release_upload_admission_for_exact_retry(
+            session,
+            token=admission.token,
+            miner_hotkey="different-hotkey",
+            sha256="a" * 64,
+        )
+    assert await session.get(UploadAdmissionReservation, "coldkey") is not None
+    await session.rollback()
+
+    async with session.begin():
+        await release_upload_admission_for_exact_retry(
+            session,
+            token=admission.token,
+            miner_hotkey="hotkey",
+            sha256="a" * 64,
+        )
+    assert await session.get(UploadAdmissionReservation, "coldkey") is None
 
 
 async def test_verified_payment_rotates_reservation_to_new_archive(

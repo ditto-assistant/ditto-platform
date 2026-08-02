@@ -475,6 +475,38 @@ class TestGetWeights:
 
 
 @pytest.mark.usefixtures("install_pylon_module")
+class TestGetBlockHash:
+    async def test_returns_canonical_lowercase_hash(
+        self, install_substrate_module: AsyncMock
+    ) -> None:
+        install_substrate_module.get_block_hash.return_value = "0xABCD"
+
+        async with ChainClient(make_chain_config()) as client:
+            block_hash = await client.get_block_hash(123)
+
+        assert block_hash == "0xabcd"
+        install_substrate_module.get_block_hash.assert_awaited_once_with(123)
+
+    async def test_missing_hash_raises_not_found(
+        self, install_substrate_module: AsyncMock
+    ) -> None:
+        install_substrate_module.get_block_hash.return_value = None
+
+        async with ChainClient(make_chain_config()) as client:
+            with pytest.raises(ExtrinsicNotFoundError):
+                await client.get_block_hash(123)
+
+    async def test_timeout_is_wrapped(
+        self, install_substrate_module: AsyncMock
+    ) -> None:
+        install_substrate_module.get_block_hash.side_effect = TimeoutError()
+
+        async with ChainClient(make_chain_config()) as client:
+            with pytest.raises(ChainTimeoutError):
+                await client.get_block_hash(123)
+
+
+@pytest.mark.usefixtures("install_pylon_module")
 class TestCheckExtrinsicSuccess:
     """Tests for ChainClient.check_extrinsic_success (the Pylon-events gap)."""
 

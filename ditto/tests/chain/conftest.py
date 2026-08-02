@@ -41,6 +41,7 @@ def mock_substrate() -> AsyncMock:
     substrate.__aenter__.return_value = substrate
     substrate.__aexit__.return_value = None
     substrate.query = AsyncMock()
+    substrate.get_block_hash = AsyncMock()
     return substrate
 
 
