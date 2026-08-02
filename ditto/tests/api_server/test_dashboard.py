@@ -256,7 +256,7 @@ class TestDashboard:
         assert 'entityAnchor("agent", e.agent_id, displayAgentName)' in body
         assert "agentVersionBadge(e.agent_version)" in body
         assert "Legacy submission" in body
-        assert "<b>Compared with:</b>" in body
+        assert '"Compared with"' in body
         assert "function isFinalized(e)" in body
         assert '"Provisional leaderboard"' in body
         assert '"P" + e.rank' in body
@@ -404,7 +404,8 @@ class TestDashboard:
         assert "validator is assigned; its score is pending" in body
         assert "Score pending" in body
         assert "has this assignment" in body
-        assert "Copy review:" in body
+        assert 'reopened: "Review reopened"' in body
+        assert '"Initial comparison"' in body
         assert "screening_reason" in body
         assert '<details class="old-screeners">' in body
         assert "Old screener results" in body
@@ -705,6 +706,13 @@ class TestDashboard:
         assert "return poolMap(pageNumbers, 4, function (pageNumber) {" in body
         assert 'return getJSON(path.replace("page=1", "page=" + pageNumber));' in body
         assert "entry.review_opened_at" in body
+        assert 'reopened: "Review reopened"' in body
+        assert 'cleared: "Review cleared"' in body
+        assert 'rejected: "Review rejected"' in body
+        assert "reviewEvidenceText(e)" in body
+        assert "reviewEvidenceHtml(e)" in body
+        assert "Current operator reason" in body
+        assert "Initial hold reason" in body
         assert "entry.preserved_composite" in body
         assert 'copyButton(hotkey, "miner hotkey")' in body
         assert 'entityAnchor("agent", agentId' in body

@@ -70,6 +70,7 @@ from ditto.db.models import (
     ArtifactFetchAudit,
     ArtifactReleaseSettingsRevision,
     AthReview,
+    AthReviewAction,
     BenchmarkDataset,
     BenchmarkRollout,
     BenchmarkRolloutAudit,
@@ -3948,6 +3949,9 @@ class TestPublicActivity:
             "duplicate_name",
             "duplicate_version",
             "review_reason",
+            "review_event",
+            "review_event_at",
+            "review_original_reason",
             "review_opened_at",
             "preserved_composite",
             "score_count",
@@ -4056,6 +4060,156 @@ class TestPublicActivity:
             "opened_by",
         ):
             assert private_value not in serialized
+
+    async def test_activity_projects_latest_reopen_reason_not_original_copy_reason(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        held_id = UUID(
+            await _seed_k3(
+                session_maker,
+                miner=_MINER_A,
+                composites=[0.61, 0.62, 0.63],
+                status=AgentStatus.ATH_PENDING_REVIEW,
+            )
+        )
+        review_id = uuid4()
+        opened_at = datetime(2026, 7, 31, 20, 0, tzinfo=UTC)
+        cleared_at = datetime(2026, 7, 31, 20, 5, tzinfo=UTC)
+        reopened_at = datetime(2026, 8, 1, 13, 0, tzinfo=UTC)
+        original_reason = "Possible source similarity requires operator review."
+        reopen_reason = "Manual benchmark-integrity review of the scored artifact."
+        async with session_maker() as session, session.begin():
+            held = await session.get(Agent, held_id)
+            assert held is not None
+            # Lifecycle guards intentionally retain this historical value.
+            held.review_reason = original_reason
+            session.add(
+                AthReview(
+                    review_id=review_id,
+                    agent_id=held_id,
+                    status="pending",
+                    opened_at=opened_at,
+                    reopened_at=reopened_at,
+                    original_duplicate_of=None,
+                    original_reason=original_reason,
+                    original_policy_version=9,
+                    original_evidence={"sha256": held.sha256},
+                    algorithm_provenance={"review_kind": "copy"},
+                )
+            )
+            session.add_all(
+                [
+                    AthReviewAction(
+                        action_id=uuid4(),
+                        review_id=review_id,
+                        action="clear",
+                        reason="Same-owner lineage verified.",
+                        actor="operator@example.com",
+                        evidence={"previous_status": "scored"},
+                        created_at=cleared_at,
+                    ),
+                    AthReviewAction(
+                        action_id=uuid4(),
+                        review_id=review_id,
+                        action="reopen",
+                        reason=reopen_reason,
+                        actor="operator@example.com",
+                        evidence={
+                            "previous_status": "scored",
+                            "sha256": held.sha256,
+                            "score_count": 3,
+                        },
+                        created_at=reopened_at,
+                    ),
+                ]
+            )
+        await _activate_era(session_maker)
+        _install_db(app, session_maker)
+
+        response = await client.get(
+            "/api/v1/public/activity?review=ath&status=under_review&limit=200"
+        )
+
+        assert response.status_code == 200
+        entry = next(
+            row for row in response.json()["entries"] if row["agent_id"] == str(held_id)
+        )
+        assert entry["review_event"] == "reopened"
+        assert datetime.fromisoformat(entry["review_event_at"]) == reopened_at
+        assert datetime.fromisoformat(entry["review_opened_at"]) == reopened_at
+        assert entry["review_reason"] == reopen_reason
+        assert entry["review_original_reason"] == original_reason
+        assert "Same-owner lineage verified" not in response.text
+        assert "operator@example.com" not in response.text
+
+    async def test_activity_projects_resolution_reason_for_resolved_review(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        resolved_id = UUID(
+            await _seed_k3(
+                session_maker,
+                miner=_MINER_A,
+                composites=[0.41, 0.42, 0.43],
+                status=AgentStatus.SCORED,
+            )
+        )
+        review_id = uuid4()
+        opened_at = datetime(2026, 7, 31, 20, 0, tzinfo=UTC)
+        resolved_at = datetime(2026, 7, 31, 20, 5, tzinfo=UTC)
+        original_reason = "Possible source similarity requires operator review."
+        resolution_reason = "Same-owner lineage verified; score eligibility restored."
+        async with session_maker() as session, session.begin():
+            resolved = await session.get(Agent, resolved_id)
+            assert resolved is not None
+            resolved.review_reason = original_reason
+            session.add(
+                AthReview(
+                    review_id=review_id,
+                    agent_id=resolved_id,
+                    status="resolved",
+                    opened_at=opened_at,
+                    resolved_at=resolved_at,
+                    resolved_by="operator@example.com",
+                    resolution="clear",
+                    resolution_reason=resolution_reason,
+                    original_duplicate_of=None,
+                    original_reason=original_reason,
+                    original_policy_version=9,
+                    original_evidence={"sha256": resolved.sha256},
+                    algorithm_provenance={"review_kind": "copy"},
+                )
+            )
+            session.add(
+                AthReviewAction(
+                    action_id=uuid4(),
+                    review_id=review_id,
+                    action="clear",
+                    reason=resolution_reason,
+                    actor="operator@example.com",
+                    evidence={"previous_status": "scored"},
+                    created_at=resolved_at,
+                )
+            )
+        await _activate_era(session_maker)
+        _install_db(app, session_maker)
+
+        response = await client.get(
+            f"/api/v1/public/activity?q={resolved_id}&limit=200"
+        )
+
+        assert response.status_code == 200
+        entry = response.json()["entries"][0]
+        assert entry["review_event"] == "cleared"
+        assert datetime.fromisoformat(entry["review_event_at"]) == resolved_at
+        assert entry["review_reason"] == resolution_reason
+        assert entry["review_original_reason"] == original_reason
+        assert "operator@example.com" not in response.text
 
     async def test_previous_generation_rows_rank_behind_the_current_era(
         self,
