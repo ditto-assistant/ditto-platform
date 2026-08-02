@@ -435,7 +435,14 @@ def _provider_preferences(
 ) -> dict[str, Any]:
     if routing_mode == "aggregate_throughput":
         return {
-            "sort": "throughput",
+            # Route for reliability first. Live production evidence showed
+            # Amazon Bedrock returning HTTP 200 responses that violated the
+            # required tool-call contract; throughput sorting repeatedly sent
+            # fresh work back to that provider. OpenRouter still owns fallback
+            # within the reviewed set, but the preferred order is explicit and
+            # the known-bad provider is excluded.
+            "order": ["coreweave", "deepinfra", "groq"],
+            "ignore": ["amazon-bedrock"],
             "allow_fallbacks": True,
             "data_collection": "deny",
             "zdr": True,
@@ -449,6 +456,27 @@ def _provider_preferences(
     if quantization:
         preferences["quantizations"] = [quantization]
     return preferences
+
+
+def _openrouter_headers(
+    api_key: str, *, include_metadata: bool = False
+) -> dict[str, str]:
+    """Headers shared by every OpenRouter request made for DittoBench."""
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        # OpenRouter's official app-attribution contract. Keeping these on both
+        # chat and embedding calls prevents one workload from disappearing from
+        # the public app accounting page.
+        "HTTP-Referer": "https://heyditto.ai/",
+        "X-OpenRouter-Title": "Ditto",
+    }
+    if include_metadata:
+        # OpenRouter keeps route identity private unless explicitly requested.
+        # It is consumed for trusted telemetry and removed from the public
+        # response allowlist.
+        headers["X-OpenRouter-Metadata"] = "enabled"
+    return headers
 
 
 # How this gate treats an unexpected request field, and why it changed
@@ -1317,14 +1345,9 @@ async def proxy_chat_completions(
             request.app.state.inference_client,
             config.upstream_url,
             payload=upstream_payload,
-            headers={
-                "Authorization": f"Bearer {config.openrouter_api_key}",
-                "Content-Type": "application/json",
-                # OpenRouter keeps route identity private unless explicitly
-                # requested. It is consumed below for trusted telemetry and
-                # removed by the public response allowlist.
-                "X-OpenRouter-Metadata": "enabled",
-            },
+            headers=_openrouter_headers(
+                config.openrouter_api_key, include_metadata=True
+            ),
         )
         upstream = provider_result.response
         upstream_attempts = provider_result.attempts
@@ -1568,10 +1591,7 @@ async def proxy_embeddings(
             request.app.state.inference_client,
             config.embedding_upstream_url,
             payload=upstream_payload,
-            headers={
-                "Authorization": f"Bearer {config.openrouter_api_key}",
-                "Content-Type": "application/json",
-            },
+            headers=_openrouter_headers(config.openrouter_api_key),
         )
         upstream = provider_result.response
         upstream_attempts = provider_result.attempts

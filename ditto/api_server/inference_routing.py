@@ -1,8 +1,9 @@
 """DB-backed OpenRouter route admission, selection, and telemetry.
 
 The initial aggregate mode admits one reviewed logical OpenRouter route and
-lets OpenRouter select the fastest healthy provider for each request. Adaptive
-mode retains exact provider-per-ticket selection behind an explicit flag.
+lets OpenRouter select from an operator-ordered healthy provider set for each
+request. Adaptive mode retains exact provider-per-ticket selection behind an
+explicit flag.
 """
 
 from __future__ import annotations
@@ -50,12 +51,15 @@ def aggregate_profile_revision(model: str) -> str:
     # the explicit-medium route eligible without a fresh reviewed calibration.
     if model == V7_MODEL:
         return V7_AGGREGATE_PROFILE_REVISION
+    # Exact upstream membership was already dynamic in aggregate mode: the
+    # router could choose a different healthy provider on every request. Keep
+    # operational provider health/order outside the calibrated identity while
+    # pinning the parts that change the model contract or privacy boundary.
     profile = {
         "model": model,
         "provider": {
             "allow_fallbacks": True,
             "data_collection": "deny",
-            "sort": "throughput",
             "zdr": True,
         },
     }

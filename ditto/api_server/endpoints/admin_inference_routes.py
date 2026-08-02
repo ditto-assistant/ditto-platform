@@ -124,18 +124,30 @@ async def list_inference_routes(
             )
         ).all()
     )
+    provider_identity = func.coalesce(
+        InferenceRequest.upstream_provider, "Unknown upstream"
+    )
     provider_telemetry = list(
         (
             await session.execute(
                 select(
-                    InferenceRequest.upstream_provider,
+                    provider_identity.label("upstream_provider"),
                     func.count().label("request_count"),
                     func.sum(
                         case((InferenceRequest.status == "completed", 1), else_=0)
                     ).label("completed_count"),
                     func.sum(
+                        case((InferenceRequest.status == "failed", 1), else_=0)
+                    ).label("failed_count"),
+                    func.sum(
+                        case((InferenceRequest.status == "started", 1), else_=0)
+                    ).label("inflight_count"),
+                    func.sum(
                         case((InferenceRequest.timed_out.is_(True), 1), else_=0)
                     ).label("timeout_count"),
+                    func.sum(InferenceRequest.upstream_attempts).label(
+                        "upstream_attempt_count"
+                    ),
                     func.sum(InferenceRequest.prompt_tokens).label("prompt_tokens"),
                     func.sum(InferenceRequest.completion_tokens).label(
                         "completion_tokens"
@@ -144,11 +156,10 @@ async def list_inference_routes(
                     func.avg(InferenceRequest.latency_ms).label("average_latency_ms"),
                 )
                 .where(
-                    InferenceRequest.upstream_provider.is_not(None),
                     InferenceRequest.request_kind == "chat",
                 )
-                .group_by(InferenceRequest.upstream_provider)
-                .order_by(InferenceRequest.upstream_provider)
+                .group_by(provider_identity)
+                .order_by(provider_identity)
             )
         ).all()
     )
@@ -162,7 +173,9 @@ async def list_inference_routes(
                 model=aggregate_model,
                 provider=AGGREGATE_PROVIDER,
                 profile_revision=aggregate_profile_revision(aggregate_model),
-                provider_sort="throughput",
+                provider_sort="operator_order",
+                provider_order=["CoreWeave", "DeepInfra", "Groq"],
+                ignored_providers=["Amazon Bedrock"],
                 allow_fallbacks=True,
             )
             if routing_mode == "aggregate_throughput"
@@ -232,7 +245,10 @@ async def list_inference_routes(
                 provider=row.upstream_provider,
                 request_count=row.request_count,
                 completed_count=row.completed_count,
+                failed_count=row.failed_count,
+                inflight_count=row.inflight_count,
                 timeout_count=row.timeout_count,
+                upstream_attempt_count=row.upstream_attempt_count,
                 prompt_tokens=row.prompt_tokens,
                 completion_tokens=row.completion_tokens,
                 cost_microusd=row.cost_microusd,
