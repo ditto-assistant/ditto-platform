@@ -266,6 +266,11 @@ class TestDashboard:
         assert 'id="pipeline-overview"' in body
         assert 'class="pipeline-item-identity"' in body
         assert 'class="pipeline-item-version"' in body
+        assert 'class="pipeline-item-badges"' in body
+        assert ".pipeline-item-heading { display: flex; flex-wrap: wrap;" in body
+        assert ".pipeline-item-meta { flex: 0 0 auto; margin-left: auto;" in body
+        assert "'<span class=\"pipeline-item-meta\">' + esc(meta)" in body
+        assert "'<span class=\"pipeline-item-meta\"><span>'" not in body
         assert 'return version == null ? "Legacy" : "v" + version;' in body
         assert "agentVersionBadge(entry.version)" not in body
         assert (
