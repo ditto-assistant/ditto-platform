@@ -21,11 +21,14 @@ Prometheus-scraped liveness probe and must not fork ``git`` per request.
 from __future__ import annotations
 
 import asyncio
+import os
+import re
 import subprocess
 import threading
 import time
 
 UNKNOWN = "unknown"
+_BUILD_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 
 CHECKED_OUT_TTL_SECONDS = 15.0
 """How long a resolved checkout revision is reused.
@@ -48,8 +51,11 @@ def resolve_commit_hash() -> str:
 
     Falls back to ``"unknown"`` on any failure (subprocess error, non-zero
     exit, missing git binary, no ``.git`` directory). The fallback lets
-    deploy images without git history boot cleanly.
+    deploy artifacts without git history boot cleanly.
     """
+    baked = os.environ.get("DITTO_BUILD_COMMIT", "").strip().lower()
+    if baked:
+        return baked if _BUILD_COMMIT_RE.fullmatch(baked) else UNKNOWN
     try:
         result = subprocess.run(
             ["git", "rev-parse", "HEAD"],

@@ -50,16 +50,6 @@ def _write_migrations(repo: Path, *, diverged: bool = False) -> None:
         )
 
 
-# Sentinel: the relay is probed on the same fake health server as the API. A
-# plain ``None`` cannot mean this, because ``None`` already means "the process
-# reports no commit at all".
-_RELAY_SHARES_API_HEALTH = "<relay-shares-api-health>"
-
-# The relay is probed on a loopback URL like the API. Tests assert the prefix
-# rather than a fixed port, because the fake listener binds an ephemeral one.
-_RELAY_HEALTH_PREFIX = "http://127.0.0.1:"
-
-
 @contextmanager
 def _health_server(status: int = 200, commit: str | None = TARGET_SHA) -> Iterator[int]:
     """Serve ``status`` on any path so update.sh's post-deploy probe can pass.
@@ -105,9 +95,8 @@ def _jlist(
 ) -> str:
     """A ``pm2 jlist`` payload whose launch identity matches ecosystem.config.js.
 
-    ``ditto-api-relay-N`` are service apps like ``ditto-api``, so the verify
-    stage holds each to the same bar: HTTP 200 on its OWN port AND the commit
-    this deploy checked out.
+    The relay entries deliberately remain in PM2's saved state. update.sh must
+    ignore them because the separate release job rolls them one at a time.
     """
     exec_path = script or str(repo / ".venv" / "bin" / "python")
     common = {
@@ -157,7 +146,6 @@ def _run_update(
     uv_source: str = ":\n",
     diverged_migrations: bool = False,
     last_deploy_record: str | None = None,
-    relay_health_commit: str | None = _RELAY_SHARES_API_HEALTH,
 ) -> tuple[subprocess.CompletedProcess[str], str, str, int]:
     repo = tmp_path / "repo"
     scripts = repo / "scripts"
@@ -249,18 +237,6 @@ def _run_update(
     with ExitStack() as stack:
         port = stack.enter_context(_health_server(health_status, health_commit))
         env["API_PORT"] = str(port)
-        # Both processes are probed on their own port in production. The fake
-        # health server answers on any path, so by default point the relay at
-        # it too; without this the relay's default 8010 would be unreachable
-        # and every test would fail on the relay rather than on what it is
-        # asserting. Tests that need the two processes to disagree pass an
-        # explicit relay_health_commit, which gets its own listener.
-        relay_port = port
-        if relay_health_commit != _RELAY_SHARES_API_HEALTH:
-            relay_port = stack.enter_context(
-                _health_server(health_status, relay_health_commit)
-            )
-        env["DITTO_RELAY_PORTS"] = f"{relay_port} {relay_port}"
         result = subprocess.run(
             [str(scripts / "update.sh")],
             cwd=repo,
@@ -428,6 +404,8 @@ def test_update_reloads_in_place_when_launch_identity_matches(tmp_path: Path) ->
     assert "pm2 reload scripts/ecosystem.config.js" in actions
     assert "pm2 delete" not in actions
     assert "ditto-api: reload" in result.stdout
+    assert "--only ditto-api-relay-" not in actions
+    assert "managed by the rolling relay release" in result.stdout
 
 
 def test_update_recreates_the_app_when_the_script_path_drifted(tmp_path: Path) -> None:
@@ -489,63 +467,19 @@ def test_update_accepts_the_stopped_one_shot_cleanup_job(tmp_path: Path) -> None
 
 
 # ---------------------------------------------------------------------------
-# The inference relay (DITTO_ROLE=relay) is a second service app on this host.
-# It shares one checkout and one `alembic upgrade head`, so it cannot drift
-# from the API by revision -- but it CAN fail to restart, and a verify stage
-# that only knew the name `ditto-api` would have waved that through on pm2
-# status alone. That is the #425 defect ("pm2 `online` is not proof of life")
-# and it would have left the relay outside the #441 commit assertion too.
-
-
-def test_update_verifies_the_relay_answers_http_not_just_pm2_status(
+def test_update_does_not_touch_or_gate_on_the_separately_released_relay(
     tmp_path: Path,
 ) -> None:
-    """The relay must answer on ITS OWN port, and the log must say so."""
-    result, _, _, _ = _run_update(tmp_path, gcloud_source="exit 1\n")
-
-    assert result.returncode == 0, result.stderr
-    assert "ditto-api-relay-1: online and serving 200" in result.stdout
-    # Named with the port it was actually probed on, so an operator reading the
-    # deploy log can tell the two processes apart.
-    assert f"ditto-api-relay-1: online and serving 200 at {_RELAY_HEALTH_PREFIX}" in (
-        result.stdout
-    )
-
-
-def test_update_fails_when_the_relay_never_comes_up(tmp_path: Path) -> None:
-    """A relay stuck in `waiting restart` is a failed deploy, named as such."""
+    """A normal API deploy must leave both relay slots serving throughout."""
     result, _, _, _ = _run_update(
         tmp_path,
         gcloud_source="exit 1\n",
         jlist=_jlist(tmp_path / "repo", relay_status="waiting restart"),
-        health_timeout="4",
     )
 
-    assert result.returncode != 0
-    assert "ditto-api-relay-1" in result.stderr
-    assert "did not come up" in result.stderr
-
-
-def test_update_fails_when_the_relay_serves_a_stale_commit(tmp_path: Path) -> None:
-    """Both processes must report the revision THIS deploy checked out.
-
-    One checkout and one restart make revision drift structurally impossible in
-    the ordinary path, so reaching this state means the relay never restarted
-    into the new build -- the failure the assertion exists to catch.
-    """
-    result, _, _, _ = _run_update(
-        tmp_path,
-        gcloud_source="exit 1\n",
-        relay_health_commit=RUNNING_SHA,
-        health_timeout="4",
-    )
-
-    assert result.returncode != 0
-    assert "ditto-api-relay-1" in result.stderr
-    assert f"is serving commit {RUNNING_SHA}" in result.stderr
-    assert f"this deploy checked out {TARGET_SHA}" in result.stderr
-    # The API itself was fine, so the relay is what has to be named.
-    assert "the process never restarted into this build" in result.stderr
+    assert result.returncode == 0, result.stderr
+    assert "--only ditto-api-relay-" not in _actions(tmp_path)
+    assert "managed by the rolling relay release" in result.stdout
 
 
 # ---------------------------------------------------------------------------

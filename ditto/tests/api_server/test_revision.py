@@ -18,6 +18,19 @@ def _clear_cache():
 
 
 class TestResolveCommitHash:
+    def test_prefers_the_release_commit_without_a_git_checkout(self, monkeypatch):
+        commit = "a" * 40
+        monkeypatch.setenv("DITTO_BUILD_COMMIT", commit.upper())
+        with patch("ditto.api_server.revision.subprocess.run") as run:
+            assert revision.resolve_commit_hash() == commit
+        run.assert_not_called()
+
+    def test_invalid_release_commit_fails_closed(self, monkeypatch):
+        monkeypatch.setenv("DITTO_BUILD_COMMIT", "main")
+        with patch("ditto.api_server.revision.subprocess.run") as run:
+            assert revision.resolve_commit_hash() == "unknown"
+        run.assert_not_called()
+
     def test_returns_hex_on_success(self):
         result = MagicMock(returncode=0, stdout="abcdef1234567890\n")
         with patch("ditto.api_server.revision.subprocess.run", return_value=result):

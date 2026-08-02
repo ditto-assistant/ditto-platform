@@ -5,11 +5,13 @@ name: Deploy
 #
 # Persistent infra (VMs, Postgres, buckets, DNS, the deploy SA) is provisioned
 # out of band by the infra repo's envs/gcp-platform Terraform + Ansible. This
-# workflow only ships new code: it authenticates via Workload Identity Federation
-# (no static keys), IAP-SSHes into the matching VM, and runs scripts/update.sh
-# (fetch -> reset -> preflight -> uv sync -> load the optional Taostats key
-# directly from Secret Manager -> ensure Pylon -> migrate -> pm2 reload ->
-# verify the app is serving the commit that was checked out).
+# workflow only ships new code. The ordinary API deploy authenticates with
+# Workload Identity Federation (no static keys), IAP-SSHes into the matching
+# VM, and runs scripts/update.sh. On main pushes that touch relay runtime paths,
+# a sibling job builds a wheel plus locked dependencies at the same time. After
+# the API deploy has migrated and verified that exact commit, relay-release
+# installs the artifact under a commit-specific path and rolls the two PM2
+# relay services one at a time. There is always one relay left behind Caddy.
 #
 # A green run means the public host answered /health on the revision the deploy
 # put there. It does NOT mean only that a script exited 0: update.sh compares
@@ -54,7 +56,65 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  changes:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    outputs:
+      relay: ${{ steps.paths.outputs.relay }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Detect relay runtime changes
+        id: paths
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          echo "relay=false" >> "$GITHUB_OUTPUT"
+          if [ "$GITHUB_REF_NAME" != "main" ] || [ "$GITHUB_EVENT_NAME" != "push" ]; then
+            exit 0
+          fi
+          if [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+            changed="$(git diff-tree --no-commit-id --name-only -r "$GITHUB_SHA")"
+          else
+            changed="$(git diff --name-only "$BEFORE" "$GITHUB_SHA")"
+          fi
+          if printf '%s\n' "$changed" | grep -Eq \
+            '^(ditto/|alembic/|pyproject\.toml$|uv\.lock$|scripts/ecosystem\.config\.js$|scripts/deploy-relay-release\.sh$|\.github/workflows/deploy\.yml$)'; then
+            echo "relay=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  relay-build:
+    needs: changes
+    if: needs.changes.outputs.relay == 'true'
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+
+      - name: Build immutable relay artifact
+        run: |
+          set -euo pipefail
+          mkdir relay-artifact
+          uv build --wheel --out-dir relay-artifact
+          uv export --frozen --no-dev --no-emit-project \
+            --format requirements-txt --output-file relay-artifact/requirements.lock \
+            >/dev/null
+          cp scripts/ecosystem.config.js relay-artifact/ecosystem.config.js
+          cp scripts/deploy-relay-release.sh relay-artifact/deploy-relay-release.sh
+          printf '%s\n' "$GITHUB_SHA" > relay-artifact/source-commit
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: platform-relay-${{ github.sha }}
+          path: relay-artifact/
+          if-no-files-found: error
+          retention-days: 1
+
   deploy:
+    needs: changes
     runs-on: blacksmith-4vcpu-ubuntu-2404
     # GitHub Environment selects the per-env DITTO_UPLOAD_PAYMENT_ADDRESS secret
     # (and enables optional required-reviewer gating on prod).
@@ -290,3 +350,56 @@ jobs:
           else
             echo "::warning::could not deregister this run's deploy key; it expires on its own TTL"
           fi
+
+  relay-release:
+    needs: [changes, relay-build, deploy]
+    if: >-
+      always() &&
+      needs.changes.outputs.relay == 'true' &&
+      needs.relay-build.result == 'success' &&
+      needs.deploy.result == 'success'
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    environment: prod
+    env:
+      GCP_ZONE: us-central1-a
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: platform-relay-${{ github.sha }}
+          path: relay-artifact
+
+      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_PLATFORM_DEPLOY_SA }}
+
+      - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+
+      - name: Register release SSH key
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          ssh-keygen -t rsa -b 2048 -N '' -q \
+            -C "gha-relay-${{ github.run_id }}-${{ github.run_attempt }}" \
+            -f ~/.ssh/google_compute_engine
+          gcloud compute os-login ssh-keys add \
+            --key-file ~/.ssh/google_compute_engine.pub --ttl 45m >/dev/null
+
+      - name: Roll relay services without shared downtime
+        run: |
+          set -euo pipefail
+          remote_artifact="/tmp/platform-relay-$GITHUB_SHA"
+          tar --create --gzip --file relay-artifact.tgz --directory relay-artifact .
+          gcloud compute scp relay-artifact.tgz \
+            "ditto-platform-prod:$remote_artifact.tgz" \
+            --zone "$GCP_ZONE" --tunnel-through-iap --quiet
+          gcloud compute ssh ditto-platform-prod \
+            --zone "$GCP_ZONE" --tunnel-through-iap --quiet \
+            --command "mkdir -p '$remote_artifact' && tar --extract --gzip --file '$remote_artifact.tgz' --directory '$remote_artifact' && sudo install -d -o deploy -g ditto /opt/ditto-platform-relay && sudo -iu deploy bash '$remote_artifact/deploy-relay-release.sh' '$remote_artifact' '$GITHUB_SHA'; code=\$?; rm -rf '$remote_artifact' '$remote_artifact.tgz'; exit \$code"
+
+      - name: Deregister release SSH key
+        if: always()
+        continue-on-error: true
+        run: |
+          gcloud compute os-login ssh-keys remove \
+            --key-file ~/.ssh/google_compute_engine.pub >/dev/null 2>&1 || true

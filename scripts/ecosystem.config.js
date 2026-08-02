@@ -94,6 +94,9 @@ const relayApp = (port, index) => ({
     // The only per-process differences. /opt/ditto-platform/.env is SHARED by
     // every process here, so the role cannot come from there.
     DITTO_ROLE: "relay",
+    // Wheel-based relay releases have no .git checkout. CI supplies the exact
+    // source SHA and /health validates it before each rolling handover.
+    DITTO_BUILD_COMMIT: process.env.DITTO_BUILD_COMMIT || "",
     API_PORT: String(port),
     POSTGRES_POOL_MIN_SIZE: "5",
     POSTGRES_POOL_MAX_SIZE: "12",
@@ -111,7 +114,10 @@ const relayApp = (port, index) => ({
   max_restarts: 10,
   min_uptime: "10s",
   restart_delay: 2000,
-  kill_timeout: 35000,
+  // Provider reads can legitimately run for up to 120s. Once SIGINT closes
+  // this slot to new work, let its existing requests finish while Caddy sends
+  // new calls to the sibling relay.
+  kill_timeout: 135000,
   max_memory_restart: "3072M",
   out_file: path.join(root, "logs", `ditto-api-relay-${index + 1}.out.log`),
   error_file: path.join(root, "logs", `ditto-api-relay-${index + 1}.err.log`),
