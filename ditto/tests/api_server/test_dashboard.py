@@ -264,6 +264,14 @@ class TestDashboard:
         assert 'id="activity-rows"' in body
         assert 'id="activity-pager"' in body
         assert 'id="pipeline-overview"' in body
+        assert 'class="pipeline-item-identity"' in body
+        assert 'class="pipeline-item-version"' in body
+        assert 'return version == null ? "Legacy" : "v" + version;' in body
+        assert "agentVersionBadge(entry.version)" not in body
+        assert (
+            """'<span class="pipeline-item-meta"><span>' + """
+            """esc(String(entry.agent_id || "").slice(0, 8))""" not in body
+        )
         assert "Network operations" in body
         assert "Waiting for screening" in body
         assert "Waiting for scores" in body
