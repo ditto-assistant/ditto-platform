@@ -76,8 +76,7 @@ jobs:
           else
             changed="$(git diff --name-only "$BEFORE" "$GITHUB_SHA")"
           fi
-          if printf '%s\n' "$changed" | grep -Eq \
-            '^(ditto/|alembic/|pyproject\.toml$|uv\.lock$|scripts/ecosystem\.config\.js$|scripts/deploy-relay-release\.sh$|\.github/workflows/deploy\.yml$)'; then
+          if scripts/relay-runtime-changed.sh <<< "$changed"; then
             echo "relay=true" >> "$GITHUB_OUTPUT"
           fi
 
