@@ -34,6 +34,7 @@ from ditto.api_server.payment_verifier.errors import (
     PaymentDestinationMismatch,
     PaymentExtrinsicFailed,
     PaymentNotFoundOnChain,
+    PaymentRecoveryExpired,
     PaymentReplayedError,
     PaymentSignerMismatch,
     PaymentVerifierError,
@@ -51,6 +52,7 @@ __all__ = [
     # Errors
     "PaymentVerifierError",
     "PaymentNotFoundOnChain",
+    "PaymentRecoveryExpired",
     "PaymentExtrinsicFailed",
     "PaymentCallTypeMismatch",
     "PaymentAmountMismatch",

@@ -20,7 +20,7 @@ import inspect
 import logging
 import os
 import uuid
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Annotated
 
 import bittensor
@@ -55,6 +55,7 @@ from ditto.api_server.fingerprint import (
 )
 from ditto.api_server.payment_verifier import (
     PaymentProof,
+    PaymentRecoveryExpired,
     PaymentReplayedError,
     PaymentVerifier,
 )
@@ -76,6 +77,7 @@ from ditto.db.queries.payments import (
     insert_evaluation_payment,
 )
 from ditto.db.queries.submission_settings import (
+    UPLOAD_ADMISSION_TTL,
     consume_or_enforce_upload_admission,
     effective_submission_settings,
     get_upload_admission,
@@ -138,6 +140,19 @@ MAX_TARBALL_SIZE_BYTES = _tarball_size_cap_from_env()
 # Streaming read chunk size. 256 KiB keeps memory bounded while letting
 # size + sha256 update incrementally without re-reading the body.
 _CHUNK_SIZE_BYTES = 256 * 1024
+
+
+def _as_utc(timestamp: datetime) -> datetime:
+    return timestamp.replace(tzinfo=UTC) if timestamp.tzinfo is None else timestamp
+
+
+def _ensure_payment_recovery_fresh(block_timestamp: datetime) -> None:
+    timestamp = _as_utc(block_timestamp)
+    if timestamp + UPLOAD_ADMISSION_TTL <= datetime.now(UTC):
+        raise PaymentRecoveryExpired(
+            f"payment at {timestamp.isoformat()} is outside the 24-hour window"
+        )
+
 
 ChainDep = Annotated["ChainClient", Depends(get_chain_client)]
 PaymentVerifierDep = Annotated[PaymentVerifier, Depends(get_payment_verifier)]
@@ -235,6 +250,10 @@ async def check(
         if owner_coldkey is not None
         else None
     )
+    if reserved_admission is not None and _as_utc(
+        reserved_admission.expires_at
+    ) <= datetime.now(UTC):
+        reserved_admission = None
     expected_recovery_amount_rao = (
         reserved_admission.fee_amount_rao
         if reserved_admission is not None
@@ -259,6 +278,7 @@ async def check(
                 raise PaymentReplayedError(
                     "payment credit belongs to a different hotkey"
                 )
+            _ensure_payment_recovery_fresh(payment_record.timestamp)
             recovery_payment_verified = True
         else:
             # The replay lookup autobegins a read transaction. Do not hold a
@@ -276,12 +296,18 @@ async def check(
                     ),
                     expected_hotkey=body.hotkey,
                     expected_amount_rao=expected_recovery_amount_rao,
+                    legacy_amount_cutoff_at=(
+                        reserved_admission.legacy_payment_cutoff_at
+                        if reserved_admission is not None
+                        else None
+                    ),
                 )
             except ChainError as e:
                 logger.warning(f"chain unreachable during /upload/check recovery: {e}")
                 raise HTTPException(
                     status_code=503, detail="chain unavailable; retry shortly"
                 ) from e
+            _ensure_payment_recovery_fresh(verified.block_timestamp)
             recovery_payment_verified = True
             if verified.miner_coldkey != owner_coldkey:
                 raise PaymentReplayedError(
@@ -326,17 +352,28 @@ async def check(
             codes.append(ERROR_CODE_SUBMISSION_COOLDOWN)
             messages.append(f"owner coldkey may submit again at {retry_at.isoformat()}")
 
+    payment_required = not codes and not recovery_payment_verified
     return UploadCheckResponse(
         ok=not codes,
         error_codes=codes,
         messages=messages,
-        payment_required=not codes and not recovery_payment_verified,
+        payment_required=payment_required,
         identical_agent_id=duplicate.agent_id if duplicate else None,
         identical_agent_status=duplicate.status if duplicate else None,
         retry_at=retry_at,
         admission_token=admission.token if admission else None,
         admission_expires_at=admission.expires_at if admission else None,
         cooldown_seconds=settings.cooldown_seconds,
+        payment_amount_rao=(
+            admission.fee_amount_rao
+            if admission is not None and payment_required
+            else None
+        ),
+        payment_send_address=(
+            request.app.state.config.upload_payment_address
+            if admission is not None and payment_required
+            else None
+        ),
     )
 
 
@@ -484,6 +521,8 @@ async def upload_agent(
         raise PaymentReplayedError("payment proof already used by a different upload")
     if payment_record and payment_record.miner_hotkey != hotkey:
         raise PaymentReplayedError("payment credit belongs to a different hotkey")
+    if payment_record:
+        _ensure_payment_recovery_fresh(payment_record.timestamp)
     using_credit = bool(payment_record)
     credit_owner_coldkey = payment_record.miner_coldkey if payment_record else None
     admission = (
@@ -527,12 +566,18 @@ async def upload_agent(
                 ),
                 expected_hotkey=hotkey,
                 expected_amount_rao=expected_amount_rao,
+                legacy_amount_cutoff_at=(
+                    admission.legacy_payment_cutoff_at
+                    if admission is not None
+                    else None
+                ),
             )
         except ChainError as e:
             logger.warning(f"chain unreachable during /upload/agent verify: {e}")
             raise HTTPException(
                 status_code=503, detail="chain unavailable; retry shortly"
             ) from e
+        _ensure_payment_recovery_fresh(verified.block_timestamp)
         owner_coldkey = verified.miner_coldkey
 
     duplicate = await get_same_owner_agent_by_sha(

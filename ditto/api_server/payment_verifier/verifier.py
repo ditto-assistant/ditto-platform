@@ -83,6 +83,7 @@ class PaymentVerifier:
         proof: PaymentProof,
         expected_hotkey: str,
         expected_amount_rao: int,
+        legacy_amount_cutoff_at: datetime | None = None,
     ) -> VerifiedPayment:
         """Verify a payment proof end-to-end. See class docstring for flow."""
         # 1. Pylon: fetch the extrinsic.
@@ -132,7 +133,21 @@ class PaymentVerifier:
             raise PaymentCallTypeMismatch(
                 f"extrinsic call_args missing or non-integer value: {ext.call_args!r}"
             ) from e
-        if value != expected_amount_rao:
+        block_ts_seconds = await self._chain.get_block_timestamp(proof.block_hash)
+        block_ts = datetime.fromtimestamp(block_ts_seconds, tz=UTC)
+        legacy_cutoff = (
+            legacy_amount_cutoff_at.replace(tzinfo=UTC)
+            if legacy_amount_cutoff_at is not None
+            and legacy_amount_cutoff_at.tzinfo is None
+            else legacy_amount_cutoff_at
+        )
+        accepted_under_legacy_fee_amnesty = (
+            value > 0
+            and value != expected_amount_rao
+            and legacy_cutoff is not None
+            and block_ts <= legacy_cutoff
+        )
+        if value != expected_amount_rao and not accepted_under_legacy_fee_amnesty:
             raise PaymentAmountMismatch(
                 f"paid {value} rao, expected {expected_amount_rao} rao"
             )
@@ -147,10 +162,6 @@ class PaymentVerifier:
                 f"on-chain coldkey {on_chain_coldkey!r} for hotkey "
                 f"{expected_hotkey} at block {proof.block_hash}"
             )
-
-        # 7. Block timestamp.
-        block_ts_seconds = await self._chain.get_block_timestamp(proof.block_hash)
-        block_ts = datetime.fromtimestamp(block_ts_seconds, tz=UTC)
 
         try:
             tao_usd_rate = await self._oracle.get_tao_usd()
@@ -167,7 +178,20 @@ class PaymentVerifier:
             tao_usd_rate=tao_usd_rate,
             dest_address=dest,
             block_timestamp=block_ts,
+            accepted_under_legacy_fee_amnesty=accepted_under_legacy_fee_amnesty,
         )
+        if accepted_under_legacy_fee_amnesty:
+            assert legacy_cutoff is not None
+            logger.warning(
+                "accepted legacy upload payment hotkey=%s paid_rao=%s "
+                "expected_rao=%s block_hash=%s idx=%s cutoff=%s",
+                expected_hotkey,
+                value,
+                expected_amount_rao,
+                proof.block_hash,
+                proof.extrinsic_index,
+                legacy_cutoff.isoformat(),
+            )
         logger.info(
             f"payment verified hotkey={expected_hotkey} amount_rao={value} "
             f"block_hash={proof.block_hash} idx={proof.extrinsic_index}"
