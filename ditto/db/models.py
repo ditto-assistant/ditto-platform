@@ -577,6 +577,53 @@ class AthReviewAction(Base):
     )
 
 
+class ScreeningRetryOverride(Base):
+    """Append-only operator grant that waives one failed attempt's backoff."""
+
+    __tablename__ = "screening_retry_overrides"
+
+    override_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), primary_key=True)
+    agent_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), nullable=False)
+    attempt_id: Mapped[UUID] = mapped_column(SaUUID(as_uuid=True), nullable=False)
+    artifact_sha256: Mapped[str] = mapped_column(Text, nullable=False)
+    expected_score_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    actor: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        ForeignKeyConstraint(["agent_id"], ["agents.agent_id"], ondelete="CASCADE"),
+        ForeignKeyConstraint(
+            ["attempt_id"], ["screening_attempts.attempt_id"], ondelete="CASCADE"
+        ),
+        UniqueConstraint("attempt_id", name="screening_retry_overrides_attempt_key"),
+        CheckConstraint(
+            "length(artifact_sha256) = 64",
+            name="screening_retry_overrides_sha_length_check",
+        ),
+        CheckConstraint(
+            "expected_score_count >= 0",
+            name="screening_retry_overrides_score_count_check",
+        ),
+        CheckConstraint(
+            "length(trim(reason)) BETWEEN 8 AND 500",
+            name="screening_retry_overrides_reason_check",
+        ),
+        CheckConstraint(
+            "length(trim(actor)) BETWEEN 1 AND 120",
+            name="screening_retry_overrides_actor_check",
+        ),
+        Index(
+            "screening_retry_overrides_agent_created_idx",
+            "agent_id",
+            "created_at",
+            "override_id",
+        ),
+    )
+
+
 class ScreeningQuarantine(Base):
     """Append-only quarantine decision plus its operator resolution."""
 

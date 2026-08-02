@@ -174,6 +174,27 @@ class AdminScreeningRescreenResponse(BaseModel):
     agent_status: str
 
 
+class AdminScreeningRetryNowRequest(BaseModel):
+    """Compare-and-swap guards for waiving one failed attempt's backoff."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    reason: Annotated[str, Field(min_length=8, max_length=500)]
+    expected_sha256: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+    expected_score_count: Annotated[int, Field(ge=0)]
+    expected_attempt_id: UUID
+
+
+class AdminScreeningRetryNowResponse(BaseModel):
+    override_id: UUID
+    agent_id: UUID
+    attempt_id: UUID
+    agent_status: str
+    backoff_deadline: datetime
+    created_at: datetime
+    idempotent: bool = False
+
+
 class AdminBenchmarkContractRefreshRequest(BaseModel):
     """Compare-and-swap guard for rebuilding one stale benchmark contract."""
 
