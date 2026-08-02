@@ -737,6 +737,58 @@ def _wire_full_stack(app: FastAPI) -> dict[str, MagicMock]:
 
 
 class TestUploadAgentHappyPath:
+    async def test_payment_terms_are_snapshotted_before_session_rollback(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        deps = _wire_full_stack(app)
+        kp = bittensor.Keypair.create_from_uri("//Alice")
+        verifier = _override_payment_verifier(
+            app, verified=_make_verified_payment(miner_hotkey=kp.ss58_address)
+        )
+        rollback_count = 0
+        cutoff = datetime.now(UTC)
+
+        class Reservation:
+            miner_hotkey = kp.ss58_address
+            sha256 = _GOOD_TAR_SHA
+            fee_amount_rao = 40_000_000
+
+            @property
+            def legacy_payment_cutoff_at(self) -> datetime:
+                if rollback_count >= 2:
+                    raise RuntimeError("expired ORM attribute was accessed")
+                return cutoff
+
+        async def _rollback() -> None:
+            nonlocal rollback_count
+            rollback_count += 1
+
+        deps["session"].in_transaction.return_value = True
+        deps["session"].rollback = AsyncMock(side_effect=_rollback)
+        monkeypatch.setattr(
+            "ditto.api_server.endpoints.upload.get_upload_admission",
+            AsyncMock(return_value=Reservation()),
+        )
+        monkeypatch.setattr(
+            "ditto.api_server.endpoints.upload.get_same_owner_agent_by_sha",
+            AsyncMock(return_value=None),
+        )
+        data, files = _upload_agent_form(keypair=kp)
+        data["admission_token"] = str(uuid4())
+
+        response = await client.post("/api/v1/upload/agent", data=data, files=files)
+
+        assert response.status_code == 200, response.text
+        assert rollback_count >= 2
+        assert verifier.verify_payment.await_args is not None
+        assert (
+            verifier.verify_payment.await_args.kwargs["legacy_amount_cutoff_at"]
+            == cutoff
+        )
+
     async def test_identical_paid_upload_returns_reusable_credit(
         self,
         app: FastAPI,

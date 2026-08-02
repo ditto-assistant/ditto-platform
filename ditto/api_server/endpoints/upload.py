@@ -537,9 +537,11 @@ async def upload_agent(
         admission = None
     if admission is not None:
         expected_amount_rao = admission.fee_amount_rao
+        legacy_payment_cutoff_at = admission.legacy_payment_cutoff_at
     else:
         settings = await effective_submission_settings(session)
         expected_amount_rao = settings.fee_amount_rao
+        legacy_payment_cutoff_at = None
 
     # The replay lookup autobegan a read transaction. Release that pooled
     # connection before the slow chain/storage/fingerprint work below.
@@ -567,11 +569,7 @@ async def upload_agent(
                 ),
                 expected_hotkey=hotkey,
                 expected_amount_rao=expected_amount_rao,
-                legacy_amount_cutoff_at=(
-                    admission.legacy_payment_cutoff_at
-                    if admission is not None
-                    else None
-                ),
+                legacy_amount_cutoff_at=legacy_payment_cutoff_at,
             )
         except ChainError as e:
             logger.warning(f"chain unreachable during /upload/agent verify: {e}")
