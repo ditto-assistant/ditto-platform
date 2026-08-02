@@ -28,6 +28,7 @@ from ditto.api_server.middleware.error_envelope import (
     ERROR_CODE_PAYMENT_DESTINATION_MISMATCH,
     ERROR_CODE_PAYMENT_EXTRINSIC_FAILED,
     ERROR_CODE_PAYMENT_NOT_FOUND,
+    ERROR_CODE_PAYMENT_RECOVERY_EXPIRED,
     ERROR_CODE_PAYMENT_REPLAYED,
     ERROR_CODE_PAYMENT_SIGNER_MISMATCH,
     ERROR_CODE_PAYMENT_VERIFIER,
@@ -45,6 +46,7 @@ from ditto.api_server.payment_verifier import (
     PaymentDestinationMismatch,
     PaymentExtrinsicFailed,
     PaymentNotFoundOnChain,
+    PaymentRecoveryExpired,
     PaymentReplayedError,
     PaymentSignerMismatch,
     PaymentVerifierError,
@@ -251,6 +253,10 @@ class TestPaymentVerifierEnvelope:
             (PaymentNotFoundOnChain("nope"), ERROR_CODE_PAYMENT_NOT_FOUND),
             (PaymentExtrinsicFailed("failed"), ERROR_CODE_PAYMENT_EXTRINSIC_FAILED),
             (PaymentAmountMismatch("band"), ERROR_CODE_PAYMENT_AMOUNT_MISMATCH),
+            (
+                PaymentRecoveryExpired("expired"),
+                ERROR_CODE_PAYMENT_RECOVERY_EXPIRED,
+            ),
             (
                 PaymentDestinationMismatch("dest"),
                 ERROR_CODE_PAYMENT_DESTINATION_MISMATCH,

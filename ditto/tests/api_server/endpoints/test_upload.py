@@ -33,6 +33,7 @@ from ditto.api_server.middleware.error_envelope import (
     ERROR_CODE_PAYMENT_DESTINATION_MISMATCH,
     ERROR_CODE_PAYMENT_EXTRINSIC_FAILED,
     ERROR_CODE_PAYMENT_NOT_FOUND,
+    ERROR_CODE_PAYMENT_RECOVERY_EXPIRED,
     ERROR_CODE_PAYMENT_REPLAYED,
     ERROR_CODE_PAYMENT_SIGNER_MISMATCH,
 )
@@ -42,6 +43,7 @@ from ditto.api_server.payment_verifier import (
     PaymentDestinationMismatch,
     PaymentExtrinsicFailed,
     PaymentNotFoundOnChain,
+    PaymentRecoveryExpired,
     PaymentReplayedError,
     PaymentSignerMismatch,
     VerifiedPayment,
@@ -209,6 +211,7 @@ class TestUploadCheck:
                 token=token,
                 expires_at=expires_at,
                 cooldown_seconds=3600,
+                fee_amount_rao=40_000_000,
             )
         )
         monkeypatch.setattr(
@@ -225,6 +228,8 @@ class TestUploadCheck:
         assert result["admission_token"] == str(token)
         assert result["admission_expires_at"] == "2026-07-24T20:30:00Z"
         assert result["cooldown_seconds"] == 3600
+        assert result["payment_amount_rao"] == 40_000_000
+        assert result["payment_send_address"]
         reserve.assert_awaited_once()
 
     async def test_unconsumed_payment_reassigns_same_hotkey_reservation(
@@ -251,6 +256,7 @@ class TestUploadCheck:
                 return_value=SimpleNamespace(
                     agent_id=None,
                     miner_hotkey=_make_keypair().ss58_address,
+                    timestamp=datetime.now(UTC),
                 )
             ),
         )
@@ -271,6 +277,39 @@ class TestUploadCheck:
         assert response.json()["admission_token"] == str(token)
         assert reserve.await_args is not None
         assert reserve.await_args.kwargs["replace_existing"] is True
+
+    async def test_payment_older_than_recovery_window_is_rejected(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        override_get_chain_client(app)
+        kp = _make_keypair()
+        _override_payment_verifier(
+            app,
+            verified=_make_verified_payment(
+                miner_hotkey=kp.ss58_address,
+                block_timestamp=datetime.now(UTC) - timedelta(hours=24, seconds=1),
+            ),
+        )
+        monkeypatch.setattr(
+            "ditto.api_server.endpoints.upload.get_evaluation_payment_for_proof",
+            AsyncMock(return_value=None),
+        )
+
+        response = await client.post(
+            "/api/v1/upload/check",
+            json={
+                **_signed_request_body(keypair=kp),
+                "payment_block_hash": _GOOD_BLOCK_HASH,
+                "payment_block_number": 13579,
+                "payment_extrinsic_index": 7,
+            },
+        )
+
+        assert response.status_code == 402
+        assert response.json()["error_code"] == ERROR_CODE_PAYMENT_RECOVERY_EXPIRED
 
     async def test_partial_recovery_payment_proof_is_rejected(
         self, app: FastAPI, client: httpx.AsyncClient
@@ -526,7 +565,7 @@ def _make_verified_payment(**overrides: Any) -> VerifiedPayment:
         "amount_rao": 17_500_000,
         "tao_usd_rate": Decimal("400"),
         "dest_address": "5SendAddress",
-        "block_timestamp": datetime(2026, 5, 19, 12, 0, tzinfo=UTC),
+        "block_timestamp": datetime.now(UTC),
     }
     base.update(overrides)
     return VerifiedPayment(**base)
@@ -681,6 +720,7 @@ class TestUploadAgentHappyPath:
             credit_for_agent_id=uuid4(),
             miner_hotkey=kp.ss58_address,
             miner_coldkey="5Coldkey",
+            timestamp=datetime.now(UTC),
         )
         monkeypatch.setattr(
             "ditto.api_server.endpoints.upload.get_evaluation_payment_for_proof",
@@ -700,6 +740,34 @@ class TestUploadAgentHappyPath:
         deps["storage"].put_object.assert_awaited_once()
         assert str(credit.agent_id) == response.json()["agent_id"]
         assert credit.credit_for_agent_id is None
+
+    async def test_expired_credit_cannot_fund_a_different_artifact(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        deps = _wire_full_stack(app)
+        kp = bittensor.Keypair.create_from_uri("//Alice")
+        credit = SimpleNamespace(
+            agent_id=None,
+            credit_for_agent_id=uuid4(),
+            miner_hotkey=kp.ss58_address,
+            miner_coldkey="5Coldkey",
+            timestamp=datetime.now(UTC) - timedelta(hours=24, seconds=1),
+        )
+        monkeypatch.setattr(
+            "ditto.api_server.endpoints.upload.get_evaluation_payment_for_proof",
+            AsyncMock(return_value=credit),
+        )
+        data, files = _upload_agent_form(keypair=kp, sha256=_GOOD_TAR_SHA)
+
+        response = await client.post("/api/v1/upload/agent", data=data, files=files)
+
+        assert response.status_code == 402
+        assert response.json()["error_code"] == ERROR_CODE_PAYMENT_RECOVERY_EXPIRED
+        deps["verifier"].verify_payment.assert_not_awaited()
+        deps["storage"].put_object.assert_not_awaited()
 
     async def test_returns_agent_id_and_uploaded_status(
         self, app: FastAPI, client: httpx.AsyncClient
@@ -971,6 +1039,10 @@ class TestUploadAgentPaymentVerifierBranches:
             (PaymentNotFoundOnChain("nope"), ERROR_CODE_PAYMENT_NOT_FOUND),
             (PaymentExtrinsicFailed("failed"), ERROR_CODE_PAYMENT_EXTRINSIC_FAILED),
             (PaymentAmountMismatch("band"), ERROR_CODE_PAYMENT_AMOUNT_MISMATCH),
+            (
+                PaymentRecoveryExpired("expired"),
+                ERROR_CODE_PAYMENT_RECOVERY_EXPIRED,
+            ),
             (
                 PaymentDestinationMismatch("dest"),
                 ERROR_CODE_PAYMENT_DESTINATION_MISMATCH,

@@ -36,6 +36,7 @@ from ditto.api_server.payment_verifier import (
     PaymentDestinationMismatch,
     PaymentExtrinsicFailed,
     PaymentNotFoundOnChain,
+    PaymentRecoveryExpired,
     PaymentReplayedError,
     PaymentSignerMismatch,
     PaymentVerifierError,
@@ -74,6 +75,7 @@ ERROR_CODE_PAYMENT_DESTINATION_MISMATCH = 3204
 ERROR_CODE_PAYMENT_SIGNER_MISMATCH = 3205
 ERROR_CODE_PAYMENT_CALL_TYPE_MISMATCH = 3206
 ERROR_CODE_PAYMENT_REPLAYED = 3207
+ERROR_CODE_PAYMENT_RECOVERY_EXPIRED = 3208
 
 # Validator-side error codes (4xxx range). Surfaced to the validator daemon
 # driving the evaluate -> score loop; distinct from the agent-side 1xxx codes.
@@ -357,6 +359,17 @@ def register_exception_handlers(app: FastAPI) -> None:
         logger.info(f"payment amount mismatch: {exc}")
         return _envelope_response(
             402, ERROR_CODE_PAYMENT_AMOUNT_MISMATCH, "payment amount mismatch"
+        )
+
+    @app.exception_handler(PaymentRecoveryExpired)
+    async def _payment_recovery_expired_handler(
+        _request: Request, exc: PaymentRecoveryExpired
+    ) -> JSONResponse:
+        logger.info(f"payment recovery window expired: {exc}")
+        return _envelope_response(
+            402,
+            ERROR_CODE_PAYMENT_RECOVERY_EXPIRED,
+            "payment recovery window expired",
         )
 
     @app.exception_handler(PaymentDestinationMismatch)

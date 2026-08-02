@@ -66,3 +66,6 @@ class VerifiedPayment:
     """Tz-aware UTC block timestamp. Substrate returns milliseconds via
     ``Timestamp.Now``; the chain client converts to seconds before this
     field is populated."""
+
+    accepted_under_legacy_fee_amnesty: bool = False
+    """Whether exact-fee validation was waived for a pre-cutover reservation."""

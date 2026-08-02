@@ -1,10 +1,12 @@
 """Race and lifecycle tests for pre-payment upload admission."""
 
 from datetime import UTC, datetime, timedelta
+from uuid import uuid4
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ditto.db.models import UploadAdmissionReservation
 from ditto.db.queries.agents import SubmissionCooldownError
 from ditto.db.queries.submission_settings import (
     EffectiveSubmissionSettings,
@@ -189,6 +191,44 @@ async def test_verified_payment_rotates_reservation_to_new_archive(
             settings=settings,
             now=now + timedelta(minutes=6),
         )
+
+
+async def test_legacy_payment_reassignment_preserves_original_recovery_deadline(
+    session: AsyncSession,
+) -> None:
+    now = datetime(2026, 7, 24, 20, 0, tzinfo=UTC)
+    expires_at = now + timedelta(hours=24)
+    cutoff_at = now + timedelta(minutes=1)
+    settings = EffectiveSubmissionSettings(revision=4, cooldown_seconds=3600)
+    async with session.begin():
+        session.add(
+            UploadAdmissionReservation(
+                miner_coldkey="coldkey",
+                token=uuid4(),
+                miner_hotkey="hotkey",
+                sha256="a" * 64,
+                settings_revision=3,
+                cooldown_seconds=3600,
+                fee_amount_rao=40_000_000,
+                legacy_payment_cutoff_at=cutoff_at,
+                created_at=now,
+                expires_at=expires_at,
+            )
+        )
+
+    async with session.begin():
+        replacement = await reserve_upload_admission(
+            session,
+            miner_coldkey="coldkey",
+            miner_hotkey="hotkey",
+            sha256="b" * 64,
+            settings=settings,
+            replace_existing=True,
+            now=now + timedelta(minutes=5),
+        )
+
+    assert replacement.expires_at == expires_at
+    assert replacement.legacy_payment_cutoff_at == cutoff_at
 
 
 async def test_verified_payment_cannot_move_reservation_to_different_hotkey(

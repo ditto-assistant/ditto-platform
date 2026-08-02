@@ -781,6 +781,11 @@ class EvaluationPayment(Base):
     amount_rao: Mapped[int] = mapped_column(BigInteger, nullable=False)
     """Payment amount in rao (1 TAO = 1e9 rao)."""
 
+    accepted_under_legacy_fee_amnesty: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
+    """Whether a pre-cutover reservation accepted its finalized legacy amount."""
+
     tao_usd_rate: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
     """TAO/USD oracle rate used at verification; null only for legacy rows."""
 
@@ -1865,6 +1870,11 @@ class UploadAdmissionReservation(Base):
     settings_revision: Mapped[int] = mapped_column(Integer, nullable=False)
     cooldown_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
     fee_amount_rao: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+    legacy_payment_cutoff_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    """Latest block time eligible for the one-time legacy-fee transition."""
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
     )

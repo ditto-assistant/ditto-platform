@@ -88,9 +88,14 @@ def _build_fake_verifier(
     verifier = MagicMock()
 
     async def _verify(
-        _proof, *, expected_hotkey: str, expected_amount_rao: int
+        _proof,
+        *,
+        expected_hotkey: str,
+        expected_amount_rao: int,
+        legacy_amount_cutoff_at=None,
     ) -> VerifiedPayment:
         assert expected_amount_rao == _QUOTE_RAO
+        assert legacy_amount_cutoff_at is None
         return VerifiedPayment(
             block_hash=block_hash,
             extrinsic_index=ext_idx,
@@ -99,7 +104,7 @@ def _build_fake_verifier(
             amount_rao=_QUOTE_RAO,
             tao_usd_rate=Decimal("400"),
             dest_address=dest_address,
-            block_timestamp=datetime(2026, 5, 19, 12, 0, tzinfo=UTC),
+            block_timestamp=datetime.now(UTC),
         )
 
     verifier.verify_payment = AsyncMock(side_effect=_verify)

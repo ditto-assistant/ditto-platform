@@ -36,6 +36,7 @@ class UploadAdmission:
     expires_at: datetime
     cooldown_seconds: int
     fee_amount_rao: int
+    legacy_payment_cutoff_at: datetime | None
 
 
 async def latest_submission_settings(
@@ -115,6 +116,7 @@ async def reserve_upload_admission(
                 expires_at=_reservation_expiry(existing),
                 cooldown_seconds=existing.cooldown_seconds,
                 fee_amount_rao=existing.fee_amount_rao,
+                legacy_payment_cutoff_at=existing.legacy_payment_cutoff_at,
             )
         if replace_existing and existing.miner_hotkey == miner_hotkey:
             # A verified, still-unconsumed payment for this hotkey may fund a
@@ -123,14 +125,16 @@ async def reserve_upload_admission(
             # after reassignment.
             existing.token = uuid.uuid4()
             existing.sha256 = sha256
-            existing.created_at = current
-            existing.expires_at = current + UPLOAD_ADMISSION_TTL
+            if existing.legacy_payment_cutoff_at is None:
+                existing.created_at = current
+                existing.expires_at = current + UPLOAD_ADMISSION_TTL
             await session.flush()
             return UploadAdmission(
                 token=existing.token,
                 expires_at=_reservation_expiry(existing),
                 cooldown_seconds=existing.cooldown_seconds,
                 fee_amount_rao=existing.fee_amount_rao,
+                legacy_payment_cutoff_at=existing.legacy_payment_cutoff_at,
             )
         block_until = _reservation_block_until(existing)
         if block_until > current:
@@ -157,6 +161,7 @@ async def reserve_upload_admission(
         settings_revision=settings.revision,
         cooldown_seconds=settings.cooldown_seconds,
         fee_amount_rao=settings.fee_amount_rao,
+        legacy_payment_cutoff_at=None,
         created_at=current,
         expires_at=current + UPLOAD_ADMISSION_TTL,
     )
@@ -167,6 +172,7 @@ async def reserve_upload_admission(
         expires_at=row.expires_at,
         cooldown_seconds=row.cooldown_seconds,
         fee_amount_rao=row.fee_amount_rao,
+        legacy_payment_cutoff_at=row.legacy_payment_cutoff_at,
     )
 
 

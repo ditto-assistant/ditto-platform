@@ -58,20 +58,11 @@ class PaymentCallTypeMismatch(PaymentVerifierError):
 
 
 class PaymentAmountMismatch(PaymentVerifierError):
-    """Raised when the paid ``amount_rao`` is outside the accepted band.
+    """Raised when a non-amnestied payment differs from its reserved TAO fee."""
 
-    The accepted band is ``±PAYMENT_DRIFT_TOLERANCE`` around the
-    recomputed quote at verify time. The lower bound is the sybil-
-    deterrent floor; the upper bound protects miners against overpaying
-    being recorded as wrong-amount.
 
-    This can happen when:
-    - TAO/USD price moved more than the drift tolerance between the
-      quote and the verify-time recompute (rare under the 1 h cache TTL).
-    - A modified miner CLI tried to pay a lower amount hoping the
-      verifier would accept underpayment.
-    - The oracle override was changed between quote and verify time.
-    """
+class PaymentRecoveryExpired(PaymentVerifierError):
+    """Raised when an unconsumed finalized proof is more than 24 hours old."""
 
 
 class PaymentDestinationMismatch(PaymentVerifierError):

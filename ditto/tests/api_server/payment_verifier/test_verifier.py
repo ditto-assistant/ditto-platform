@@ -7,7 +7,7 @@ named test, not a generic happy-path explosion.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -276,6 +276,48 @@ class TestAmount:
             _make_proof(), expected_hotkey="5Hotkey", expected_amount_rao=QUOTE_RAO
         )
         assert result.amount_rao == QUOTE_RAO
+        assert result.accepted_under_legacy_fee_amnesty is False
+
+    async def test_pre_cutover_legacy_amount_is_accepted_once_by_policy(self):
+        block_time = datetime.fromtimestamp(1_700_000_000, tz=UTC)
+        ext = _make_extrinsic_info(value=17_500_000)
+        verifier = _make_verifier(extrinsic_info=ext)
+
+        result = await verifier.verify_payment(
+            _make_proof(),
+            expected_hotkey="5Hotkey",
+            expected_amount_rao=QUOTE_RAO,
+            legacy_amount_cutoff_at=block_time + timedelta(seconds=1),
+        )
+
+        assert result.amount_rao == 17_500_000
+        assert result.accepted_under_legacy_fee_amnesty is True
+
+    async def test_post_cutover_wrong_amount_is_rejected(self):
+        block_time = datetime.fromtimestamp(1_700_000_000, tz=UTC)
+        ext = _make_extrinsic_info(value=17_500_000)
+        verifier = _make_verifier(extrinsic_info=ext)
+
+        with pytest.raises(PaymentAmountMismatch):
+            await verifier.verify_payment(
+                _make_proof(),
+                expected_hotkey="5Hotkey",
+                expected_amount_rao=QUOTE_RAO,
+                legacy_amount_cutoff_at=block_time - timedelta(seconds=1),
+            )
+
+    async def test_zero_value_is_never_eligible_for_legacy_amnesty(self):
+        block_time = datetime.fromtimestamp(1_700_000_000, tz=UTC)
+        ext = _make_extrinsic_info(value=0)
+        verifier = _make_verifier(extrinsic_info=ext)
+
+        with pytest.raises(PaymentAmountMismatch):
+            await verifier.verify_payment(
+                _make_proof(),
+                expected_hotkey="5Hotkey",
+                expected_amount_rao=QUOTE_RAO,
+                legacy_amount_cutoff_at=block_time + timedelta(seconds=1),
+            )
 
 
 class TestSignerOwnership:
