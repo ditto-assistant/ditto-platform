@@ -259,6 +259,11 @@ async def check(
         if reserved_admission is not None
         else settings.fee_amount_rao
     )
+    recovery_legacy_amount_cutoff_at = (
+        reserved_admission.legacy_payment_cutoff_at
+        if reserved_admission is not None
+        else None
+    )
     recovery_payment_verified = False
     if (
         not codes
@@ -296,11 +301,7 @@ async def check(
                     ),
                     expected_hotkey=body.hotkey,
                     expected_amount_rao=expected_recovery_amount_rao,
-                    legacy_amount_cutoff_at=(
-                        reserved_admission.legacy_payment_cutoff_at
-                        if reserved_admission is not None
-                        else None
-                    ),
+                    legacy_amount_cutoff_at=recovery_legacy_amount_cutoff_at,
                 )
             except ChainError as e:
                 logger.warning(f"chain unreachable during /upload/check recovery: {e}")

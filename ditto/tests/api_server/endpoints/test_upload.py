@@ -311,6 +311,75 @@ class TestUploadCheck:
         assert response.status_code == 402
         assert response.json()["error_code"] == ERROR_CODE_PAYMENT_RECOVERY_EXPIRED
 
+    async def test_recovery_snapshots_reservation_before_session_rollback(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Chain verification must not lazy-load an expired ORM reservation."""
+        from ditto.api_server.dependencies import get_session
+
+        override_get_chain_client(app)
+        rolled_back = False
+        cutoff = datetime.now(UTC)
+
+        class Reservation:
+            expires_at = datetime.now(UTC) + timedelta(hours=1)
+            fee_amount_rao = 40_000_000
+
+            @property
+            def legacy_payment_cutoff_at(self) -> datetime:
+                if rolled_back:
+                    raise RuntimeError("expired ORM attribute was accessed")
+                return cutoff
+
+        session = MagicMock()
+        session.in_transaction.return_value = True
+
+        async def _rollback() -> None:
+            nonlocal rolled_back
+            rolled_back = True
+
+        session.rollback = AsyncMock(side_effect=_rollback)
+
+        async def _session_override():  # type: ignore[no-untyped-def]
+            yield session
+
+        app.dependency_overrides[get_session] = _session_override
+        monkeypatch.setattr(
+            "ditto.api_server.endpoints.upload.get_upload_admission_for_coldkey",
+            AsyncMock(return_value=Reservation()),
+        )
+        monkeypatch.setattr(
+            "ditto.api_server.endpoints.upload.get_evaluation_payment_for_proof",
+            AsyncMock(return_value=None),
+        )
+        monkeypatch.setattr(
+            "ditto.api_server.endpoints.upload.get_same_hotkey_agent_by_sha",
+            AsyncMock(return_value=None),
+        )
+        verifier = _override_payment_verifier(app)
+
+        response = await client.post(
+            "/api/v1/upload/check",
+            json={
+                **_signed_request_body(),
+                "payment_block_hash": _GOOD_BLOCK_HASH,
+                "payment_block_number": 13579,
+                "payment_extrinsic_index": 7,
+            },
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["payment_required"] is False
+        assert rolled_back is True
+        assert verifier.verify_payment.await_args is not None
+        assert (
+            verifier.verify_payment.await_args.kwargs["legacy_amount_cutoff_at"]
+            == cutoff
+        )
+
     async def test_partial_recovery_payment_proof_is_rejected(
         self, app: FastAPI, client: httpx.AsyncClient
     ) -> None:
