@@ -6596,7 +6596,7 @@
             (entry.preserved_composite != null ? " · composite " + fx(Number(entry.preserved_composite))
               : entry.provisional_composite != null ? " · provisional " + fx(Number(entry.provisional_composite)) : "") +
             " · " + relTime(entry.submitted_at),
-          text: [entry.name, agentVersionLabel(entry.version), entry.agent_id, entry.miner_hotkey, entry.status, stage[0], entry.review_reason, entry.screening_reason, entry.duplicate_of, entry.duplicate_name, agentVersionLabel(entry.duplicate_version)].map(searchText).join(" ")
+          text: [entry.name, agentVersionLabel(entry.version), entry.agent_id, entry.miner_hotkey, entry.status, stage[0], entry.review_event, entry.review_reason, entry.review_original_reason, entry.screening_reason, entry.duplicate_of, entry.duplicate_name, agentVersionLabel(entry.duplicate_version)].map(searchText).join(" ")
         });
       });
       return corpus;
@@ -6799,6 +6799,36 @@
         rejected: ["Rejected", "bad"]
       };
       return stages[status] || ["Pending", ""];
+    }
+
+    function reviewEventLabel(entry) {
+      var labels = {
+        opened: "Operator review",
+        reopened: "Review reopened",
+        cleared: "Review cleared",
+        rejected: "Review rejected"
+      };
+      return labels[entry.review_event] || "Operator review";
+    }
+
+    function reviewEvidenceText(entry) {
+      if (!entry || !entry.review_reason) return "";
+      var text = reviewEventLabel(entry) + ": " + entry.review_reason;
+      if (entry.review_original_reason && entry.review_original_reason !== entry.review_reason) {
+        text += " Initial hold: " + entry.review_original_reason;
+      }
+      return text;
+    }
+
+    function reviewEvidenceHtml(entry) {
+      if (!entry || !entry.review_reason) return "";
+      var html = '<span class="stage-note"><b>' + esc(reviewEventLabel(entry)) + ':</b> ' +
+        esc(entry.review_reason) + '</span>';
+      if (entry.review_original_reason && entry.review_original_reason !== entry.review_reason) {
+        html += '<span class="stage-note"><b>Initial hold:</b> ' +
+          esc(entry.review_original_reason) + '</span>';
+      }
+      return html;
     }
 
     function validationProgress(e) {
@@ -7883,9 +7913,13 @@
       configureEntityActions("agent", e.agent_id);
       var stage = activityStage(e.status);
       var evidence = e.review_reason
-        ? "Copy review: " + e.review_reason
+        ? reviewEvidenceText(e)
         : (e.screening_reason ? "Screening: " + e.screening_reason : "No additional evidence reported.");
-      if (e.duplicate_of) evidence += " Compared with " + duplicateLabel(e) + ".";
+      if (e.duplicate_of) {
+        evidence += e.review_event && e.review_event !== "opened"
+          ? " Initial comparison: " + duplicateLabel(e) + "."
+          : " Compared with " + duplicateLabel(e) + ".";
+      }
       consensusToken = null;
       document.getElementById("d-stats").classList.add("pipeline-mode");
       document.querySelector("#modal .split").style.display = "none";
@@ -8227,12 +8261,15 @@
         var progress = validationProgress(e);
         var evidence = "";
         if (e.review_reason) {
-          evidence = '<span class="stage-note"><b>Copy review:</b> ' + esc(e.review_reason) + '</span>';
+          evidence = reviewEvidenceHtml(e);
         } else if (e.screening_reason) {
           evidence = '<span class="stage-note"><b>Screening:</b> ' + esc(e.screening_reason) + '</span>';
         }
         if (e.duplicate_of) {
-          evidence += '<span class="stage-note"><b>Compared with:</b> ' +
+          var comparisonLabel = e.review_event && e.review_event !== "opened"
+            ? "Initial comparison"
+            : "Compared with";
+          evidence += '<span class="stage-note"><b>' + comparisonLabel + ':</b> ' +
             entityAnchor("agent", e.duplicate_of, duplicateLabel(e)) + '</span>';
         }
         var accessibleName = agentLabel(e.name, e.version);
@@ -9288,18 +9325,23 @@
         var compositeLabel = Number.isFinite(composite) ? fx(composite) : "–";
         var scoreCount = Number(entry.score_count) || 0;
         var reason = entry.review_reason || "This submission was routed to ATH review.";
+        var eventLabel = entry.review_event === "reopened" ? "ATH review reopened" : "ATH review pending";
+        var historicalReason = entry.review_original_reason && entry.review_original_reason !== reason
+          ? '<div class="ath-hold-reason"><b>Initial hold reason</b><span>' + esc(entry.review_original_reason) + '</span></div>'
+          : "";
         return '<article class="ath-review-card" aria-label="ATH review for ' + esc(agentLabel(entry.name, entry.version)) + '">' +
           '<div class="ath-review-main">' +
             '<div><div class="ath-agent-name">' + entityAnchor("agent", agentId, agentLabel(entry.name, entry.version)) + '</div>' +
               '<div class="ath-id-line"><code>' + esc(agentId) + '</code>' + copyButton(agentId, "agent ID") + '</div>' +
               '<div class="ath-hotkey"><span>Miner</span><span title="' + esc(hotkey) + '">' + entityAnchor("miner", hotkey, shortKey(hotkey)) + '</span>' + copyButton(hotkey, "miner hotkey") + '</div></div>' +
-            '<div><span class="ath-review-status">ATH review pending</span>' +
+            '<div><span class="ath-review-status">' + eventLabel + '</span>' +
               '<dl class="ath-time-grid"><dt>Submitted</dt><dd>' + esc(athDate(entry.submitted_at)) + ' · ' + esc(relTime(entry.submitted_at)) + '</dd>' +
               '<dt>Held</dt><dd>' + esc(athDate(entry.review_opened_at)) + (entry.review_opened_at ? ' · ' + esc(relTime(entry.review_opened_at)) : '') + '</dd></dl></div>' +
             '<div class="ath-score"><div><span>Scores recorded</span><strong>' + scoreCount + '</strong></div>' +
               '<div><span>Composite</span><strong>' + esc(compositeLabel) + '</strong></div></div>' +
           '</div>' +
-          '<div class="ath-hold-reason"><b>Why this is held</b><span>' + esc(reason) + '</span></div>' +
+          '<div class="ath-hold-reason"><b>Current operator reason</b><span>' + esc(reason) + '</span></div>' +
+          historicalReason +
         '</article>';
       }).join("");
     }

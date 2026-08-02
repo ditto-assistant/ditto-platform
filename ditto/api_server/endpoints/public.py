@@ -198,6 +198,7 @@ from ditto.chain import ChainError
 from ditto.db.models import (
     Agent,
     AthReview,
+    AthReviewAction,
     BenchmarkDataset,
     BenchmarkRollout,
     ConfirmationScore,
@@ -3474,7 +3475,7 @@ def _public_activity_response(
     benchmark_admitted_agent_ids: set[UUID] | None = None,
     retry_states: dict[UUID, AgentRetryState] | None = None,
     duplicate_metadata: dict[UUID, tuple[str, int | None]] | None = None,
-    ath_review_opened_at: dict[UUID, datetime] | None = None,
+    ath_reviews: dict[UUID, _PublicAthReviewSnapshot] | None = None,
     ath_review_composite: dict[UUID, float] | None = None,
     retired_agent_ids: set[UUID] | None = None,
     ath_only: bool = False,
@@ -3590,8 +3591,31 @@ def _public_activity_response(
                 duplicate_version=(duplicate_metadata or {}).get(
                     row.agent.duplicate_of, (None, None)
                 )[1],
-                review_reason=row.agent.review_reason,
-                review_opened_at=(ath_review_opened_at or {}).get(row.agent.agent_id),
+                review_reason=(
+                    (ath_reviews or {})[row.agent.agent_id].reason
+                    if row.agent.agent_id in (ath_reviews or {})
+                    else row.agent.review_reason
+                ),
+                review_event=(
+                    (ath_reviews or {})[row.agent.agent_id].event
+                    if row.agent.agent_id in (ath_reviews or {})
+                    else None
+                ),
+                review_event_at=(
+                    (ath_reviews or {})[row.agent.agent_id].event_at
+                    if row.agent.agent_id in (ath_reviews or {})
+                    else None
+                ),
+                review_original_reason=(
+                    (ath_reviews or {})[row.agent.agent_id].original_reason
+                    if row.agent.agent_id in (ath_reviews or {})
+                    else None
+                ),
+                review_opened_at=(
+                    (ath_reviews or {})[row.agent.agent_id].opened_at
+                    if row.agent.agent_id in (ath_reviews or {})
+                    else None
+                ),
                 preserved_composite=(ath_review_composite or {}).get(
                     row.agent.agent_id
                 ),
@@ -3697,32 +3721,95 @@ async def _duplicate_submission_metadata(
     }
 
 
+@dataclass(frozen=True, slots=True)
+class _PublicAthReviewSnapshot:
+    """Public-safe projection of the latest durable ATH lifecycle event."""
+
+    event: Literal["opened", "reopened", "cleared", "rejected"]
+    reason: str
+    event_at: datetime
+    opened_at: datetime
+    original_reason: str
+
+
 async def _ath_review_public_snapshot(
     session: AsyncSession, rows: list[Any]
-) -> tuple[dict[UUID, datetime], dict[UUID, float]]:
-    """Load public-safe hold times and canonical composites for active reviews."""
-    agent_ids = {
-        row.agent.agent_id
-        for row in rows
-        if row.agent.status == AgentStatus.ATH_PENDING_REVIEW
-    }
+) -> tuple[dict[UUID, _PublicAthReviewSnapshot], dict[UUID, float]]:
+    """Load current ATH reasons plus canonical composites for active holds.
+
+    ``Agent.review_reason`` intentionally preserves the first hold reason for
+    lifecycle guards. Public projection must instead follow the durable action
+    ledger: a reopened hold is explained by its newest ``reopen`` action and a
+    resolved review by its clear/reject resolution. The original reason remains
+    available only as explicitly labelled history.
+    """
+    agent_ids = {row.agent.agent_id for row in rows}
     if not agent_ids:
         return {}, {}
-    opened_at = dict(
-        (
-            await session.execute(
-                select(AthReview.agent_id, AthReview.opened_at).where(
-                    AthReview.agent_id.in_(agent_ids), AthReview.status == "pending"
-                )
+    reviews = list(
+        await session.scalars(
+            select(AthReview).where(AthReview.agent_id.in_(agent_ids))
+        )
+    )
+    latest_actions: dict[UUID, AthReviewAction] = {}
+    if reviews:
+        actions = await session.scalars(
+            select(AthReviewAction)
+            .where(
+                AthReviewAction.review_id.in_([review.review_id for review in reviews])
+            )
+            .order_by(
+                AthReviewAction.review_id,
+                AthReviewAction.created_at.desc(),
+                AthReviewAction.action_id.desc(),
             )
         )
-        .tuples()
-        .all()
-    )
+        for action in actions:
+            latest_actions.setdefault(action.review_id, action)
+
+    snapshots: dict[UUID, _PublicAthReviewSnapshot] = {}
+    for review in reviews:
+        latest = latest_actions.get(review.review_id)
+        if review.status == "pending":
+            if latest is not None and latest.action == "reopen":
+                event: Literal["opened", "reopened", "cleared", "rejected"] = "reopened"
+                reason = latest.reason
+                event_at = latest.created_at
+            else:
+                event = "opened"
+                reason = review.original_reason or "Submission routed to ATH review."
+                event_at = review.opened_at
+            opened_at = review.reopened_at or review.opened_at
+        else:
+            resolution = review.resolution or (latest.action if latest else None)
+            event = "rejected" if resolution == "reject" else "cleared"
+            reason = (
+                review.resolution_reason
+                or (latest.reason if latest is not None else None)
+                or "ATH review resolved."
+            )
+            event_at = review.resolved_at or (
+                latest.created_at if latest is not None else review.opened_at
+            )
+            opened_at = review.reopened_at or review.opened_at
+        snapshots[review.agent_id] = _PublicAthReviewSnapshot(
+            event=event,
+            reason=reason,
+            event_at=event_at,
+            opened_at=opened_at,
+            original_reason=review.original_reason
+            or "Submission routed to ATH review.",
+        )
+
+    active_agent_ids = {
+        review.agent_id for review in reviews if review.status == "pending"
+    }
     composites: dict[UUID, list[float]] = {}
     for agent_id, composite in (
         await session.execute(
-            select(Score.agent_id, Score.composite).where(Score.agent_id.in_(agent_ids))
+            select(Score.agent_id, Score.composite).where(
+                Score.agent_id.in_(active_agent_ids)
+            )
         )
     ).tuples():
         composites.setdefault(agent_id, []).append(float(composite))
@@ -3731,7 +3818,7 @@ async def _ath_review_public_snapshot(
         agent_id: float(statistics.median(values))
         for agent_id, values in composites.items()
     }
-    return opened_at, medians
+    return snapshots, medians
 
 
 @router.get("/activity", response_model=PublicActivityResponse)
@@ -3769,10 +3856,9 @@ async def activity(
         bench_version=active_version,
         agent_ids=[row.agent.agent_id for row in rows],
     )
-    ath_opened_at: dict[UUID, datetime] = {}
+    ath_reviews: dict[UUID, _PublicAthReviewSnapshot] = {}
     ath_composite: dict[UUID, float] = {}
-    if review == "ath":
-        ath_opened_at, ath_composite = await _ath_review_public_snapshot(session, rows)
+    ath_reviews, ath_composite = await _ath_review_public_snapshot(session, rows)
     assignments = await list_active_validator_assignments(session, now=now)
     active_work = await list_active_validator_work(
         session, now=now, cutoff=now - _VALIDATOR_ONLINE_WINDOW
@@ -3831,7 +3917,7 @@ async def activity(
             session, agents=[row.agent for row in rows], now=now
         ),
         duplicate_metadata=await _duplicate_submission_metadata(session, rows),
-        ath_review_opened_at=ath_opened_at,
+        ath_reviews=ath_reviews,
         ath_review_composite=ath_composite,
         retired_agent_ids=retired,
         ath_only=review == "ath",
@@ -3883,6 +3969,9 @@ async def operations(
     # One read, shared by the preview population and the projected labels --
     # same reason as ``/activity`` above.
     retired = await retired_agent_ids(session)
+    ath_reviews, ath_composite = await _ath_review_public_snapshot(
+        session, activity_rows
+    )
     activity_snapshot = _public_activity_response(
         rows=activity_rows,
         active_work=active_work,
@@ -3919,6 +4008,8 @@ async def operations(
         benchmark_admitted_agent_ids=admitted,
         retry_states=retry_states,
         duplicate_metadata=await _duplicate_submission_metadata(session, activity_rows),
+        ath_reviews=ath_reviews,
+        ath_review_composite=ath_composite,
         retired_agent_ids=retired,
         terminal_history_limit=50,
     )

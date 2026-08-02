@@ -1790,9 +1790,42 @@ class PublicActivityEntry(BaseModel):
         str | None,
         Field(
             default=None,
-            description="Anti-copy signals that routed this submission to review.",
+            description=(
+                "Public operator reason for the current ATH lifecycle event. For an "
+                "active reopened hold this is the reopen reason, not the historical "
+                "reason that first routed the submission to review. For a resolved "
+                "review this is the resolution reason."
+            ),
         ),
     ]
+    review_event: Annotated[
+        Literal["opened", "reopened", "cleared", "rejected"] | None,
+        Field(
+            default=None,
+            description=(
+                "Latest public ATH lifecycle event. Null when the submission has no "
+                "durable ATH review record."
+            ),
+        ),
+    ] = None
+    review_event_at: Annotated[
+        datetime | None,
+        Field(
+            default=None,
+            description="When the latest public ATH lifecycle event occurred (UTC).",
+        ),
+    ] = None
+    review_original_reason: Annotated[
+        str | None,
+        Field(
+            default=None,
+            description=(
+                "Reason for the original ATH hold, retained as historical context. "
+                "Clients must not present it as the current reason after a reopen or "
+                "resolution."
+            ),
+        ),
+    ] = None
     review_opened_at: Annotated[
         datetime | None,
         Field(
