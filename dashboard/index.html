@@ -691,8 +691,9 @@
     .pipeline-item-identity { display: flex; flex: 1 1 auto; align-items: baseline; gap: 5px; min-width: 0; }
     .pipeline-item-name { display: block; overflow: hidden; color: var(--text); font-size: 12.5px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
     .pipeline-item-version { flex: 0 0 auto; color: var(--text-dim); font: 650 10px/1.4 var(--mono); white-space: nowrap; }
-    .pipeline-item-heading { display: flex; align-items: center; gap: 6px; min-width: 0; }
+    .pipeline-item-heading { display: flex; flex-wrap: wrap; align-items: baseline; column-gap: 6px; row-gap: 2px; min-width: 0; }
     .pipeline-item-identity .pipeline-item-name { flex: 0 1 auto; min-width: 0; }
+    .pipeline-item-badges { display: flex; flex-wrap: wrap; gap: 3px 5px; margin-top: 3px; }
     .pipeline-next-badge {
       flex: 0 0 auto; padding: 1px 5px; border-radius: 999px;
       color: var(--accent); background: color-mix(in oklab, var(--accent) 10%, transparent);
@@ -719,7 +720,7 @@
     .pipeline-stuck-count { flex: 0 0 auto; margin-left: 6px; padding: 0 6px; border: 0; border-radius: 999px; color: var(--danger); background: color-mix(in oklab, var(--danger) 14%, transparent); font: 750 10px/1.6 var(--sans); cursor: pointer; }
     .pipeline-stuck-count:hover, .pipeline-stuck-count[aria-pressed="true"] { background: color-mix(in oklab, var(--danger) 24%, transparent); }
     .pipeline-stuck-count:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
-    .pipeline-item-meta { display: flex; justify-content: flex-end; gap: 8px; margin-top: 3px; color: var(--text-faint); font-family: var(--mono); font-size: 11.5px; }
+    .pipeline-item-meta { flex: 0 0 auto; margin-left: auto; color: var(--text-faint); font-family: var(--mono); font-size: 11.5px; white-space: nowrap; }
     .pipeline-item-priority-detail { display: block; margin-top: 4px; color: var(--text-dim); font: 600 10px/1.35 var(--mono); }
     .pipeline-item-qualification-detail { display: block; margin-top: 4px; color: var(--accent-2); font: 650 9.5px/1.35 var(--mono); text-wrap: pretty; }
     .pipeline-item-policy { display: block; margin-top: 5px; color: var(--accent-2); font: 650 10px/1.35 var(--mono); }
@@ -8286,14 +8287,16 @@
             ? "Provisional " + fx(Number(entry.provisional_composite))
             : "";
           var accessibleName = agentLabel(entry.name, entry.version);
+          var badges =
+            (isUpNext ? '<span class="pipeline-next-badge" title="Highest current priority; validator eligibility can vary">Up next</span>' : '') +
+            (queueGate ? '<span class="pipeline-gate-badge" title="' + esc(queueGate.title) + '">' + esc(queueGate.label) + '</span>' : '') +
+            (rolloutPosition ? '<span class="pipeline-qualification-badge" title="Frozen inherited benchmark rollout position">Cohort #' + esc(rolloutPosition) + ' → v' + esc(rolloutVersion) + '</span>' : '') +
+            (rescore && rescore.isQualification ? '<span class="pipeline-qualification-badge" title="Existing score remains authoritative while this inherited cohort agent qualifies on the next benchmark">Cohort → v' + esc(rescore.targetVersion) + '</span>' : '');
           return '<a class="pipeline-item" href="' + esc(entityHref("agent", entry.agent_id)) + '" data-entity-link="agent" data-pipeline-i="' + item.index + '" aria-label="View ' + esc(accessibleName) + ' details' + (isUpNext ? ', up next for validator assignment' : '') + (queueGate ? ', ' + esc(queueGate.aria) : '') + (rescore && rescore.isQualification ? ', inherited benchmark cohort qualification in progress' : '') + (screeningLabel ? ', ' + esc(screeningLabel) : '') + '">' +
             '<span class="pipeline-item-heading"><span class="pipeline-item-identity"><span class="pipeline-item-name">' + esc(agentName(entry.name)) + '</span>' +
               '<span class="pipeline-item-version">' + esc(pipelineAgentVersionLabel(entry.version)) + '</span></span>' +
-              (isUpNext ? '<span class="pipeline-next-badge" title="Highest current priority; validator eligibility can vary">Up next</span>' : '') +
-              (queueGate ? '<span class="pipeline-gate-badge" title="' + esc(queueGate.title) + '">' + esc(queueGate.label) + '</span>' : '') +
-              (rolloutPosition ? '<span class="pipeline-qualification-badge" title="Frozen inherited benchmark rollout position">Cohort #' + esc(rolloutPosition) + ' → v' + esc(rolloutVersion) + '</span>' : '') +
-              (rescore && rescore.isQualification ? '<span class="pipeline-qualification-badge" title="Existing score remains authoritative while this inherited cohort agent qualifies on the next benchmark">Cohort → v' + esc(rescore.targetVersion) + '</span>' : '') + '</span>' +
-            '<span class="pipeline-item-meta"><span>' + esc(meta) + '</span></span>' +
+              '<span class="pipeline-item-meta">' + esc(meta) + '</span></span>' +
+            (badges ? '<span class="pipeline-item-badges">' + badges + '</span>' : '') +
             (rolloutPosition ? '<span class="pipeline-item-qualification-detail">v' + esc(activeBench || currentBench) + ' score stays live until v' + esc(rolloutVersion) + ' quorum</span>' :
               (rescore && rescore.isQualification ? '<span class="pipeline-item-qualification-detail">v' + esc(rescore.sourceVersion) + ' score stays live until v' + esc(rescore.targetVersion) + ' quorum</span>' : '')) +
             (provisionalScore ? '<span class="pipeline-item-priority-detail">' + esc(provisionalScore) + '</span>' : '') +
@@ -8337,8 +8340,8 @@
         var reason = entry.review_reason || entry.screening_reason || "Qualification or anomaly review";
         return '<a class="pipeline-item" href="' + esc(entityHref("agent", entry.agent_id)) + '" data-entity-link="agent" data-pipeline-i="' + item.index + '" aria-label="View ' + esc(agentLabel(entry.name, entry.version)) + ' integrity review details">' +
           '<span class="pipeline-item-heading"><span class="pipeline-item-identity"><span class="pipeline-item-name">' + esc(agentName(entry.name)) + '</span>' +
-          '<span class="pipeline-item-version">' + esc(pipelineAgentVersionLabel(entry.version)) + '</span></span></span>' +
-          '<span class="pipeline-item-meta"><span>' + esc(relTime(entry.review_opened_at || entry.submitted_at)) + '</span></span>' +
+          '<span class="pipeline-item-version">' + esc(pipelineAgentVersionLabel(entry.version)) + '</span></span>' +
+          '<span class="pipeline-item-meta">' + esc(relTime(entry.review_opened_at || entry.submitted_at)) + '</span></span>' +
           '<span class="pipeline-item-priority-detail">' + esc(reason) + '</span>' +
           '</a>';
       }).join("") + (indexed.length > 3
