@@ -43,6 +43,9 @@ from ditto.api_models.ticket_status import TicketPurpose, TicketStatus
 # plain JSON on the SQLite unit-test fallback. The variant keeps one model
 # working across both dialects.
 _JSON_VARIANT = JSON().with_variant(JSONB(), "postgresql")
+_NULLABLE_JSON_VARIANT = JSON(none_as_null=True).with_variant(
+    JSONB(none_as_null=True), "postgresql"
+)
 
 # Naming convention so alembic autogenerate produces deterministic constraint
 # names instead of random SHA suffixes.
@@ -587,6 +590,14 @@ class ScreeningQuarantine(Base):
     manifest_digest: Mapped[str] = mapped_column(Text, nullable=False)
     finding_digest: Mapped[str | None] = mapped_column(Text, nullable=True)
     reason_code: Mapped[str] = mapped_column(Text, nullable=False)
+    review_audit_digest: Mapped[str | None] = mapped_column(Text, nullable=True)
+    """Digest of the signed, public-safe reviewer budget audit."""
+
+    review_audit: Mapped[dict | None] = mapped_column(
+        _NULLABLE_JSON_VARIANT, nullable=True
+    )
+    """Typed reviewer budget/accounting audit; never source or prompt content."""
+
     evidence: Mapped[list | None] = mapped_column(_JSON_VARIANT, nullable=True)
     """Bounded public-safe policy evidence trail (module, code, summary,
     digest) shipped by the screener on quarantine. Display data for the
@@ -634,6 +645,18 @@ class ScreeningQuarantine(Base):
         CheckConstraint(
             "finding_digest IS NULL OR finding_digest ~ '^[0-9a-f]{64}$'",
             name="screening_quarantines_finding_digest_check",
+        ),
+        CheckConstraint(
+            "review_audit_digest IS NULL OR review_audit_digest ~ '^[0-9a-f]{64}$'",
+            name="screening_quarantines_review_audit_digest_check",
+        ),
+        CheckConstraint(
+            "(review_audit IS NULL) = (review_audit_digest IS NULL)",
+            name="screening_quarantines_review_audit_pair_check",
+        ),
+        CheckConstraint(
+            "review_audit IS NULL OR reason_code = 'source-review-inconclusive'",
+            name="screening_quarantines_review_audit_reason_check",
         ),
         CheckConstraint(
             "reason_code ~ '^[a-z0-9][a-z0-9-]{0,63}$'",

@@ -17,6 +17,7 @@ from ditto.api_models.screener import SCREENING_POLICY_VERSION
 from ditto.db.models import (
     Agent,
     AgentStatus,
+    AthReview,
     BenchmarkDataset,
     BenchmarkRollout,
     BenchmarkRolloutMember,
@@ -238,7 +239,12 @@ def _claimed_duplicate(
     raise AssertionError("agent was not claimed")
 
 
-async def _claim(session: AsyncSession, *, limit: int = 10) -> list:
+async def _claim(
+    session: AsyncSession,
+    *,
+    limit: int = 10,
+    deferred_review_mode: str = "off",
+) -> list:
     async with session.begin():
         return await claim_screening_attempts(
             session,
@@ -246,7 +252,131 @@ async def _claim(session: AsyncSession, *, limit: int = 10) -> list:
             now=datetime.now(UTC),
             ttl=timedelta(minutes=45),
             limit=limit,
+            deferred_review_mode=deferred_review_mode,
         )
+
+
+@pytest.mark.parametrize("mode", ["off", "observe"])
+async def test_only_enforce_uses_mechanical_first_claim(
+    session: AsyncSession, mode: str
+) -> None:
+    agent = Agent(
+        agent_id=uuid4(),
+        miner_hotkey=f"5HK-{mode}",
+        name=f"fresh-{mode}",
+        sha256=uuid4().hex * 2,
+        status=AgentStatus.UPLOADED,
+    )
+    async with session.begin():
+        session.add(agent)
+
+    claimed = await _claim(session, deferred_review_mode=mode)
+    attempt, _duplicate = _claimed_duplicate(claimed, agent)
+
+    assert attempt.build_only is False
+
+
+async def test_enforce_uses_mechanical_first_then_one_deep_claim(
+    session: AsyncSession,
+) -> None:
+    agent = Agent(
+        agent_id=uuid4(),
+        miner_hotkey="5HK-enforce",
+        name="fresh-enforce",
+        sha256=uuid4().hex * 2,
+        status=AgentStatus.UPLOADED,
+    )
+    async with session.begin():
+        session.add(agent)
+
+    claimed = await _claim(session, deferred_review_mode="enforce")
+    mechanical, _duplicate = _claimed_duplicate(claimed, agent)
+    assert mechanical.build_only is True
+    assert mechanical.reason_code == "deferred-mechanical-admission"
+
+    opened_at = datetime.now(UTC)
+    async with session.begin():
+        mechanical.status = "passed"
+        mechanical.finished_at = opened_at
+        agent.status = AgentStatus.ATH_PENDING_REVIEW
+        session.add(
+            AthReview(
+                review_id=uuid4(),
+                agent_id=agent.agent_id,
+                status="pending",
+                opened_at=opened_at,
+                original_reason="deferred review",
+                original_policy_version=SCREENING_POLICY_VERSION,
+                original_evidence={"previous_status": AgentStatus.SCORED.value},
+                algorithm_provenance={
+                    "review_kind": "deferred_source_review",
+                },
+            )
+        )
+
+    # Rollback is a true stop: off mode preserves the hold/evidence for manual
+    # adjudication but starts no new expensive deep review.
+    assert await _claim(session, deferred_review_mode="off") == []
+
+    claimed = await _claim(session, deferred_review_mode="enforce")
+    deep, _duplicate = _claimed_duplicate(claimed, agent)
+    assert deep.build_only is False
+    assert deep.reason_code is None
+
+    async with session.begin():
+        deep.status = "passed"
+        deep.finished_at = datetime.now(UTC)
+
+    # Any terminal deep result is the one allowed attempt. The pending ATH row
+    # now waits for operator adjudication instead of looping back to a screener.
+    assert await _claim(session, deferred_review_mode="enforce") == []
+
+
+async def test_retryable_deep_infrastructure_failure_is_reclaimable(
+    session: AsyncSession,
+) -> None:
+    agent = Agent(
+        agent_id=uuid4(),
+        miner_hotkey="5HK-deep-infra",
+        name="deep-infra",
+        sha256=uuid4().hex * 2,
+        status=AgentStatus.ATH_PENDING_REVIEW,
+    )
+    opened_at = datetime.now(UTC) - timedelta(minutes=2)
+    async with session.begin():
+        session.add(agent)
+        await session.flush()
+        session.add(
+            AthReview(
+                review_id=uuid4(),
+                agent_id=agent.agent_id,
+                status="pending",
+                opened_at=opened_at,
+                original_reason="deferred review",
+                original_policy_version=SCREENING_POLICY_VERSION,
+                original_evidence={"previous_status": AgentStatus.SCORED.value},
+                algorithm_provenance={
+                    "review_kind": "deferred_source_review",
+                },
+            )
+        )
+        session.add(
+            ScreeningAttempt(
+                attempt_id=uuid4(),
+                agent_id=agent.agent_id,
+                screener_hotkey=_SCREENER,
+                policy_version=SCREENING_POLICY_VERSION,
+                status="failed",
+                started_at=opened_at + timedelta(seconds=1),
+                deadline=opened_at + timedelta(minutes=1),
+                finished_at=opened_at + timedelta(minutes=1),
+                build_only=False,
+            )
+        )
+
+    claimed = await _claim(session, deferred_review_mode="enforce")
+    retry, _duplicate = _claimed_duplicate(claimed, agent)
+    assert retry.build_only is False
 
 
 async def test_agent_parked_for_review_after_expiry_cap(session: AsyncSession):

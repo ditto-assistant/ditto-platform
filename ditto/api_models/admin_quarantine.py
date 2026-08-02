@@ -8,7 +8,11 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
-from ditto.api_models.screener import ScreenEvidenceItem, SourceReviewFinding
+from ditto.api_models.screener import (
+    ScreenEvidenceItem,
+    ScreenReviewAudit,
+    SourceReviewFinding,
+)
 from ditto.api_models.screener_review_settings import AdminShadowReviewObservation
 
 QuarantineResolution = Literal["release", "rescreen", "reject"]
@@ -43,6 +47,8 @@ class AdminQuarantineItem(BaseModel):
     manifest_digest: str
     finding_digest: str | None
     reason_code: str
+    review_audit_digest: str | None = None
+    review_audit: ScreenReviewAudit | None = None
     evidence: list[ScreenEvidenceItem] | None
     finding: SourceReviewFinding | None
     finding_verified: bool

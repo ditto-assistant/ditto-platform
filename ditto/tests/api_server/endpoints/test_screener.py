@@ -69,6 +69,7 @@ from ditto.db.models import (
     Agent,
     ArtifactFetchAudit,
     ArtifactReleaseSettingsRevision,
+    AthReview,
     BenchmarkDataset,
     BenchmarkRollout,
     BenchmarkRolloutMember,
@@ -89,7 +90,11 @@ from ditto.db.queries.attestation import record_attestation
 from ditto.db.queries.screening import MAX_SCREENING_EXPIRIES
 from ditto.db.queries.tickets import issue_ticket
 from ditto.tests.legacy_era import retired_era_writes_allowed
-from ditto_screening_protocol import ScreenResultOutcome, verdict_signing_message
+from ditto_screening_protocol import (
+    ScreenResultOutcome,
+    ScreenReviewAudit,
+    verdict_signing_message,
+)
 
 _KEYPAIR = bittensor.Keypair.create_from_uri("//Alice")
 _SCREENER_HOTKEY = _KEYPAIR.ss58_address
@@ -229,6 +234,22 @@ def _result_payload(
             else None,
             finding_digest=overrides.get("finding_digest")
             if isinstance(overrides.get("finding_digest"), str)
+            else None,
+            review_audit_digest=overrides.get("review_audit_digest")
+            if isinstance(overrides.get("review_audit_digest"), str)
+            else None,
+            deferred_source_review=bool(overrides.get("deferred_source_review", False)),
+            review_settings_revision=overrides.get("review_settings_revision")
+            if isinstance(overrides.get("review_settings_revision"), int)
+            else None,
+            review_settings_instance_id=overrides.get("review_settings_instance_id")
+            if isinstance(overrides.get("review_settings_instance_id"), str)
+            else None,
+            review_settings_scope=overrides.get("review_settings_scope")
+            if isinstance(overrides.get("review_settings_scope"), str)
+            else None,
+            review_settings_checksum=overrides.get("review_settings_checksum")
+            if isinstance(overrides.get("review_settings_checksum"), str)
             else None,
             reason_code=overrides.get("reason_code")
             if isinstance(overrides.get("reason_code"), str)
@@ -609,6 +630,25 @@ _AUTH_HEADER = {
     "X-Screener-Hotkey": _SCREENER_HOTKEY,
 }
 _CLAIM_URL = f"/api/v1/screener/claim?policy_version={SCREENING_POLICY_VERSION}"
+
+
+def _bounded_review_audit(*, steps_used: int = 6) -> ScreenReviewAudit:
+    return ScreenReviewAudit(
+        stage="l1",
+        reason_code="source-review-inconclusive",
+        prompt_revision="source-review-v9",
+        harness_revision="policy-v9",
+        max_steps=8,
+        steps_used=steps_used,
+        max_read_bytes=4_000_000,
+        read_bytes_used=2_000_000,
+        max_input_tokens=200_000,
+        input_tokens_used=120_000,
+        max_output_tokens=32_000,
+        output_tokens_used=20_000,
+        max_cost_usd=5.0,
+        cost_usd_used=3.0,
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -1859,13 +1899,338 @@ class TestClaim:
         replay = await client.post(
             f"/api/v1/screener/agent/{agent_id}/result", json=payload
         )
-        assert first.status_code == replay.status_code == 200
+        assert first.status_code == replay.status_code == 200, replay.text
         assert replay.json()["status"] == AgentStatus.QUARANTINED
         async with session_maker() as session:
             attempt = await session.get(ScreeningAttempt, attempt_id)
             quarantines = (await session.scalars(select(ScreeningQuarantine))).all()
             assert attempt is not None and attempt.status == "quarantined"
             assert len(quarantines) == 1
+
+    async def test_deferred_mechanical_admission_retains_signed_audit_once(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(
+            session_maker, status=AgentStatus.SCREENING, name="mechanical-first"
+        )
+        attempt_id = uuid4()
+        now = datetime.now(UTC)
+        async with session_maker() as session, session.begin():
+            session.add(
+                ScreeningAttempt(
+                    attempt_id=attempt_id,
+                    agent_id=agent_id,
+                    screener_hotkey=_SCREENER_HOTKEY,
+                    policy_version=SCREENING_POLICY_VERSION,
+                    status="running",
+                    started_at=now,
+                    deadline=now + timedelta(minutes=30),
+                    reason_code="deferred-mechanical-admission",
+                    build_only=True,
+                )
+            )
+        _install_db(app, session_maker)
+        _install_chain(app)
+        await _seed_verified_image_upload(
+            session_maker, agent_id=agent_id, attempt_id=attempt_id
+        )
+        audit = _bounded_review_audit()
+        missing_signed_flag = await client.post(
+            f"/api/v1/screener/agent/{agent_id}/result",
+            json=_result_payload(
+                agent_id,
+                passed=True,
+                attempt_id=attempt_id,
+                outcome="pass_inconclusive",
+                manifest_digest="12" * 32,
+                reason_code="source-review-inconclusive",
+                review_audit_digest=audit.canonical_digest(),
+                review_audit=audit.model_dump(mode="json"),
+                build_only=True,
+            ),
+        )
+        assert missing_signed_flag.status_code == 409
+        assert missing_signed_flag.json()["error_code"] == (
+            ERROR_CODE_AGENT_NOT_SCREENABLE
+        )
+        payload = _result_payload(
+            agent_id,
+            passed=True,
+            attempt_id=attempt_id,
+            outcome="pass_inconclusive",
+            manifest_digest="12" * 32,
+            reason_code="source-review-inconclusive",
+            review_audit_digest=audit.canonical_digest(),
+            review_audit=audit.model_dump(mode="json"),
+            build_only=True,
+            deferred_source_review=True,
+        )
+
+        first = await client.post(
+            f"/api/v1/screener/agent/{agent_id}/result", json=payload
+        )
+        replay = await client.post(
+            f"/api/v1/screener/agent/{agent_id}/result", json=payload
+        )
+
+        assert first.status_code == replay.status_code == 200, replay.text
+        assert replay.json()["status"] == AgentStatus.EVALUATING
+        async with session_maker() as session:
+            agent = await session.get(Agent, agent_id)
+            attempt = await session.get(ScreeningAttempt, attempt_id)
+            retained = (
+                await session.scalars(
+                    select(ScreeningQuarantine).where(
+                        ScreeningQuarantine.attempt_id == attempt_id
+                    )
+                )
+            ).all()
+            assert agent is not None and agent.status == AgentStatus.EVALUATING
+            assert attempt is not None and attempt.status == "passed"
+            assert len(retained) == 1
+            assert retained[0].status == "resolved"
+            assert retained[0].review_audit_digest == audit.canonical_digest()
+            assert retained[0].review_audit == audit.model_dump(mode="json")
+
+        app.state.config = replace(
+            app.state.config,
+            admin_api_token="test-admin-token-at-least-32-characters",
+        )
+        listed = await client.get(
+            "/api/v1/admin/screening-quarantines?status=resolved",
+            headers={"Authorization": "Bearer test-admin-token-at-least-32-characters"},
+        )
+        assert listed.status_code == 200, listed.text
+        retained_item = listed.json()["items"][0]
+        assert retained_item["review_audit_digest"] == audit.canonical_digest()
+        assert retained_item["review_audit"] == audit.model_dump(mode="json")
+
+        changed_audit = _bounded_review_audit(steps_used=7)
+        conflict = await client.post(
+            f"/api/v1/screener/agent/{agent_id}/result",
+            json=_result_payload(
+                agent_id,
+                passed=True,
+                attempt_id=attempt_id,
+                outcome="pass_inconclusive",
+                manifest_digest="12" * 32,
+                reason_code="source-review-inconclusive",
+                review_audit_digest=changed_audit.canonical_digest(),
+                review_audit=changed_audit.model_dump(mode="json"),
+                build_only=True,
+                deferred_source_review=True,
+            ),
+        )
+        assert conflict.status_code == 409
+        assert conflict.json()["error_code"] == ERROR_CODE_AGENT_NOT_SCREENABLE
+
+    async def test_ordinary_full_review_exhaustion_terminally_admits_once(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(
+            session_maker, status=AgentStatus.SCREENING, name="ordinary-review"
+        )
+        attempt_id = uuid4()
+        now = datetime.now(UTC)
+        async with session_maker() as session, session.begin():
+            session.add(
+                ScreeningAttempt(
+                    attempt_id=attempt_id,
+                    agent_id=agent_id,
+                    screener_hotkey=_SCREENER_HOTKEY,
+                    policy_version=SCREENING_POLICY_VERSION,
+                    status="running",
+                    started_at=now,
+                    deadline=now + timedelta(minutes=30),
+                    build_only=False,
+                )
+            )
+        _install_db(app, session_maker)
+        _install_chain(app)
+        await _seed_verified_image_upload(
+            session_maker, agent_id=agent_id, attempt_id=attempt_id
+        )
+        audit = _bounded_review_audit()
+
+        payload = _result_payload(
+            agent_id,
+            passed=True,
+            attempt_id=attempt_id,
+            outcome="pass_inconclusive",
+            manifest_digest="12" * 32,
+            reason_code="source-review-inconclusive",
+            review_audit_digest=audit.canonical_digest(),
+            review_audit=audit.model_dump(mode="json"),
+        )
+        response = await client.post(
+            f"/api/v1/screener/agent/{agent_id}/result",
+            json=payload,
+        )
+        replay = await client.post(
+            f"/api/v1/screener/agent/{agent_id}/result", json=payload
+        )
+
+        assert response.status_code == replay.status_code == 200, replay.text
+        assert replay.json()["status"] == AgentStatus.EVALUATING
+        async with session_maker() as session:
+            agent = await session.get(Agent, agent_id)
+            attempts = (
+                await session.scalars(
+                    select(ScreeningAttempt).where(
+                        ScreeningAttempt.agent_id == agent_id
+                    )
+                )
+            ).all()
+            retained = await session.scalar(
+                select(ScreeningQuarantine).where(
+                    ScreeningQuarantine.attempt_id == attempt_id
+                )
+            )
+            assert agent is not None and agent.status == AgentStatus.EVALUATING
+            assert agent.screening_reason == (
+                "Bounded source review exhausted; admitted for scoring"
+            )
+            assert len(attempts) == 1 and attempts[0].status == "passed"
+            assert retained is not None and retained.status == "resolved"
+            assert retained.review_audit_digest == audit.canonical_digest()
+
+    async def test_deferred_mechanical_admission_can_fail_closed_on_finding(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(
+            session_maker, status=AgentStatus.SCREENING, name="mechanical-finding"
+        )
+        attempt_id = uuid4()
+        now = datetime.now(UTC)
+        async with session_maker() as session, session.begin():
+            session.add(
+                ScreeningAttempt(
+                    attempt_id=attempt_id,
+                    agent_id=agent_id,
+                    screener_hotkey=_SCREENER_HOTKEY,
+                    policy_version=SCREENING_POLICY_VERSION,
+                    status="running",
+                    started_at=now,
+                    deadline=now + timedelta(minutes=30),
+                    reason_code="deferred-mechanical-admission",
+                    build_only=True,
+                )
+            )
+        _install_db(app, session_maker)
+        _install_chain(app)
+
+        response = await client.post(
+            f"/api/v1/screener/agent/{agent_id}/result",
+            json=_result_payload(
+                agent_id,
+                passed=False,
+                attempt_id=attempt_id,
+                outcome="quarantine",
+                manifest_digest="56" * 32,
+                finding_digest="78" * 32,
+                reason_code="agentic-source-review-tripwire",
+                build_only=True,
+                deferred_source_review=True,
+            ),
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["status"] == AgentStatus.QUARANTINED
+
+    async def test_late_deep_review_result_cannot_reverse_operator_clear(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = await _seed_agent(
+            session_maker,
+            status=AgentStatus.SCORED,
+            name="operator-cleared",
+            screening_policy_version=SCREENING_POLICY_VERSION,
+        )
+        attempt_id = uuid4()
+        opened_at = datetime.now(UTC) - timedelta(minutes=20)
+        cleared_at = opened_at + timedelta(minutes=5)
+        async with session_maker() as session, session.begin():
+            session.add(
+                AthReview(
+                    review_id=uuid4(),
+                    agent_id=agent_id,
+                    status="resolved",
+                    opened_at=opened_at,
+                    resolved_at=cleared_at,
+                    resolved_by="operator",
+                    resolution="clear",
+                    resolution_reason="Operator cleared the submission",
+                    original_reason="Deferred source review",
+                    original_policy_version=SCREENING_POLICY_VERSION,
+                    original_evidence={"previous_status": AgentStatus.SCORED.value},
+                    algorithm_provenance={"review_kind": "deferred_source_review"},
+                )
+            )
+            session.add(
+                ScreeningAttempt(
+                    attempt_id=attempt_id,
+                    agent_id=agent_id,
+                    screener_hotkey=_SCREENER_HOTKEY,
+                    policy_version=SCREENING_POLICY_VERSION,
+                    status="running",
+                    started_at=opened_at + timedelta(minutes=1),
+                    deadline=datetime.now(UTC) + timedelta(minutes=30),
+                    build_only=False,
+                )
+            )
+        _install_db(app, session_maker)
+        _install_chain(app)
+        await _seed_verified_image_upload(
+            session_maker, agent_id=agent_id, attempt_id=attempt_id
+        )
+        audit = _bounded_review_audit()
+
+        response = await client.post(
+            f"/api/v1/screener/agent/{agent_id}/result",
+            json=_result_payload(
+                agent_id,
+                passed=True,
+                attempt_id=attempt_id,
+                outcome="pass_inconclusive",
+                manifest_digest="12" * 32,
+                reason_code="source-review-inconclusive",
+                review_audit_digest=audit.canonical_digest(),
+                review_audit=audit.model_dump(mode="json"),
+            ),
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["status"] == AgentStatus.SCORED
+        async with session_maker() as session:
+            agent = await session.get(Agent, agent_id)
+            review = await session.scalar(
+                select(AthReview).where(AthReview.agent_id == agent_id)
+            )
+            retained = await session.scalar(
+                select(ScreeningQuarantine).where(
+                    ScreeningQuarantine.attempt_id == attempt_id
+                )
+            )
+            assert agent is not None and agent.status == AgentStatus.SCORED
+            assert agent.review_reason is None
+            assert review is not None and review.status == "resolved"
+            assert review.resolution_reason == "Operator cleared the submission"
+            assert retained is not None and retained.status == "resolved"
+            assert retained.resolution_reason == (
+                "Late deep-review evidence retained after operator action"
+            )
 
 
 class TestQuarantineAdmin:

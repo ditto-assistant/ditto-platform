@@ -81,6 +81,7 @@ from ditto.api_models.benchmark_progress import benchmark_progress_signing_token
 from ditto.api_models.continual_retest_settings import ContinualRetestSettings
 from ditto.api_models.inference import InferenceGrantOffer
 from ditto.api_models.queue_policy_settings import (
+    DeferredSourceReviewSettings,
     PrevGenCarryoverSettings,
     QueuePolicySettings,
 )
@@ -123,6 +124,13 @@ from ditto.api_server.crn import (
     fold_seed_bound,
 )
 from ditto.api_server.datapipeline import DatasetGenerator
+from ditto.api_server.deferred_source_review import (
+    DEFERRED_MECHANICAL_REASON,
+    DEFERRED_REVIEW_KIND,
+    DEFERRED_REVIEW_REASON,
+    DeferredReviewDecision,
+    evaluate_deferred_review,
+)
 from ditto.api_server.dependencies import (
     get_chain_client,
     get_dataset_generator,
@@ -162,11 +170,14 @@ from ditto.chain import ChainError
 from ditto.db.models import (
     Agent,
     AthReview,
+    AthReviewAction,
     BenchmarkDataset,
     BenchmarkRollout,
     ConfirmationScore,
     InferenceGrant,
     Score,
+    ScreeningAttempt,
+    ScreeningQuarantine,
     ValidatorHeartbeat,
     ValidatorTicket,
 )
@@ -401,6 +412,334 @@ async def _resolve_queue_policy(request: Request) -> QueuePolicySettings:
     if resolver is None:
         return QUEUE_POLICY_DEFAULTS
     return await resolver.resolve(getattr(request.app.state, "session_maker", None))
+
+
+async def _deferred_screening_attempts(
+    session: AsyncSession, *, agent_ids: Sequence[UUID]
+) -> dict[UUID, ScreeningAttempt]:
+    """Batch-resolve outstanding mechanical admissions without ledger N+1s.
+
+    A prior deferred ATH lifecycle (pending or resolved) is terminal for
+    qualification; an operator clear must not be reopened by a later score
+    mutation. A terminal non-build attempt is also a stop even if historical
+    data somehow lost its review row.
+    """
+    ids = tuple(dict.fromkeys(agent_ids))
+    if not ids:
+        return {}
+    reviewed_ids = set(
+        await session.scalars(
+            select(AthReview.agent_id).where(
+                AthReview.agent_id.in_(ids),
+                AthReview.algorithm_provenance["review_kind"].as_string()
+                == DEFERRED_REVIEW_KIND,
+            )
+        )
+    )
+    terminal_ids = set(
+        await session.scalars(
+            select(ScreeningAttempt.agent_id)
+            .where(
+                ScreeningAttempt.agent_id.in_(ids),
+                ScreeningAttempt.policy_version == SCREENING_POLICY_VERSION,
+                ScreeningAttempt.build_only.is_(False),
+                ScreeningAttempt.status.in_(("passed", "quarantined")),
+            )
+            .distinct()
+        )
+    )
+    rows = (
+        await session.scalars(
+            select(ScreeningAttempt)
+            .where(
+                ScreeningAttempt.agent_id.in_(ids),
+                ScreeningAttempt.policy_version == SCREENING_POLICY_VERSION,
+                ScreeningAttempt.build_only.is_(True),
+                ScreeningAttempt.status == "passed",
+                ScreeningAttempt.reason_code == DEFERRED_MECHANICAL_REASON,
+            )
+            .order_by(
+                ScreeningAttempt.agent_id,
+                ScreeningAttempt.finished_at.desc(),
+                ScreeningAttempt.attempt_id,
+            )
+        )
+    ).all()
+    outstanding: dict[UUID, ScreeningAttempt] = {}
+    for attempt in rows:
+        if (
+            attempt.agent_id in reviewed_ids
+            or attempt.agent_id in terminal_ids
+            or attempt.agent_id in outstanding
+        ):
+            continue
+        outstanding[attempt.agent_id] = attempt
+    return outstanding
+
+
+async def _deferred_screening_attempt(
+    session: AsyncSession, *, agent_id: UUID
+) -> ScreeningAttempt | None:
+    """Return one admission attempt proving deep review is still outstanding."""
+    return (await _deferred_screening_attempts(session, agent_ids=(agent_id,))).get(
+        agent_id
+    )
+
+
+async def _record_deferred_review_decision(
+    session: AsyncSession,
+    *,
+    agent: Agent,
+    decision: DeferredReviewDecision,
+    mode: Literal["observe", "enforce"],
+    screening_attempt: ScreeningAttempt | None,
+    score_count: int,
+    now: datetime,
+) -> None:
+    """Persist an observe record or enforce an idempotent reward hold."""
+    if not decision.triggered:
+        return
+    retained_review: ScreeningQuarantine | None = None
+    if screening_attempt is not None:
+        retained_review = await session.scalar(
+            select(ScreeningQuarantine).where(
+                ScreeningQuarantine.attempt_id == screening_attempt.attempt_id
+            )
+        )
+    evidence = {
+        "sha256": agent.sha256,
+        "score_count": score_count,
+        "previous_status": agent.status.value,
+        "deferred_review": {
+            **decision.evidence,
+            "mode": mode,
+            "screening_attempt_id": (
+                str(screening_attempt.attempt_id)
+                if screening_attempt is not None
+                else None
+            ),
+            "screening_reason_code": (
+                screening_attempt.reason_code if screening_attempt is not None else None
+            ),
+            "review_audit_digest": (
+                retained_review.review_audit_digest
+                if retained_review is not None
+                else None
+            ),
+            "review_audit": (
+                retained_review.review_audit if retained_review is not None else None
+            ),
+        },
+    }
+    existing = await session.scalar(
+        select(AthReview).where(AthReview.agent_id == agent.agent_id).with_for_update()
+    )
+    if mode == "observe":
+        # AthReview is unique per agent and may already hold unrelated resolved
+        # history. The append-only score audit is therefore the authoritative
+        # observe-mode record: every qualification is durable without
+        # overwriting, reopening, or being suppressed by that unique row.
+        await append_audit_entry(
+            session,
+            agent_id=agent.agent_id,
+            validator_hotkey=None,
+            event=EVENT_AUDIT,
+            payload={
+                "audit_kind": DEFERRED_REVIEW_KIND,
+                "enforced": False,
+                "qualified": True,
+                "trigger_kinds": list(decision.triggers),
+            },
+            recorded_at=now,
+        )
+        return
+
+    if existing is not None and existing.status == "pending":
+        return
+
+    previous_status = agent.status.value
+    if existing is None:
+        session.add(
+            AthReview(
+                review_id=uuid4(),
+                agent_id=agent.agent_id,
+                status="pending",
+                opened_at=now,
+                original_reason=DEFERRED_REVIEW_REASON,
+                original_policy_version=agent.screening_policy_version,
+                original_evidence=evidence,
+                algorithm_provenance={
+                    "snapshot": "score-finalization",
+                    "review_kind": DEFERRED_REVIEW_KIND,
+                    "algorithm_version": "deferred-source-review-v1",
+                    "opened_by": "platform",
+                    "backfilled": False,
+                    "opened_at_source": "deferred-review-enforce",
+                },
+            )
+        )
+    else:
+        prior_provenance = existing.algorithm_provenance
+        prior_review = {
+            "original_reason": existing.original_reason,
+            "original_policy_version": existing.original_policy_version,
+            "original_evidence": existing.original_evidence,
+            "algorithm_provenance": prior_provenance,
+            "resolution": existing.resolution,
+            "resolution_reason": existing.resolution_reason,
+            "resolved_by": existing.resolved_by,
+            "resolved_at": (
+                existing.resolved_at.isoformat()
+                if existing.resolved_at is not None
+                else None
+            ),
+        }
+        existing.status = "pending"
+        existing.reopened_at = now
+        existing.resolved_at = None
+        existing.resolved_by = None
+        existing.resolution = None
+        existing.resolution_reason = None
+        existing.original_reason = DEFERRED_REVIEW_REASON
+        existing.original_policy_version = agent.screening_policy_version
+        existing.original_evidence = {
+            **evidence,
+            "prior_review": prior_review,
+        }
+        # The current pending lifecycle is a deferred review. Claiming the one
+        # allowed deep attempt keys off this provenance; retaining a resolved
+        # copy/transform kind here would strand the agent in ATH forever.
+        existing.algorithm_provenance = {
+            "snapshot": "score-finalization",
+            "review_kind": DEFERRED_REVIEW_KIND,
+            "algorithm_version": "deferred-source-review-v1",
+            "opened_by": "platform",
+            "backfilled": False,
+            "opened_at_source": "deferred-review-reopen",
+            "prior_review_kind": prior_provenance.get("review_kind"),
+        }
+        session.add(
+            AthReviewAction(
+                action_id=uuid4(),
+                review_id=existing.review_id,
+                action="reopen",
+                reason=DEFERRED_REVIEW_REASON,
+                actor="platform:deferred-source-review",
+                evidence={
+                    "sha256": agent.sha256,
+                    "score_count": score_count,
+                    "previous_status": previous_status,
+                },
+                created_at=now,
+            )
+        )
+    agent.status = AgentStatus.ATH_PENDING_REVIEW
+    agent.duplicate_of = None
+    agent.review_reason = DEFERRED_REVIEW_REASON
+
+
+async def _evaluate_and_record_deferred_review(
+    session: AsyncSession,
+    *,
+    agent: Agent,
+    bench_version: int,
+    score_count: int,
+    settings: DeferredSourceReviewSettings,
+    now: datetime,
+) -> None:
+    """Re-evaluate deferred admissions after a canonical ledger mutation.
+
+    This helper is used both at first quorum and on operator-authorized score
+    replacement. The explicit flush is load-bearing: ``list_eligible_ledger``
+    filters on the agent's finalized status and must see the just-written score
+    and status before deciding rank/anomaly eligibility. In enforce mode a
+    mutation can promote a *different* row into the top five, so the whole
+    canonical same-version ledger is reconsidered. Only rows carrying the
+    immutable mechanical-admission marker can acquire a delayed hold, and the
+    marker resolver suppresses pending or terminal deep-review lifecycles.
+    """
+    if settings.mode == "off" or agent.status not in {
+        AgentStatus.SCORED,
+        AgentStatus.LIVE,
+    }:
+        return
+    mode: Literal["observe", "enforce"] = settings.mode
+    await session.flush()
+    ledger = await list_eligible_ledger(
+        session,
+        bench_version=bench_version,
+        include_fingerprints=False,
+        include_details=False,
+    )
+    if mode == "observe":
+        decision = evaluate_deferred_review(
+            agent_id=agent.agent_id,
+            ledger=ledger,
+            settings=settings,
+        )
+        await _record_deferred_review_decision(
+            session,
+            agent=agent,
+            decision=decision,
+            mode=mode,
+            screening_attempt=None,
+            score_count=score_count,
+            now=now,
+        )
+        return
+
+    ledger_ids = [row.agent_id for row in ledger if row.eligible]
+    if not ledger_ids:
+        return
+    candidates = {
+        candidate.agent_id: candidate
+        for candidate in await session.scalars(
+            select(Agent).where(
+                Agent.agent_id.in_(ledger_ids),
+                Agent.status.in_((AgentStatus.SCORED, AgentStatus.LIVE)),
+            )
+        )
+    }
+    score_counts = {
+        candidate_id: int(count)
+        for candidate_id, count in (
+            await session.execute(
+                select(Score.agent_id, func.count())
+                .where(
+                    Score.agent_id.in_(ledger_ids),
+                    Score.bench_version == bench_version,
+                )
+                .group_by(Score.agent_id)
+            )
+        ).all()
+    }
+    admissions = await _deferred_screening_attempts(
+        session, agent_ids=tuple(candidates)
+    )
+    for row in ledger:
+        candidate = candidates.get(row.agent_id)
+        if candidate is None or not row.eligible:
+            continue
+        admission_attempt = admissions.get(row.agent_id)
+        if admission_attempt is None:
+            # Legacy/full-reviewed rows never acquire a new hold merely because
+            # the control is enabled later. Resolved terminal deep reviews are
+            # likewise suppressed by the marker resolver.
+            continue
+        decision = evaluate_deferred_review(
+            agent_id=row.agent_id,
+            ledger=ledger,
+            settings=settings,
+        )
+        await _record_deferred_review_decision(
+            session,
+            agent=candidate,
+            decision=decision,
+            mode="enforce",
+            screening_attempt=admission_attempt,
+            score_count=score_counts.get(row.agent_id, 0),
+            now=now,
+        )
 
 
 async def _fresh_submission_lane_due(
@@ -4492,6 +4831,8 @@ async def submit_score(
             f"v{MIN_SCOREABLE_BENCH_VERSION} and later only"
         )
 
+    queue_policy = await _resolve_queue_policy(request)
+
     # 4. Atomic: record the score + advance status together. The row lock
     #    serializes concurrent scorers so the status guard + transition below
     #    can't be lost-updated.
@@ -4791,6 +5132,14 @@ async def submit_score(
             replacement_median = statistics.median(
                 score.composite for score in replacement_scores
             )
+            await _evaluate_and_record_deferred_review(
+                session,
+                agent=agent,
+                bench_version=ticket.bench_version,
+                score_count=len(replacement_scores),
+                settings=queue_policy.deferred_source_review,
+                now=audit_now,
+            )
             await append_audit_entry(
                 session,
                 agent_id=agent_id,
@@ -5062,6 +5411,15 @@ async def submit_score(
                         },
                         recorded_at=audit_now,
                     )
+                deferred_settings = queue_policy.deferred_source_review
+                await _evaluate_and_record_deferred_review(
+                    session,
+                    agent=agent,
+                    bench_version=ticket.bench_version,
+                    score_count=len(agent_scores),
+                    settings=deferred_settings,
+                    now=audit_now,
+                )
                 # Append the finalize audit entry: quorum reached, the median the
                 # platform finalized on, and which validators scored it. The
                 # moderation detail (why held / duplicate_of) is deliberately kept

@@ -72,6 +72,11 @@ from ditto.api_server.artifact_audit import client_ip, request_detail
 from ditto.api_server.attestation import expected_netuid
 from ditto.api_server.benchmark_rollout import refresh_rolling_qualification
 from ditto.api_server.datapipeline import DatasetGenerator
+from ditto.api_server.deferred_source_review import (
+    DEFERRED_MECHANICAL_REASON,
+    DEFERRED_REVIEW_KIND,
+    INCONCLUSIVE_REASON_CODE,
+)
 from ditto.api_server.dependencies import (
     get_dataset_generator,
     get_session,
@@ -83,6 +88,7 @@ from ditto.api_server.endpoints.validator import (
     _verify_signature,
 )
 from ditto.api_server.onchain_seed import derive_seed
+from ditto.api_server.queue_policy_settings import resolve_queue_policy_settings
 from ditto.api_server.storage import (
     ObjectDownloadFailedError,
     ObjectNotFoundError,
@@ -92,6 +98,8 @@ from ditto.api_server.storage import (
 from ditto.chain import ChainError
 from ditto.db.models import (
     Agent,
+    AthReview,
+    AthReviewAction,
     BenchmarkDataset,
     BenchmarkRollout,
     BenchmarkRolloutMember,
@@ -645,6 +653,7 @@ async def claim(
     now = datetime.now(UTC)
     if session.get_bind().dialect.name == "postgresql":
         async with session.begin():
+            queue_settings = await resolve_queue_policy_settings(session)
             claimed = await claim_screening_attempts(
                 session,
                 screener_hotkey=screener_hotkey,
@@ -652,12 +661,14 @@ async def claim(
                 ttl=_SCREENING_LEASE_TTL,
                 limit=limit,
                 netuid=expected_netuid(),
+                deferred_review_mode=queue_settings.deferred_source_review.mode,
             )
     else:
         # SQLite is used by local/test deployments and has no advisory locks.
         # Hold a process-local lock through commit so its behavior matches the
         # Postgres transaction-scoped lock used in production.
         async with _CLAIM_FALLBACK_LOCK, session.begin():
+            queue_settings = await resolve_queue_policy_settings(session)
             claimed = await claim_screening_attempts(
                 session,
                 screener_hotkey=screener_hotkey,
@@ -665,6 +676,7 @@ async def claim(
                 ttl=_SCREENING_LEASE_TTL,
                 limit=limit,
                 netuid=expected_netuid(),
+                deferred_review_mode=queue_settings.deferred_source_review.mode,
             )
     items = [
         ScreenerQueueItem(
@@ -672,13 +684,16 @@ async def claim(
             miner_hotkey=agent.miner_hotkey,
             name=agent.name,
             sha256=agent.sha256,
-            status=AgentStatus.SCREENING,
+            status=agent.status,
             created_at=agent.created_at,
             attempt_id=attempt.attempt_id,
             lease_deadline=attempt.deadline,
             precheck_reason_code=attempt.reason_code,
             duplicate_of=duplicate_of,
             build_only=attempt.build_only,
+            deferred_source_review=(
+                attempt.build_only and attempt.reason_code == DEFERRED_MECHANICAL_REASON
+            ),
         )
         for agent, attempt, duplicate_of in claimed
     ]
@@ -1370,13 +1385,29 @@ async def _backfill_quarantine_payloads(
     verdict bound.
     """
     evidence_json, finding_json = _quarantine_payload_json(payload)
-    if evidence_json is None and finding_json is None:
+    audit_json = (
+        payload.review_audit.model_dump(mode="json")
+        if payload.review_audit is not None
+        else None
+    )
+    if evidence_json is None and finding_json is None and audit_json is None:
         return
     quarantine = await session.scalar(
         select(ScreeningQuarantine).where(ScreeningQuarantine.attempt_id == attempt_id)
     )
     if quarantine is None:
         return
+    if audit_json is not None and payload.review_audit_digest is not None:
+        if quarantine.review_audit is None and quarantine.review_audit_digest is None:
+            quarantine.review_audit = audit_json
+            quarantine.review_audit_digest = payload.review_audit_digest
+        elif (
+            quarantine.review_audit != audit_json
+            or quarantine.review_audit_digest != payload.review_audit_digest
+        ):
+            raise AgentNotScreenableError(
+                "re-reported review audit conflicts with retained evidence"
+            )
     if quarantine.evidence is None and evidence_json:
         quarantine.evidence = evidence_json
     if (
@@ -1443,6 +1474,8 @@ async def submit_result(
             outcome=payload.outcome,
             manifest_digest=payload.manifest_digest,
             finding_digest=payload.finding_digest,
+            review_audit_digest=payload.review_audit_digest,
+            deferred_source_review=payload.deferred_source_review,
             review_settings_revision=payload.review_settings_revision,
             review_settings_instance_id=payload.review_settings_instance_id,
             review_settings_scope=payload.review_settings_scope,
@@ -1525,8 +1558,93 @@ async def submit_result(
                 "stored screened image size changed after verification"
             )
 
+    outcome_value = payload.outcome.value if payload.outcome is not None else None
+    records_review_evidence = outcome_value in {
+        "pass_inconclusive",
+        "inconclusive",
+        "quarantine",
+    }
+    deferred_review: AthReview | None = None
+    reported_attempt: ScreeningAttempt | None = None
+    deferred_attempt_lifecycle = False
+    deferred_deep_attempt = False
+    restore_status = AgentStatus.SCORED
+    if payload.attempt_id is not None:
+        async with session.begin():
+            reported_attempt = await get_screening_attempt(
+                session, attempt_id=payload.attempt_id
+            )
+            current_agent = await get_agent_by_id(session, agent_id=agent_id)
+            if current_agent is not None:
+                deferred_review = await session.scalar(
+                    select(AthReview).where(
+                        AthReview.agent_id == agent_id,
+                        AthReview.algorithm_provenance["review_kind"].as_string()
+                        == DEFERRED_REVIEW_KIND,
+                    )
+                )
+            review_started_at = (
+                deferred_review.reopened_at or deferred_review.opened_at
+                if deferred_review is not None
+                else None
+            )
+            deferred_attempt_lifecycle = bool(
+                reported_attempt is not None
+                and not reported_attempt.build_only
+                and review_started_at is not None
+                and reported_attempt.started_at >= review_started_at
+            )
+            deferred_deep_attempt = bool(
+                deferred_attempt_lifecycle
+                and current_agent is not None
+                and current_agent.status == AgentStatus.ATH_PENDING_REVIEW
+                and deferred_review is not None
+                and deferred_review.status == "pending"
+            )
+            if deferred_review is not None:
+                previous = deferred_review.original_evidence.get("previous_status")
+                if previous == AgentStatus.LIVE.value:
+                    restore_status = AgentStatus.LIVE
+
+    deferred_mechanical_admission = bool(
+        reported_attempt is not None
+        and reported_attempt.build_only
+        and reported_attempt.reason_code == DEFERRED_MECHANICAL_REASON
+    )
+    if (
+        reported_attempt is not None
+        and payload.deferred_source_review != deferred_mechanical_admission
+    ):
+        raise AgentNotScreenableError(
+            "verdict execution mode does not match the claimed screening attempt"
+        )
     public_reason: str | None
-    if payload.outcome == ScreenResultOutcome.INCONCLUSIVE:
+    if deferred_deep_attempt and outcome_value == "pass":
+        target = restore_status
+        public_reason = None
+    elif deferred_deep_attempt and outcome_value in {
+        "pass_inconclusive",
+        "inconclusive",
+        "quarantine",
+    }:
+        # A completed deep review that cannot clear the artifact remains a
+        # reward hold. It is terminal for this attempt: no inconclusive loop.
+        target = AgentStatus.ATH_PENDING_REVIEW
+        public_reason = "Deferred source review requires operator adjudication"
+    elif (
+        deferred_deep_attempt and payload.outcome == ScreenResultOutcome.RETRYABLE_INFRA
+    ):
+        target = AgentStatus.ATH_PENDING_REVIEW
+        public_reason = "Deferred source review was interrupted; retry scheduled"
+    elif outcome_value == "pass_inconclusive":
+        target = AgentStatus.EVALUATING
+        public_reason = (
+            "Mechanical admission passed; deep source review deferred until score "
+            "qualification"
+            if deferred_mechanical_admission
+            else "Bounded source review exhausted; admitted for scoring"
+        )
+    elif payload.outcome == ScreenResultOutcome.INCONCLUSIVE:
         # Inconclusive remains a NON-verdict: it neither passes nor rejects the
         # submission. Persist the completed attempt as an early-expired lease
         # so operators do not see work that finished minutes ago as still
@@ -1540,15 +1658,14 @@ async def submit_result(
         # prerequisites and runs no source review, so it must not be able to
         # re-quarantine — that would let a screener silently override the
         # operator release / prior pass that made it EVALUATING.
-        if payload.attempt_id is not None:
-            async with session.begin():
-                reported_attempt = await get_screening_attempt(
-                    session, attempt_id=payload.attempt_id
-                )
-            if reported_attempt is not None and reported_attempt.build_only:
-                raise AgentNotScreenableError(
-                    "a build-only screening attempt cannot quarantine"
-                )
+        if (
+            reported_attempt is not None
+            and reported_attempt.build_only
+            and not (deferred_mechanical_admission and payload.deferred_source_review)
+        ):
+            raise AgentNotScreenableError(
+                "a build-only screening attempt cannot quarantine"
+            )
         target = AgentStatus.QUARANTINED
         public_reason = "Submission held for anti-cheat review"
     elif payload.outcome == ScreenResultOutcome.RETRYABLE_INFRA:
@@ -1630,10 +1747,13 @@ async def submit_result(
             raise AgentNotFoundError(f"no agent with id={agent_id}")
         attempt: ScreeningAttempt | None = None
         attempt_status = (
-            "expired"
+            "passed"
+            if deferred_attempt_lifecycle
+            and outcome_value in {"pass", "pass_inconclusive", "inconclusive"}
+            else "expired"
             if payload.outcome == ScreenResultOutcome.INCONCLUSIVE
             else "quarantined"
-            if target == AgentStatus.QUARANTINED
+            if target == AgentStatus.QUARANTINED or outcome_value == "quarantine"
             else "passed"
             if payload.passed
             else ("rejected" if target == AgentStatus.REJECTED else "failed")
@@ -1744,7 +1864,7 @@ async def submit_result(
                 # carry review payloads that an earlier report (or an older
                 # platform build) did not persist. Backfill them before
                 # returning or they would be unrecoverable for this attempt.
-                if target == AgentStatus.QUARANTINED:
+                if records_review_evidence:
                     await _backfill_quarantine_payloads(
                         session, attempt_id=attempt.attempt_id, payload=payload
                     )
@@ -1756,6 +1876,25 @@ async def submit_result(
                 raise AgentNotScreenableError(
                     "screening attempt is expired or already completed"
                 )
+        deferred_review_active_now = False
+        if deferred_attempt_lifecycle:
+            deferred_review = await session.scalar(
+                select(AthReview)
+                .where(
+                    AthReview.agent_id == agent_id,
+                    AthReview.algorithm_provenance["review_kind"].as_string()
+                    == DEFERRED_REVIEW_KIND,
+                )
+                .with_for_update()
+            )
+            deferred_review_active_now = bool(
+                deferred_review is not None
+                and deferred_review.status == "pending"
+                and agent.status == AgentStatus.ATH_PENDING_REVIEW
+            )
+        late_deferred_result = (
+            deferred_attempt_lifecycle and not deferred_review_active_now
+        )
         rescreening = (
             agent.status
             in (
@@ -1780,7 +1919,15 @@ async def submit_result(
             )
         ) and agent.status in (AgentStatus.SCORED, AgentStatus.LIVE)
         idempotent = agent.status == target
-        if rolling_rescreen and payload.passed:
+        if late_deferred_result:
+            # An operator resolution is authoritative. A screener response that
+            # was already in flight may finish after clear/reject; retain its
+            # signed attempt evidence below, but never resurrect the hold or
+            # overwrite the operator-selected status/reason.
+            pass
+        elif deferred_deep_attempt:
+            agent.status = target
+        elif rolling_rescreen and payload.passed:
             pass
         elif rolling_rescreen or agent.status in _SCREENABLE_STATUSES or rescreening:
             agent.status = target
@@ -1791,9 +1938,18 @@ async def submit_result(
                 f"agent {agent_id} is {agent.status}, cannot apply verdict "
                 f"passed={payload.passed} (target {target})"
             )
-        agent.screening_reason = public_reason
-        agent.screening_reason_code = None if payload.passed else payload.reason_code
-        if payload.reason_code == "exact-cross-miner-duplicate":
+        if not late_deferred_result:
+            agent.screening_reason = public_reason
+            agent.screening_reason_code = (
+                payload.reason_code
+                if outcome_value in {"pass_inconclusive", "inconclusive", "quarantine"}
+                else None
+                if payload.passed
+                else payload.reason_code
+            )
+        if late_deferred_result:
+            pass
+        elif payload.reason_code == "exact-cross-miner-duplicate":
             if attempt is None or attempt.duplicate_of is None:
                 raise AgentNotScreenableError(
                     "exact duplicate verdict requires a platform precheck"
@@ -1804,9 +1960,12 @@ async def submit_result(
         # Persist the policy that produced either terminal verdict. Rejected
         # submissions retry only after a policy bump; infrastructure failures
         # remain retryable under the same policy.
-        if payload.policy_version == SCREENING_POLICY_VERSION:
+        if (
+            not late_deferred_result
+            and payload.policy_version == SCREENING_POLICY_VERSION
+        ):
             agent.screening_policy_version = payload.policy_version
-        if payload.passed:
+        if payload.passed and not late_deferred_result:
             agent.screened_image_sha256 = payload.image_sha256
             agent.screened_image_size_bytes = payload.image_size_bytes
             agent.screened_image_id = payload.image_id
@@ -1814,6 +1973,41 @@ async def submit_result(
             agent.screened_image_upload_id = image_upload_id
             agent.screened_image_verified_at = (
                 verified_upload.verified_at if verified_upload is not None else None
+            )
+        if (
+            deferred_deep_attempt
+            and deferred_review_active_now
+            and outcome_value == "pass"
+        ):
+            assert deferred_review is not None
+            cleared_at = datetime.now(UTC)
+            deferred_review.status = "resolved"
+            deferred_review.resolved_at = cleared_at
+            deferred_review.resolved_by = "platform:deferred-source-review"
+            deferred_review.resolution = "clear"
+            deferred_review.resolution_reason = (
+                "Deferred source review completed without a decisive finding"
+            )
+            agent.review_reason = None
+            agent.duplicate_of = None
+            session.add(
+                AthReviewAction(
+                    action_id=uuid4(),
+                    review_id=deferred_review.review_id,
+                    action="clear",
+                    reason=deferred_review.resolution_reason,
+                    actor=deferred_review.resolved_by,
+                    evidence={
+                        "sha256": agent.sha256,
+                        "score_count": int(
+                            deferred_review.original_evidence.get("score_count", 0)
+                        ),
+                        "previous_status": deferred_review.original_evidence.get(
+                            "previous_status", AgentStatus.SCORED.value
+                        ),
+                    },
+                    created_at=cleared_at,
+                )
             )
         if attempt is None and not idempotent:
             now = datetime.now(UTC)
@@ -1833,17 +2027,20 @@ async def submit_result(
             attempt.status = attempt_status
             attempt.finished_at = datetime.now(UTC)
             attempt.public_reason = public_reason
-            attempt.reason_code = payload.reason_code
+            if attempt.reason_code != DEFERRED_MECHANICAL_REASON:
+                attempt.reason_code = payload.reason_code
             attempt.review_settings_revision = payload.review_settings_revision
             attempt.review_settings_instance_id = payload.review_settings_instance_id
             attempt.review_settings_scope = payload.review_settings_scope
             attempt.review_settings_checksum = payload.review_settings_checksum
-        if target == AgentStatus.QUARANTINED:
+        if target == AgentStatus.QUARANTINED or records_review_evidence:
             if attempt is None:
                 raise AgentNotScreenableError(
-                    "quarantine requires a claimed screening attempt"
+                    "source-review evidence requires a claimed screening attempt"
                 )
-            if payload.manifest_digest is None or payload.reason_code is None:
+            if target == AgentStatus.QUARANTINED and (
+                payload.manifest_digest is None or payload.reason_code is None
+            ):
                 raise AgentNotScreenableError(
                     "quarantine result is missing bounded evidence"
                 )
@@ -1856,6 +2053,10 @@ async def submit_result(
                 )
             )
             if existing_quarantine is None:
+                evidence_deferred = target != AgentStatus.QUARANTINED or (
+                    deferred_attempt_lifecycle
+                )
+                resolved_at = datetime.now(UTC) if evidence_deferred else None
                 session.add(
                     ScreeningQuarantine(
                         quarantine_id=uuid4(),
@@ -1863,25 +2064,95 @@ async def submit_result(
                         attempt_id=attempt.attempt_id,
                         screener_hotkey=screener_hotkey,
                         policy_version=payload.policy_version,
-                        manifest_digest=payload.manifest_digest,
+                        manifest_digest=payload.manifest_digest
+                        or hashlib.sha256(
+                            b"ditto:deferred-source-review:inconclusive:v1"
+                        ).hexdigest(),
                         finding_digest=payload.finding_digest,
-                        reason_code=payload.reason_code,
+                        review_audit_digest=payload.review_audit_digest,
+                        review_audit=(
+                            payload.review_audit.model_dump(mode="json")
+                            if payload.review_audit is not None
+                            else None
+                        ),
+                        reason_code=payload.reason_code or INCONCLUSIVE_REASON_CODE,
                         evidence=evidence_json,
                         finding=finding_json,
-                        status="active",
+                        status="resolved" if evidence_deferred else "active",
+                        resolved_at=resolved_at,
+                        resolved_by=(
+                            "platform:deferred-source-review"
+                            if evidence_deferred
+                            else None
+                        ),
+                        resolution="rescreen" if evidence_deferred else None,
+                        resolution_reason=(
+                            "Late deep-review evidence retained after operator action"
+                            if late_deferred_result
+                            else "Evidence retained on the score-qualified ATH review"
+                            if deferred_attempt_lifecycle
+                            else "Deep source review deferred until score qualification"
+                            if deferred_mechanical_admission
+                            else "Bounded source review exhausted; admitted for scoring"
+                        )
+                        if evidence_deferred
+                        else None,
                     )
                 )
             else:
                 await _backfill_quarantine_payloads(
                     session, attempt_id=attempt.attempt_id, payload=payload
                 )
+            if (
+                deferred_review is not None
+                and deferred_deep_attempt
+                and deferred_review_active_now
+            ):
+                deferred_snapshot = deferred_review.original_evidence.get(
+                    "deferred_review", {}
+                )
+                deferred_review.original_evidence = {
+                    **deferred_review.original_evidence,
+                    "deferred_review": {
+                        **(
+                            deferred_snapshot
+                            if isinstance(deferred_snapshot, dict)
+                            else {}
+                        ),
+                        "screening_reason_code": payload.reason_code,
+                        "review_audit_digest": payload.review_audit_digest,
+                        "review_audit": (
+                            payload.review_audit.model_dump(mode="json")
+                            if payload.review_audit is not None
+                            else None
+                        ),
+                    },
+                    "deep_review_result": {
+                        "attempt_id": str(attempt.attempt_id),
+                        "outcome": outcome_value,
+                        "reason_code": payload.reason_code,
+                        "manifest_digest": payload.manifest_digest,
+                        "finding_digest": payload.finding_digest,
+                        "review_audit_digest": payload.review_audit_digest,
+                        "review_audit": (
+                            payload.review_audit.model_dump(mode="json")
+                            if payload.review_audit is not None
+                            else None
+                        ),
+                    },
+                }
         # Pin the generated version row once. Locking the agent serializes two
         # verdicts; the second lookup prevents a duplicate insert if another
         # path backfilled the row while generation was in flight.
-        if new_dataset is not None and agent.status in (
-            AgentStatus.EVALUATING,
-            AgentStatus.SCORED,
-            AgentStatus.LIVE,
+        if (
+            new_dataset is not None
+            and not late_deferred_result
+            and agent.status
+            in (
+                AgentStatus.EVALUATING,
+                AgentStatus.SCORED,
+                AgentStatus.LIVE,
+            )
         ):
             (
                 bench_version,

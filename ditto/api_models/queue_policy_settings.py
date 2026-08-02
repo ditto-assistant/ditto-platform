@@ -145,6 +145,19 @@ DEFAULT_SIMILARITY_CONTAINMENT_THRESHOLD = 0.95
 ROLLOUT_LOCKED_FIELDS = ("lane_cycle_size", "fresh_submission_slots")
 
 
+class DeferredSourceReviewSettings(BaseModel):
+    """Hot-swappable post-score deep-review admission and anomaly policy."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    mode: Literal["off", "observe", "enforce"] = "off"
+    min_cohort_size: Annotated[int, Field(ge=5, le=100)] = 8
+    composite_mad_multiplier: Annotated[float, Field(ge=1.0, le=20.0)] = 6.0
+    axis_mad_multiplier: Annotated[float, Field(ge=1.0, le=20.0)] = 6.0
+    min_composite_delta: Annotated[float, Field(ge=0.0, le=1.0)] = 0.10
+    min_axis_delta: Annotated[float, Field(ge=0.0, le=1.0)] = 0.15
+
+
 def _as_slot_tuple(value: object) -> object:
     """Accept a JSON array for a field that is stored as an immutable tuple.
 
@@ -490,6 +503,16 @@ class QueuePolicySettings(BaseModel):
     prev_gen_carryover: PrevGenCarryoverSettings = PrevGenCarryoverSettings()
     """Adoption policy for stranded previous-generation submissions."""
 
+    deferred_source_review: DeferredSourceReviewSettings = (
+        DeferredSourceReviewSettings()
+    )
+    """Mechanical-first admission and post-score deep-review policy.
+
+    Top-five qualification is a fixed integrity invariant in ``enforce`` mode;
+    operators can tune only the robust anomaly trigger or roll the whole feature
+    between off, observe, and enforce.
+    """
+
     @model_validator(mode="after")
     def _check_coherent(self) -> QueuePolicySettings:
         """Reject combinations that individually validate but jointly deadlock.
@@ -661,6 +684,15 @@ class AdminQueuePolicySettingsRequest(BaseModel):
         if similarity_missing:
             raise ValueError(
                 f"similarity_budget is stored whole too; missing {similarity_missing}"
+            )
+        deferred_missing = sorted(
+            set(DeferredSourceReviewSettings.model_fields)
+            - self.settings.deferred_source_review.model_fields_set
+        )
+        if deferred_missing:
+            raise ValueError(
+                "deferred_source_review is stored whole too; missing "
+                f"{deferred_missing}"
             )
         return self
 
