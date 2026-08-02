@@ -52,29 +52,11 @@
 # to be backward-compatible with the previous revision either way, and the
 # rollback relies on exactly that property rather than introducing it.
 #
-# THE RELAY (DITTO_ROLE=relay, #438) IS A SECOND PROCESS ON THIS HOST, NOT A
-# SECOND HOST -- which is what makes it safe for this script to own.
-#
-# An earlier version of this note said two-host deploys were unsolvable here,
-# and it was right: two hosts pulling independently would migrate one shared
-# database from two uncoordinated DDL transactions, and a rollback on one host
-# but not the other would leave the pair straddling two revisions. That needs a
-# deploy that migrates once and then rolls both, which no per-host script can
-# arrange.
-#
-# Running the relay as a second pm2 app on this host dissolves that problem
-# instead of solving it. There is ONE checkout, so `git reset --hard` below
-# fixes one revision for both processes and there is no second pull to race.
-# There is ONE run of `alembic upgrade head`, ordered before the pm2 stage, so
-# migrations are exactly-once by sequence rather than by locking. And the
-# verify stage holds EVERY app in app_health_url_for to the same bar -- HTTP
-# 200 plus the commit this deploy checked out -- so a process that failed to
-# restart fails the deploy rather than drifting silently behind its sibling.
-#
-# Drift between the two roles is therefore structurally impossible here, and
-# the pair can only ever be as stale as each other. Splitting the relay onto
-# its own host would reintroduce every problem in the paragraph above; do not
-# do it without moving the deploy into the workflow first.
+# THE RELAY IS RELEASED SEPARATELY. The GitHub deploy workflow builds its
+# wheel/lock artifact in parallel with this ordinary Platform deploy, then
+# rolls ditto-api-relay-1 and -2 one at a time after this script has migrated
+# and verified the API. Never reload those apps here: doing both in one PM2
+# command caused the 2026-08-02 inference outage window.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -140,23 +122,6 @@ resolve_health_url() {
 app_health_url_for() {
   case "$1" in
     ditto-api) resolve_health_url ;;
-    # Relay ports are derived from the app index so this stays correct when a
-    # relay is added to RELAY_PORTS in scripts/ecosystem.config.js. The base
-    # must match RELAY_PORTS[0] there. $DITTO_RELAY_PORT_BASE exists so the
-    # test harness can point the relays at an ephemeral listener.
-    ditto-api-relay-*)
-      # ditto-api-relay-N takes the Nth port from the list, which must mirror
-      # RELAY_PORTS in scripts/ecosystem.config.js. $DITTO_RELAY_PORTS lets the
-      # test harness point every relay at one ephemeral listener; an unknown
-      # index yields an empty URL, which degrades to a pm2-status-only check
-      # rather than probing the wrong port.
-      local idx="${1##*-}" port
-      case "$idx" in '' | *[!0-9]*) printf ''; return ;; esac
-      port="$(printf '%s' "${DITTO_RELAY_PORTS:-8010 8011}" |
-        tr ' ,' '\n\n' | sed -n "${idx}p")"
-      [ -n "$port" ] || { printf ''; return; }
-      printf 'http://127.0.0.1:%s/health' "$port"
-      ;;
     *) printf '' ;;
   esac
 }
@@ -468,6 +433,10 @@ oneshot_apps=""
 # back out of "$pm2_plan" only when it has to explain a failure.
 while IFS=$'\t' read -r action name role err_log _ reason; do
   [ -n "$name" ] || continue
+  if [[ "$name" == ditto-api-relay-* ]]; then
+    echo "    $name: managed by the rolling relay release; ordinary deploy skips it"
+    continue
+  fi
   case "$role" in
     oneshot) oneshot_apps="$oneshot_apps $name" ;;
     *) service_apps="$service_apps $name" ;;
