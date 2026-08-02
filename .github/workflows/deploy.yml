@@ -51,10 +51,6 @@ permissions:
   contents: read
   id-token: write # OIDC -> GCP WIF
 
-concurrency:
-  group: deploy-${{ github.ref_name }}
-  cancel-in-progress: false
-
 jobs:
   changes:
     runs-on: blacksmith-4vcpu-ubuntu-2404
@@ -116,6 +112,11 @@ jobs:
   deploy:
     needs: changes
     runs-on: blacksmith-4vcpu-ubuntu-2404
+    # Keep API deploys ordered per branch without making a slow relay rollout
+    # block a later API-only release.
+    concurrency:
+      group: platform-api-deploy-${{ github.ref_name }}
+      cancel-in-progress: false
     # GitHub Environment selects the per-env DITTO_UPLOAD_PAYMENT_ADDRESS secret
     # (and enables optional required-reviewer gating on prod).
     environment: ${{ github.ref_name == 'main' && 'prod' || 'dev' }}
@@ -359,9 +360,17 @@ jobs:
       needs.relay-build.result == 'success' &&
       needs.deploy.result == 'success'
     runs-on: blacksmith-4vcpu-ubuntu-2404
+    # Relay rolls remain serialized so two releases cannot touch the same PM2
+    # slots concurrently. This is deliberately separate from the API lane.
+    concurrency:
+      group: platform-relay-release-${{ github.ref_name }}
+      cancel-in-progress: false
     environment: prod
     env:
       GCP_ZONE: us-central1-a
+      # gcloud's IAP tunnel can use NumPy for its upload data path. Without
+      # site-package access, a 6 MB relay artifact took ten minutes to scp.
+      CLOUDSDK_PYTHON_SITEPACKAGES: "1"
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -374,6 +383,14 @@ jobs:
           service_account: ${{ secrets.GCP_PLATFORM_DEPLOY_SA }}
 
       - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+
+      - name: Accelerate IAP artifact upload
+        run: |
+          set -euo pipefail
+          gcloud_python="$(gcloud info --format='value(basic.python_location)')"
+          "$gcloud_python" -m pip install --disable-pip-version-check --quiet \
+            'numpy==2.4.4'
+          "$gcloud_python" -c 'import numpy'
 
       - name: Register release SSH key
         run: |
