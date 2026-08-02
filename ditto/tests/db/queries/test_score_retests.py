@@ -154,17 +154,16 @@ class TestNoRetestHistoryTakesNoLocks:
                 )
             assert promoted is None
 
-    async def test_a_queued_retest_still_takes_the_lock_it_needs(
+    async def test_a_queued_retest_never_waits_on_a_busy_queue_lock(
         self,
         session: AsyncSession,
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
-        """The skip is keyed on lifecycle, not on convenience.
+        """A queued re-test stays queued when another transaction owns the lock.
 
-        The moment a validator has any re-test history the serialization is
-        load-bearing again, so this asserts the lock is still taken -- otherwise
-        the fix above would read as "stop locking" rather than "stop locking for
-        callers that provably cannot use it".
+        Waiting is unsafe here because job issuance may already own ordinary
+        ticket rows the lock holder needs. Returning ``None`` is retry-safe: the
+        append-only QUEUED lifecycle remains intact for the next poll.
         """
         ticket = await _seed_issued_ticket(session)
         async with session.begin():
@@ -177,29 +176,20 @@ class TestNoRetestHistoryTakesNoLocks:
                 recorded_at=_NOW,
             )
 
-        async def _activate(scorer: AsyncSession) -> ValidatorTicket | None:
-            async with scorer.begin():
-                return await activate_next_score_retest(
-                    scorer,
-                    validator_hotkey=_HOTKEY,
-                    now=_NOW,
-                    supports_version=lambda _version: True,
-                    slot_id=_SLOT,
-                )
-
         async with session_maker() as holder, session_maker() as scorer:
             await holder.begin()
             await holder.execute(
                 select(func.pg_advisory_xact_lock(func.hashtextextended(_HOTKEY, 0)))
             )
-            waiting = asyncio.ensure_future(_activate(scorer))
-            done, _ = await asyncio.wait([waiting], timeout=1.0)
-            assert not done, "a validator with re-test history must serialize"
-
-            # Let it finish rather than cancelling it: a cancelled query leaves
-            # the connection unusable, and a test that cannot clean up teaches
-            # nothing about the lock it was written to observe.
-            await holder.rollback()
-            # A QUEUED entry behind an unrelated live lease stays queued, so the
-            # answer is still None -- it just could not be reached until now.
-            assert await asyncio.wait_for(waiting, timeout=_NO_WAIT) is None
+            async with scorer.begin():
+                promoted = await asyncio.wait_for(
+                    activate_next_score_retest(
+                        scorer,
+                        validator_hotkey=_HOTKEY,
+                        now=_NOW,
+                        supports_version=lambda _version: True,
+                        slot_id=_SLOT,
+                    ),
+                    timeout=_NO_WAIT,
+                )
+            assert promoted is None
