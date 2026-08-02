@@ -6,9 +6,34 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
+from ditto.api_models.screener import ScreenReviewAudit
+
+
+class AdminDeferredReviewEvidence(BaseModel):
+    """Public-safe trigger snapshot for a score-qualified source review."""
+
+    mode: Literal["observe", "enforce"]
+    triggers: list[
+        Literal[
+            "top_five",
+            "composite_anomaly",
+            "tool_anomaly",
+            "memory_anomaly",
+        ]
+    ]
+    rank: int | None = None
+    cohort_size: int
+    peer_count: int
+    candidate: dict[str, float]
+    thresholds: dict[str, dict[str, float]] | None = None
+    screening_attempt_id: UUID | None = None
+    screening_reason_code: str | None = None
+    review_audit_digest: str | None = None
+    review_audit: ScreenReviewAudit | None = None
+
 
 class AdminCopyReviewEvidence(BaseModel):
-    review_kind: Literal["copy", "benchmark_overfit"] = "copy"
+    review_kind: Literal["copy", "benchmark_overfit", "deferred_source_review"] = "copy"
     duplicate_of: UUID | None
     reason: str | None
     policy_version: int
@@ -27,6 +52,7 @@ class AdminCopyReviewEvidence(BaseModel):
     lookup. Null when the matched row is gone or carries no payment record.
     Same caveat as ``AdminCopyReviewItem.miner_coldkey``: one signal, not proof."""
     duplicate_of_submitted_at: datetime | None = None
+    deferred_review: AdminDeferredReviewEvidence | None = None
 
 
 class AdminCopySimilarityEvidence(BaseModel):

@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import ColumnElement, and_, case, exists, func, or_, select
+from sqlalchemy import ColumnElement, and_, case, exists, false, func, or_, select
 from sqlalchemy.orm import aliased
 from sqlalchemy.sql.selectable import ScalarSelect
 
@@ -16,6 +16,7 @@ from ditto.api_models.benchmark_contract import benchmark_contracts
 from ditto.api_models.screener import SCREENING_POLICY_VERSION
 from ditto.db.models import (
     Agent,
+    AthReview,
     BenchmarkDataset,
     BenchmarkRollout,
     BenchmarkRolloutMember,
@@ -78,6 +79,7 @@ _EXHAUSTED_REASON_CODE = "repeatedly-inconclusive"
 _EXHAUSTED_PUBLIC_REASON = (
     "Screening was inconclusive repeatedly; held for operator review"
 )
+_DEFERRED_MECHANICAL_REASON = "deferred-mechanical-admission"
 _EXHAUSTED_MANIFEST_DIGEST = hashlib.sha256(
     b"ditto:repeatedly-inconclusive:v1"
 ).hexdigest()
@@ -398,6 +400,7 @@ async def claim_screening_attempts(
     ttl: timedelta,
     limit: int,
     netuid: int = 118,
+    deferred_review_mode: str = "off",
 ) -> list[tuple[Agent, ScreeningAttempt, UUID | None]]:
     """Claim completion-lane contenders, then least-scored eligible work."""
     # Claiming is already a short transaction. Serialize it in Postgres so two
@@ -448,6 +451,28 @@ async def claim_screening_attempts(
     missing_dataset, prerequisite_admitted = await prerequisite_screening_predicates(
         session
     )
+    pending_deferred_review = exists(
+        select(AthReview.review_id).where(
+            AthReview.agent_id == Agent.agent_id,
+            AthReview.status == "pending",
+            AthReview.algorithm_provenance["review_kind"].as_string()
+            == "deferred_source_review",
+            ~exists(
+                select(ScreeningAttempt.attempt_id).where(
+                    ScreeningAttempt.agent_id == Agent.agent_id,
+                    ScreeningAttempt.build_only.is_(False),
+                    ScreeningAttempt.status.in_(("passed", "quarantined")),
+                    ScreeningAttempt.started_at
+                    >= func.coalesce(AthReview.reopened_at, AthReview.opened_at),
+                )
+            ),
+        )
+    )
+    deferred_ath_eligible = (
+        (Agent.status == AgentStatus.ATH_PENDING_REVIEW) & pending_deferred_review
+        if deferred_review_mode == "enforce"
+        else false()
+    )
     eligible = or_(
         Agent.status == AgentStatus.UPLOADED,
         Agent.status == AgentStatus.SCREENING_FAILED,
@@ -473,6 +498,7 @@ async def claim_screening_attempts(
             & prerequisite_admitted
             & missing_active_screened_image()
         ),
+        deferred_ath_eligible,
     )
     candidate_payment = aliased(EvaluationPayment)
     earlier = aliased(Agent)
@@ -670,9 +696,17 @@ async def claim_screening_attempts(
         # release/re-quarantine loop). It is a build-only pass. A fresh
         # (UPLOADED), failed, or stale-policy submission still gets the full
         # review.
-        build_only = (
-            agent.status == AgentStatus.EVALUATING
-            and agent.screening_policy_version >= SCREENING_POLICY_VERSION
+        deferred_deep_review = agent.status == AgentStatus.ATH_PENDING_REVIEW
+        mechanical_first = deferred_review_mode == "enforce" and agent.status in {
+            AgentStatus.UPLOADED,
+            AgentStatus.SCREENING_FAILED,
+        }
+        build_only = not deferred_deep_review and (
+            mechanical_first
+            or (
+                agent.status == AgentStatus.EVALUATING
+                and agent.screening_policy_version >= SCREENING_POLICY_VERSION
+            )
         )
         attempt = ScreeningAttempt(
             attempt_id=uuid4(),
@@ -683,13 +717,21 @@ async def claim_screening_attempts(
             started_at=now,
             deadline=now + ttl,
             reason_code=(
-                "exact-cross-miner-duplicate" if duplicate_of is not None else None
+                "exact-cross-miner-duplicate"
+                if duplicate_of is not None
+                else _DEFERRED_MECHANICAL_REASON
+                if mechanical_first
+                else None
             ),
             duplicate_of=duplicate_of,
             build_only=build_only,
         )
         session.add(attempt)
-        if agent.status not in (AgentStatus.SCORED, AgentStatus.LIVE):
+        if agent.status not in (
+            AgentStatus.SCORED,
+            AgentStatus.LIVE,
+            AgentStatus.ATH_PENDING_REVIEW,
+        ):
             agent.status = AgentStatus.SCREENING
         agent.screening_reason = None
         agent.screening_reason_code = None

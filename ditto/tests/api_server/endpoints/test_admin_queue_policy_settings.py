@@ -71,6 +71,14 @@ def _settings(**overrides: object) -> dict[str, object]:
             "require_cohort_complete": True,
             "require_desired_era_drained": True,
         },
+        "deferred_source_review": {
+            "mode": "off",
+            "min_cohort_size": 8,
+            "composite_mad_multiplier": 6.0,
+            "axis_mad_multiplier": 6.0,
+            "min_composite_delta": 0.10,
+            "min_axis_delta": 0.15,
+        },
     }
     settings.update(overrides)
     return settings

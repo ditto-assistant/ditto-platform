@@ -25,6 +25,7 @@ from ditto.api_models.admin_copy_review import (
     AdminCopyReviewOpenResponse,
     AdminCopyReviewResolveRequest,
     AdminCopyReviewResolveResponse,
+    AdminDeferredReviewEvidence,
     AdminSourceDiffFileDetail,
     AdminSourceDiffManifest,
 )
@@ -109,8 +110,18 @@ def _item(
 ) -> AdminCopyReviewItem:
     provenance = review.algorithm_provenance
     review_kind = provenance.get("review_kind")
-    if review_kind not in ("copy", "benchmark_overfit"):
+    if review_kind not in (
+        "copy",
+        "benchmark_overfit",
+        "deferred_source_review",
+    ):
         review_kind = "copy"
+    deferred_raw = review.original_evidence.get("deferred_review")
+    deferred_review = (
+        AdminDeferredReviewEvidence.model_validate(deferred_raw)
+        if isinstance(deferred_raw, dict)
+        else None
+    )
     return AdminCopyReviewItem(
         review_id=review.review_id,
         agent_id=agent.agent_id,
@@ -126,7 +137,10 @@ def _item(
         resolution=cast(Literal["clear", "reject"] | None, review.resolution),
         resolution_reason=review.resolution_reason,
         original=AdminCopyReviewEvidence(
-            review_kind=cast(Literal["copy", "benchmark_overfit"], review_kind),
+            review_kind=cast(
+                Literal["copy", "benchmark_overfit", "deferred_source_review"],
+                review_kind,
+            ),
             duplicate_of=review.original_duplicate_of,
             reason=review.original_reason,
             policy_version=review.original_policy_version,
@@ -141,6 +155,7 @@ def _item(
             duplicate_of_hotkey=matched.miner_hotkey if matched else None,
             duplicate_of_coldkey=duplicate_of_coldkey if matched else None,
             duplicate_of_submitted_at=matched.created_at if matched else None,
+            deferred_review=deferred_review,
         ),
         current_comparison=comparison,
     )

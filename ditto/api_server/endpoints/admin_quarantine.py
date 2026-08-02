@@ -76,6 +76,7 @@ from ditto.api_models.benchmark_contract import benchmark_contract
 from ditto.api_models.screener import (
     SCREENING_POLICY_VERSION,
     ScreenEvidenceItem,
+    ScreenReviewAudit,
     SourceReviewFinding,
 )
 from ditto.api_models.ticket_status import TicketStatus
@@ -224,6 +225,15 @@ def _item(
     miner_coldkey: str | None = None,
 ) -> AdminQuarantineItem:
     evidence, finding, finding_verified = _review_payloads(row, agent)
+    review_audit: ScreenReviewAudit | None = None
+    if isinstance(row.review_audit, dict) and row.review_audit_digest is not None:
+        try:
+            parsed_audit = ScreenReviewAudit.model_validate(row.review_audit)
+        except ValueError:
+            pass
+        else:
+            if parsed_audit.canonical_digest() == row.review_audit_digest:
+                review_audit = parsed_audit
     return AdminQuarantineItem(
         quarantine_id=row.quarantine_id,
         agent_id=row.agent_id,
@@ -237,6 +247,10 @@ def _item(
         manifest_digest=row.manifest_digest,
         finding_digest=row.finding_digest,
         reason_code=row.reason_code,
+        review_audit_digest=(
+            row.review_audit_digest if review_audit is not None else None
+        ),
+        review_audit=review_audit,
         evidence=evidence,
         finding=finding,
         finding_verified=finding_verified,
