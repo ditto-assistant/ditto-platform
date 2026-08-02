@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from asyncpg.exceptions import UniqueViolationError
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError as SAIntegrityError
 
 # PaymentReplayedError is a payment-domain outcome that happens to be
@@ -85,7 +85,7 @@ async def get_agent_for_payment_proof(
         select(Agent)
         .join(EvaluationPayment, EvaluationPayment.agent_id == Agent.agent_id)
         .where(
-            EvaluationPayment.block_hash == block_hash,
+            func.lower(EvaluationPayment.block_hash) == block_hash.lower(),
             EvaluationPayment.extrinsic_index == extrinsic_index,
         )
     )
@@ -100,7 +100,7 @@ async def get_evaluation_payment_for_proof(
 ) -> EvaluationPayment | None:
     """Return the replay-protection row for a proof, including open credits."""
     stmt = select(EvaluationPayment).where(
-        EvaluationPayment.block_hash == block_hash,
+        func.lower(EvaluationPayment.block_hash) == block_hash.lower(),
         EvaluationPayment.extrinsic_index == extrinsic_index,
     )
     if for_update:
@@ -169,7 +169,7 @@ async def insert_evaluation_payment(
             "exactly one of agent_id or credit_for_agent_id must be supplied"
         )
     row = EvaluationPayment(
-        block_hash=verified.block_hash,
+        block_hash=verified.block_hash.lower(),
         extrinsic_index=verified.extrinsic_index,
         agent_id=agent_id,
         credit_for_agent_id=credit_for_agent_id,

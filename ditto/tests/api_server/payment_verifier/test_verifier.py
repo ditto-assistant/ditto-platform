@@ -87,6 +87,8 @@ def _make_extrinsic_info(
 
 def _make_verifier(
     *,
+    canonical_block_hash: str = "0xblock",
+    block_hash_side_effect: Exception | None = None,
     extrinsic_info: MagicMock | None = None,
     extrinsic_side_effect: Exception | None = None,
     success: bool = True,
@@ -99,6 +101,10 @@ def _make_verifier(
     send_address: str = "5SendAddress",
 ) -> PaymentVerifier:
     chain = MagicMock()
+    if block_hash_side_effect is not None:
+        chain.get_block_hash = AsyncMock(side_effect=block_hash_side_effect)
+    else:
+        chain.get_block_hash = AsyncMock(return_value=canonical_block_hash)
     if extrinsic_side_effect is not None:
         chain.get_extrinsic = AsyncMock(side_effect=extrinsic_side_effect)
     else:
@@ -169,6 +175,34 @@ class TestVerifyPaymentHappyPath:
 
 
 class TestExtrinsicLookup:
+    async def test_block_number_hash_mismatch_is_rejected(self):
+        verifier = _make_verifier(canonical_block_hash="0xcanonical")
+
+        with pytest.raises(PaymentNotFoundOnChain):
+            await verifier.verify_payment(
+                _make_proof(block_hash="0xsupplied"),
+                expected_hotkey="5Hotkey",
+                expected_amount_rao=QUOTE_RAO,
+            )
+
+        verifier._chain.get_extrinsic.assert_not_awaited()
+
+    async def test_block_hash_is_canonicalized_before_storage_reads(self):
+        verifier = _make_verifier(canonical_block_hash="0xBLOCK")
+
+        result = await verifier.verify_payment(
+            _make_proof(block_hash="0xblock"),
+            expected_hotkey="5Hotkey",
+            expected_amount_rao=QUOTE_RAO,
+        )
+
+        assert result.block_hash == "0xblock"
+        verifier._chain.check_extrinsic_success.assert_awaited_once_with("0xblock", 7)
+        verifier._chain.get_block_timestamp.assert_awaited_once_with("0xblock")
+        verifier._chain.get_coldkey_for_hotkey.assert_awaited_once_with(
+            "5Hotkey", "0xblock"
+        )
+
     async def test_not_found_raises_typed(self):
         verifier = _make_verifier(extrinsic_side_effect=ExtrinsicNotFoundError("nope"))
         with pytest.raises(PaymentNotFoundOnChain):

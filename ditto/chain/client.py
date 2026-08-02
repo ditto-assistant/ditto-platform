@@ -239,6 +239,30 @@ class ChainClient:
             ) from e
         return ExtrinsicInfo.from_pylon(response)
 
+    async def get_block_hash(self, block_number: int) -> str:
+        """Resolve the canonical hash for ``block_number`` from Substrate.
+
+        Payment proofs carry both identifiers because Pylon reads extrinsics by
+        number while historical events and storage are read by hash. Callers
+        must bind the pair before combining those two data sources.
+        """
+        from async_substrate_interface import AsyncSubstrateInterface
+
+        try:
+            async with AsyncSubstrateInterface(url=self._substrate_url()) as substrate:
+                block_hash = await substrate.get_block_hash(block_number)
+        except TimeoutError as e:
+            raise ChainTimeoutError(f"get_block_hash({block_number}) timed out") from e
+        except Exception as e:
+            raise ChainConnectionError(
+                f"get_block_hash({block_number}) failed: {self._safe_rpc_error(e)}"
+            ) from e
+        if not block_hash:
+            raise ExtrinsicNotFoundError(
+                f"no block hash found for block number {block_number}"
+            )
+        return str(block_hash).lower()
+
     # --- Weight setting ---
 
     async def put_weights(self, weights: dict[str, float]) -> None:

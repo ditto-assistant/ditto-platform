@@ -278,6 +278,70 @@ class TestUploadCheck:
         assert reserve.await_args is not None
         assert reserve.await_args.kwargs["replace_existing"] is True
 
+    async def test_assigned_payment_allows_exact_retry_to_reach_upload_agent(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        override_get_chain_client(app)
+        verifier = _override_payment_verifier(app)
+        agent_id = uuid4()
+        token = uuid4()
+        duplicate_lookup = AsyncMock(return_value=None)
+        monkeypatch.setattr(
+            "ditto.api_server.endpoints.upload.get_same_hotkey_agent_by_sha",
+            duplicate_lookup,
+        )
+        monkeypatch.setattr(
+            "ditto.api_server.endpoints.upload.get_evaluation_payment_for_proof",
+            AsyncMock(
+                return_value=SimpleNamespace(
+                    agent_id=agent_id,
+                    miner_hotkey=_make_keypair().ss58_address,
+                )
+            ),
+        )
+        monkeypatch.setattr(
+            "ditto.api_server.endpoints.upload.get_agent_for_payment_proof",
+            AsyncMock(
+                return_value=SimpleNamespace(
+                    agent_id=agent_id,
+                    miner_hotkey=_make_keypair().ss58_address,
+                    sha256=_GOOD_SHA256,
+                )
+            ),
+        )
+        monkeypatch.setattr(
+            "ditto.api_server.endpoints.upload.reserve_upload_admission",
+            AsyncMock(
+                return_value=SimpleNamespace(
+                    token=token,
+                    expires_at=datetime.now(UTC) + timedelta(hours=1),
+                    cooldown_seconds=3600,
+                    fee_amount_rao=40_000_000,
+                )
+            ),
+        )
+
+        response = await client.post(
+            "/api/v1/upload/check",
+            json={
+                **_signed_request_body(),
+                "reserve_submission_slot": True,
+                "payment_block_hash": _GOOD_BLOCK_HASH,
+                "payment_block_number": 13579,
+                "payment_extrinsic_index": 7,
+            },
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["ok"] is True
+        assert response.json()["payment_required"] is False
+        assert response.json()["admission_token"] == str(token)
+        duplicate_lookup.assert_not_awaited()
+        verifier.verify_payment.assert_not_awaited()
+
     async def test_payment_older_than_recovery_window_is_rejected(
         self,
         app: FastAPI,
@@ -801,15 +865,36 @@ class TestUploadAgentHappyPath:
             app, verified=_make_verified_payment(miner_hotkey=kp.ss58_address)
         )
         duplicate_id = uuid4()
+        rollback_count = 0
+
+        class Duplicate:
+            @property
+            def agent_id(self):  # type: ignore[no-untyped-def]
+                if rollback_count >= 3:
+                    raise RuntimeError("expired duplicate agent was accessed")
+                return duplicate_id
+
+            @property
+            def version(self):  # type: ignore[no-untyped-def]
+                if rollback_count >= 3:
+                    raise RuntimeError("expired duplicate agent was accessed")
+                return 2
+
+            @property
+            def status(self):  # type: ignore[no-untyped-def]
+                if rollback_count >= 3:
+                    raise RuntimeError("expired duplicate agent was accessed")
+                return AgentStatus.SCORED
+
+        async def _rollback() -> None:
+            nonlocal rollback_count
+            rollback_count += 1
+
+        deps["session"].in_transaction.return_value = True
+        deps["session"].rollback = AsyncMock(side_effect=_rollback)
         monkeypatch.setattr(
             "ditto.api_server.endpoints.upload.get_same_owner_agent_by_sha",
-            AsyncMock(
-                return_value=SimpleNamespace(
-                    agent_id=duplicate_id,
-                    version=2,
-                    status=AgentStatus.SCORED,
-                )
-            ),
+            AsyncMock(return_value=Duplicate()),
         )
         data, files = _upload_agent_form(keypair=kp)
 
@@ -827,6 +912,7 @@ class TestUploadAgentHappyPath:
         credit_row = deps["session"].add.call_args.args[0]
         assert credit_row.agent_id is None
         assert credit_row.credit_for_agent_id == duplicate_id
+        assert rollback_count >= 3
 
     async def test_available_credit_funds_a_different_artifact(
         self,
@@ -1199,6 +1285,13 @@ class TestUploadAgentReplayHandling:
         deps = _wire_full_stack(app)
         kp = bittensor.Keypair.create_from_uri("//Alice")
         original_id = uuid4()
+        admission_token = uuid4()
+        release = AsyncMock(return_value=None)
+        monkeypatch.setattr(
+            "ditto.api_server.endpoints.upload.release_upload_admission_for_exact_retry",
+            release,
+        )
+        deps["session"].commit = AsyncMock(return_value=None)
         monkeypatch.setattr(
             "ditto.api_server.endpoints.upload.get_agent_for_payment_proof",
             AsyncMock(
@@ -1213,6 +1306,7 @@ class TestUploadAgentReplayHandling:
             ),
         )
         data, files = _upload_agent_form(keypair=kp)
+        data["admission_token"] = str(admission_token)
 
         response = await client.post("/api/v1/upload/agent", data=data, files=files)
 
@@ -1223,6 +1317,13 @@ class TestUploadAgentReplayHandling:
             "status": "screening",
         }
         deps["verifier"].verify_payment.assert_not_awaited()
+        release.assert_awaited_once_with(
+            deps["session"],
+            token=admission_token,
+            miner_hotkey=kp.ss58_address,
+            sha256=_GOOD_TAR_SHA,
+        )
+        deps["session"].commit.assert_awaited_once()
         deps["storage"].put_object.assert_not_awaited()
 
     async def test_reused_proof_for_different_upload_stays_rejected(

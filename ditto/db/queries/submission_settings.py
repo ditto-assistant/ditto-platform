@@ -6,7 +6,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import select, text
+from sqlalchemy import delete, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ditto.db.models import SubmissionSettingsRevision, UploadAdmissionReservation
@@ -190,6 +190,23 @@ async def get_upload_admission_for_coldkey(
     session: AsyncSession, *, miner_coldkey: str
 ) -> UploadAdmissionReservation | None:
     return await session.get(UploadAdmissionReservation, miner_coldkey)
+
+
+async def release_upload_admission_for_exact_retry(
+    session: AsyncSession,
+    *,
+    token: uuid.UUID,
+    miner_hotkey: str,
+    sha256: str,
+) -> None:
+    """Remove the temporary reservation created to recover an exact retry."""
+    await session.execute(
+        delete(UploadAdmissionReservation).where(
+            UploadAdmissionReservation.token == token,
+            UploadAdmissionReservation.miner_hotkey == miner_hotkey,
+            UploadAdmissionReservation.sha256 == sha256,
+        )
+    )
 
 
 async def consume_or_enforce_upload_admission(

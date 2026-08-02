@@ -94,6 +94,75 @@ def _mock_session(flush_side_effect: BaseException | None = None) -> MagicMock:
 
 
 class TestInsertEvaluationPaymentHappyPath:
+    async def test_block_hash_is_canonicalized_for_insert_and_lookup(
+        self, session: AsyncSession
+    ) -> None:
+        agent_id = uuid4()
+        verified = _make_verified(block_hash="0xABCDEF")
+
+        async with session.begin():
+            await insert_agent(
+                session,
+                agent_id=agent_id,
+                miner_hotkey=verified.miner_hotkey,
+                name="canonical-hash",
+                sha256="ca" * 32,
+                size_bytes=10,
+            )
+            await insert_evaluation_payment(
+                session, verified=verified, agent_id=agent_id
+            )
+
+        payment = await get_evaluation_payment_for_proof(
+            session,
+            block_hash="0xAbCdEf",
+            extrinsic_index=verified.extrinsic_index,
+        )
+        assert payment is not None
+        assert payment.block_hash == "0xabcdef"
+
+    async def test_lookup_finds_legacy_mixed_case_block_hash(
+        self, session: AsyncSession
+    ) -> None:
+        agent_id = uuid4()
+        verified = _make_verified(block_hash="0xabcdef")
+
+        async with session.begin():
+            await insert_agent(
+                session,
+                agent_id=agent_id,
+                miner_hotkey=verified.miner_hotkey,
+                name="legacy-mixed-case-hash",
+                sha256="cb" * 32,
+                size_bytes=10,
+            )
+            await insert_evaluation_payment(
+                session, verified=verified, agent_id=agent_id
+            )
+            payment = await get_evaluation_payment_for_proof(
+                session,
+                block_hash=verified.block_hash,
+                extrinsic_index=verified.extrinsic_index,
+            )
+            assert payment is not None
+            payment.block_hash = "0xAbCdEf"
+
+        payment = await get_evaluation_payment_for_proof(
+            session,
+            block_hash="0xabcdef",
+            extrinsic_index=verified.extrinsic_index,
+        )
+        agent = await get_agent_for_payment_proof(
+            session,
+            block_hash="0xABCDEF",
+            extrinsic_index=verified.extrinsic_index,
+        )
+
+        assert payment is not None
+        assert payment.block_hash == "0xAbCdEf"
+        assert agent is not None
+        assert agent.agent_id == agent_id
+
     async def test_inserts_row(self, session: AsyncSession):
         agent_id = uuid4()
         verified = _make_verified()
