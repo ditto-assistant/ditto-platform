@@ -1103,9 +1103,7 @@ class TestDashboard:
                             "percent": 37,
                         }
                     ],
-                    "assigned_benchmarks": [
-                        {"agent_id": "agent", "slot_id": "slot-0"}
-                    ],
+                    "assigned_benchmarks": [{"agent_id": "agent", "slot_id": "slot-0"}],
                 }
             ]
         }
@@ -1114,9 +1112,7 @@ class TestDashboard:
                 {
                     "validator_hotkey": "validator",
                     "active_benchmarks": [],
-                    "assigned_benchmarks": [
-                        {"agent_id": "agent", "slot_id": "slot-0"}
-                    ],
+                    "assigned_benchmarks": [{"agent_id": "agent", "slot_id": "slot-0"}],
                 }
             ]
         }
