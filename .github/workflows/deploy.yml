@@ -154,6 +154,12 @@ jobs:
       - name: Set up gcloud
         uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
 
+      - name: Enable NumPy-accelerated IAP transport
+        run: |
+          gcloud_python="$(gcloud info --format='value(basic.python_location)')"
+          "$gcloud_python" -m pip install --disable-pip-version-check numpy
+          "$gcloud_python" -c 'import numpy; print(f"NumPy {numpy.__version__} enabled for gcloud IAP")'
+
       - name: Register deploy SSH key with OS Login
         # Every run starts on a fresh runner with no ~/.ssh/google_compute_engine,
         # so `gcloud compute ssh` would otherwise mint a throwaway keypair AND
@@ -374,6 +380,12 @@ jobs:
           service_account: ${{ secrets.GCP_PLATFORM_DEPLOY_SA }}
 
       - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+
+      - name: Enable NumPy-accelerated IAP transport
+        run: |
+          gcloud_python="$(gcloud info --format='value(basic.python_location)')"
+          "$gcloud_python" -m pip install --disable-pip-version-check numpy
+          "$gcloud_python" -c 'import numpy; print(f"NumPy {numpy.__version__} enabled for gcloud IAP")'
 
       - name: Register release SSH key
         run: |
