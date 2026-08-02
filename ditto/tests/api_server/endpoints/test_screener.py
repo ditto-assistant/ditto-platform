@@ -84,6 +84,7 @@ from ditto.db.models import (
     ScreeningDispute,
     ScreeningQuarantine,
     ScreeningQuarantineResolution,
+    ScreeningRetryOverride,
     ValidatorTicket,
 )
 from ditto.db.queries.attestation import record_attestation
@@ -3215,6 +3216,94 @@ class TestQuarantineAdmin:
             assert agent.screening_policy_version == SCREENING_POLICY_VERSION
             assert [attempt.attempt_id for attempt in attempts] == [attempt_id]
             assert len(scores) == 1
+
+    async def test_operator_retry_now_waives_only_exact_failed_attempt_backoff(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        app.state.config = replace(
+            app.state.config,
+            admin_api_token="test-admin-token-at-least-32-characters",
+        )
+        agent_id = await _seed_agent(
+            session_maker,
+            status=AgentStatus.SCREENING_FAILED,
+            screening_policy_version=SCREENING_POLICY_VERSION,
+        )
+        attempt_id = uuid4()
+        now = datetime.now(UTC)
+        original_deadline = now + timedelta(minutes=50)
+        async with session_maker() as session, session.begin():
+            session.add(
+                ScreeningAttempt(
+                    attempt_id=attempt_id,
+                    agent_id=agent_id,
+                    screener_hotkey=_SCREENER_HOTKEY,
+                    policy_version=SCREENING_POLICY_VERSION,
+                    status="expired",
+                    started_at=now - timedelta(minutes=10),
+                    deadline=original_deadline,
+                    finished_at=now,
+                    public_reason="Screening was inconclusive; retry scheduled",
+                    reason_code="source-review-step-budget-exhausted",
+                )
+            )
+        _install_db(app, session_maker)
+
+        held = await client.post(_CLAIM_URL, headers=_AUTH_HEADER)
+        assert held.status_code == 200
+        assert held.json()["items"] == []
+
+        request = {
+            "reason": "Retry immediately after source-review budget exhaustion",
+            "expected_sha256": _SHA256,
+            "expected_score_count": 0,
+            "expected_attempt_id": str(attempt_id),
+        }
+        response = await client.post(
+            f"/api/v1/admin/screening-submissions/{agent_id}/retry-now",
+            headers={
+                "Authorization": "Bearer test-admin-token-at-least-32-characters",
+                "X-Admin-Actor": "backroom:test-user",
+            },
+            json=request,
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["attempt_id"] == str(attempt_id)
+        assert response.json()["idempotent"] is False
+
+        repeated = await client.post(
+            f"/api/v1/admin/screening-submissions/{agent_id}/retry-now",
+            headers={
+                "Authorization": "Bearer test-admin-token-at-least-32-characters",
+                "X-Admin-Actor": "backroom:test-user",
+            },
+            json=request,
+        )
+        assert repeated.status_code == 200, repeated.text
+        assert repeated.json()["override_id"] == response.json()["override_id"]
+        assert repeated.json()["idempotent"] is True
+
+        async with session_maker() as session:
+            attempt = await session.get(ScreeningAttempt, attempt_id)
+            overrides = list(
+                await session.scalars(
+                    select(ScreeningRetryOverride).where(
+                        ScreeningRetryOverride.agent_id == agent_id
+                    )
+                )
+            )
+        assert attempt is not None
+        assert attempt.status == "expired"
+        assert attempt.deadline == original_deadline
+        assert len(overrides) == 1
+        assert overrides[0].actor == "backroom:test-user"
+
+        claimed = await client.post(_CLAIM_URL, headers=_AUTH_HEADER)
+        assert claimed.status_code == 200, claimed.text
+        assert claimed.json()["items"][0]["agent_id"] == str(agent_id)
 
     async def test_operator_rebuilds_only_the_screened_image_build_only(
         self,

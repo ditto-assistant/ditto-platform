@@ -25,6 +25,7 @@ from ditto.db.models import (
     Score,
     ScreeningAttempt,
     ScreeningQuarantine,
+    ScreeningRetryOverride,
 )
 from ditto.db.queries.benchmark_admission import (
     activated_rollout_for_version,
@@ -424,6 +425,12 @@ async def claim_screening_attempts(
                 and_(
                     ScreeningAttempt.status == "expired",
                     ScreeningAttempt.deadline > now,
+                    ~exists(
+                        select(ScreeningRetryOverride.override_id).where(
+                            ScreeningRetryOverride.attempt_id
+                            == ScreeningAttempt.attempt_id
+                        )
+                    ),
                 ),
             ),
         )

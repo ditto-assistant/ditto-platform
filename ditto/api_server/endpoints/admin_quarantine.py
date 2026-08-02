@@ -61,6 +61,8 @@ from ditto.api_models.admin_quarantine import (
     AdminScreeningDisputeResolveResponse,
     AdminScreeningRescreenRequest,
     AdminScreeningRescreenResponse,
+    AdminScreeningRetryNowRequest,
+    AdminScreeningRetryNowResponse,
     AdminScreeningSubmission,
     AdminScreeningSubmissionList,
     AdminSourceExcerpt,
@@ -125,6 +127,7 @@ from ditto.db.models import (
     ScreeningDispute,
     ScreeningQuarantine,
     ScreeningQuarantineResolution,
+    ScreeningRetryOverride,
     ValidatorHeartbeat,
     ValidatorTicket,
 )
@@ -1685,6 +1688,125 @@ async def rescreen_rejected_submission(
     )
     return AdminScreeningRescreenResponse(
         agent_id=agent_id, agent_status=AgentStatus.SCREENING_FAILED
+    )
+
+
+@router.post(
+    "/screening-submissions/{agent_id}/retry-now",
+    response_model=AdminScreeningRetryNowResponse,
+)
+async def retry_failed_screening_now(
+    agent_id: UUID,
+    payload: AdminScreeningRetryNowRequest,
+    _admin: AdminDep,
+    session: SessionDep,
+    x_admin_actor: Annotated[str | None, Header()] = None,
+) -> AdminScreeningRetryNowResponse:
+    """Waive only one exact failed attempt's remaining automatic backoff."""
+    if x_admin_actor is None or not 1 <= len(x_admin_actor) <= 120:
+        raise HTTPException(status_code=422, detail="X-Admin-Actor is required")
+    now = datetime.now(UTC)
+    idempotent = False
+    async with session.begin():
+        agent = await session.scalar(
+            select(Agent).where(Agent.agent_id == agent_id).with_for_update()
+        )
+        if agent is None:
+            raise HTTPException(status_code=404, detail="agent not found")
+        if agent.sha256 != payload.expected_sha256:
+            raise HTTPException(status_code=409, detail="artifact identity changed")
+        score_count = int(
+            await session.scalar(
+                select(func.count())
+                .select_from(Score)
+                .where(Score.agent_id == agent_id)
+            )
+            or 0
+        )
+        if score_count != payload.expected_score_count:
+            raise HTTPException(status_code=409, detail="score count changed")
+        attempt = await session.scalar(
+            select(ScreeningAttempt)
+            .where(
+                ScreeningAttempt.attempt_id == payload.expected_attempt_id,
+                ScreeningAttempt.agent_id == agent_id,
+            )
+            .with_for_update()
+        )
+        if attempt is None:
+            raise HTTPException(status_code=409, detail="screening attempt changed")
+        latest_attempt_id = await session.scalar(
+            select(ScreeningAttempt.attempt_id)
+            .where(ScreeningAttempt.agent_id == agent_id)
+            .order_by(
+                ScreeningAttempt.started_at.desc(),
+                ScreeningAttempt.attempt_id.desc(),
+            )
+            .limit(1)
+        )
+        if latest_attempt_id != attempt.attempt_id:
+            raise HTTPException(status_code=409, detail="screening attempt changed")
+        override = await session.scalar(
+            select(ScreeningRetryOverride).where(
+                ScreeningRetryOverride.attempt_id == attempt.attempt_id
+            )
+        )
+        if override is not None:
+            idempotent = True
+        else:
+            running_attempt = await session.scalar(
+                select(ScreeningAttempt.attempt_id).where(
+                    ScreeningAttempt.agent_id == agent_id,
+                    ScreeningAttempt.status == "running",
+                )
+            )
+            if running_attempt is not None:
+                raise HTTPException(
+                    status_code=409, detail="screening attempt is active"
+                )
+            if agent.status != AgentStatus.SCREENING_FAILED:
+                raise HTTPException(
+                    status_code=409,
+                    detail="submission is not waiting after a failed screening",
+                )
+            if attempt.status != "expired":
+                raise HTTPException(
+                    status_code=409, detail="screening attempt is not expired"
+                )
+            if attempt.deadline <= now:
+                raise HTTPException(
+                    status_code=409, detail="screening backoff has already elapsed"
+                )
+            override = ScreeningRetryOverride(
+                override_id=uuid4(),
+                agent_id=agent_id,
+                attempt_id=attempt.attempt_id,
+                artifact_sha256=agent.sha256,
+                expected_score_count=score_count,
+                reason=payload.reason,
+                actor=x_admin_actor,
+                created_at=now,
+            )
+            session.add(override)
+            await session.flush()
+    logger.info(
+        "admin_actor=%s waived screening backoff agent_id=%s attempt_id=%s "
+        "override_id=%s idempotent=%s reason=%s",
+        x_admin_actor,
+        agent_id,
+        attempt.attempt_id,
+        override.override_id,
+        idempotent,
+        payload.reason,
+    )
+    return AdminScreeningRetryNowResponse(
+        override_id=override.override_id,
+        agent_id=agent_id,
+        attempt_id=attempt.attempt_id,
+        agent_status=agent.status,
+        backoff_deadline=attempt.deadline,
+        created_at=override.created_at,
+        idempotent=idempotent,
     )
 
 
