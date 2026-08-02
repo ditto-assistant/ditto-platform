@@ -688,7 +688,15 @@ async def claim(
             created_at=agent.created_at,
             attempt_id=attempt.attempt_id,
             lease_deadline=attempt.deadline,
-            precheck_reason_code=attempt.reason_code,
+            # ``precheck_reason_code`` is the exact-duplicate channel and the
+            # signed queue contract requires it to be paired with
+            # ``duplicate_of``. Mechanical deferred admission has its own
+            # explicit flags below; leaking its internal attempt reason into
+            # the duplicate channel makes response validation fail after the
+            # lease transaction commits.
+            precheck_reason_code=(
+                attempt.reason_code if duplicate_of is not None else None
+            ),
             duplicate_of=duplicate_of,
             build_only=attempt.build_only,
             deferred_source_review=(

@@ -12,6 +12,7 @@ import json
 from collections.abc import AsyncIterator
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
@@ -1411,6 +1412,35 @@ class TestQueue:
 
 
 class TestClaim:
+    async def test_mechanical_admission_claim_uses_its_dedicated_contract_fields(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        agent_id = await _seed_agent(session_maker, status=AgentStatus.UPLOADED)
+        _install_db(app, session_maker)
+        _install_chain(app)
+        monkeypatch.setattr(
+            "ditto.api_server.endpoints.screener.resolve_queue_policy_settings",
+            AsyncMock(
+                return_value=SimpleNamespace(
+                    deferred_source_review=SimpleNamespace(mode="enforce")
+                )
+            ),
+        )
+
+        response = await client.post(_CLAIM_URL, headers=_AUTH_HEADER)
+
+        assert response.status_code == 200, response.text
+        item = response.json()["items"][0]
+        assert item["agent_id"] == str(agent_id)
+        assert item["build_only"] is True
+        assert item["deferred_source_review"] is True
+        assert item["precheck_reason_code"] is None
+        assert item["duplicate_of"] is None
+
     async def test_claim_prioritizes_zero_score_submission(
         self,
         app: FastAPI,
