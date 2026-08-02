@@ -291,6 +291,9 @@ class TestDashboard:
         assert "function pipelineBoardStage(entry)" in body
         assert "function operationsPipelineActivity(data)" in body
         assert "data.rollout_queue" in body
+        assert "data.validators.validators" in body
+        assert "progressByAgent" in body
+        assert ".map(withValidatorProgress)" in body
         assert "Cohort #" in body
         assert "(entry.active_benchmarks || []).some(queueRelevantBenchmark)" in body
         assert ".filter(queueRelevantBenchmark)" in body
@@ -308,6 +311,7 @@ class TestDashboard:
         # of the list while no validator is able to lease it.
         assert "&& !queueGate;" in body
         assert "function queueGateLabel(entry)" in body
+        assert "Never badge work already running" in body
         assert 'class="pipeline-gate-badge"' in body
         for gate in ("previous_generation", "owner_serialized", "not_leasable"):
             assert gate + ": {" in body
@@ -891,6 +895,8 @@ class TestDashboard:
         assert "lower-score submissions clear screening" in body
         assert "This is not data loss" in body
         assert "policyScreeningLabel(entry)" in body
+        assert 'if (entry.screening_build_only === true) return ""' in body
+        assert "Mechanical admission · verified image" not in body
         assert 'return "Rescreen · policy v" + completed + " → v" + required' in body
 
     async def test_includes_accessible_fleet_status(self) -> None:
@@ -1036,6 +1042,11 @@ class TestDashboard:
         assert 'entry.assignment_state === "assignment_mismatch"' in body
         assert 'entry.assignment_state === "assigning"' in body
         assert 'entry.assignment_state === "heartbeat_stale"' in body
+        assert "VALIDATOR_TELEMETRY_GRACE_MS = 20000" in body
+        assert "function preserveTransientValidatorTelemetry(report, nowMs)" in body
+        assert "_telemetry_delayed: true" in body
+        assert "Progress update delayed" in body
+        assert 'return ["Telemetry delayed", "warn"]' in body
         assert 'return ["Mismatch", "bad"]' in body
         assert "counts.warning++" in body
         assert "Assignment mismatch" in body
@@ -1069,6 +1080,79 @@ class TestDashboard:
         assert "renderPipelineBoard(null, true)" in loader
         assert "operationsRequest = null" in loader
         assert "operationsRefreshFailed" in body
+
+    async def test_transient_validator_telemetry_uses_a_bounded_grace(self) -> None:
+        app = create_api_server(make_api_server_config(dashboard_enabled=True))
+        body = (await _get(app, "/")).text
+        match = re.search(
+            r"(function hasBenchmarkTelemetry.*?return report;\n    \})"
+            r"\n\n    function sortFleetEntries",
+            body,
+            re.DOTALL,
+        )
+        assert match is not None
+        report = {
+            "validators": [
+                {
+                    "validator_hotkey": "validator",
+                    "active_benchmarks": [
+                        {
+                            "agent_id": "agent",
+                            "slot_id": "slot-0",
+                            "stage": "running_benchmark",
+                            "percent": 37,
+                        }
+                    ],
+                    "assigned_benchmarks": [{"agent_id": "agent", "slot_id": "slot-0"}],
+                }
+            ]
+        }
+        gap = {
+            "validators": [
+                {
+                    "validator_hotkey": "validator",
+                    "active_benchmarks": [],
+                    "assigned_benchmarks": [{"agent_id": "agent", "slot_id": "slot-0"}],
+                }
+            ]
+        }
+        script = (
+            "var VALIDATOR_TELEMETRY_GRACE_MS = 20000;\n"
+            "var validatorTelemetryCache = Object.create(null);\n"
+            + match.group(1)
+            + "\nvar first = preserveTransientValidatorTelemetry("
+            + json.dumps(report)
+            + ", 1000);"
+            + "\nvar delayed = preserveTransientValidatorTelemetry("
+            + json.dumps(gap)
+            + ", 6000);"
+            + "\nvar expired = preserveTransientValidatorTelemetry("
+            + json.dumps(gap)
+            + ", 22001);"
+            + "\nconsole.log(JSON.stringify({"
+            + "first:first, delayed:delayed, expired:expired}));"
+        )
+        result = subprocess.run(
+            ["node", "-e", script],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        observed = json.loads(result.stdout)
+        assert observed["first"]["validators"][0]["_telemetry_grace"] is False
+        assert observed["delayed"]["validators"][0]["_telemetry_grace"] is True
+        assert observed["delayed"]["validators"][0]["active_benchmarks"] == [
+            {
+                "agent_id": "agent",
+                "slot_id": "slot-0",
+                "stage": "running_benchmark",
+                "percent": 37,
+                "_telemetry_delayed": True,
+                "_telemetry_delayed_at": "1970-01-01T00:00:01.000Z",
+            }
+        ]
+        assert observed["expired"]["validators"][0]["_telemetry_grace"] is False
+        assert observed["expired"]["validators"][0]["active_benchmarks"] == []
 
     async def test_benchmark_authority_state_never_promotes_rollout_target(
         self,

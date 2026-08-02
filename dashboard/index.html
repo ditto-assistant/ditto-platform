@@ -3154,6 +3154,13 @@
     var operationsRequest = null;
     var operationsRefreshFailed = false;
     var operationsSnapshotAt = null;
+    // A validator heartbeat and the platform lease projection are separate
+    // writes. Preserve the last signed per-slot progress through a few fast
+    // operations polls so a one-frame gap reads as delayed telemetry rather
+    // than a fleet-wide assignment failure. Persistent mismatches still turn
+    // red when this short grace expires.
+    var VALIDATOR_TELEMETRY_GRACE_MS = 20000;
+    var validatorTelemetryCache = Object.create(null);
     var activityUnavailable = false;
     var athReviewCache = null;
     var athReviewLoading = false;
@@ -6882,9 +6889,10 @@
     }
 
     function policyScreeningLabel(entry) {
-      if (entry.screening_build_only === true) {
-        return "Mechanical admission · verified image";
-      }
+      // The active build stage already says what is happening. Calling the
+      // image "verified" before that build finishes was both redundant and
+      // temporally false.
+      if (entry.screening_build_only === true) return "";
       if (entry.screening_build_only === false && entry.status === "screening") {
         return "Source integrity review";
       }
@@ -7016,6 +7024,15 @@
     }
 
     function benchmarkProgressText(progress) {
+      if (progress && progress._telemetry_delayed) {
+        var lastReported = progress.percent == null
+          ? benchmarkStageLabel(progress.stage)
+          : "last reported " + progress.percent + "%";
+        if (progress.completed_checks != null && progress.total_checks != null) {
+          lastReported += " · " + progress.completed_checks + " of " + progress.total_checks + " checks";
+        }
+        return "Progress update delayed · " + lastReported;
+      }
       if (!progress || !progress.stage) {
         // Ticket issuance and the validator's first signed slot heartbeat are
         // separate writes. During the platform's one-minute assignment handoff
@@ -8019,14 +8036,47 @@
     function operationsPipelineActivity(data) {
       var activity = data && data.activity ? data.activity : {};
       var rollout = data && Array.isArray(data.rollout_queue) ? data.rollout_queue : [];
-      if (!rollout.length) return activity;
+      // The activity projection can briefly lag the richer per-slot heartbeat
+      // projection in the same atomic operations response. Union that live
+      // progress into submission cards before choosing their pipeline column.
+      var progressByAgent = Object.create(null);
+      var validators = data && data.validators && Array.isArray(data.validators.validators)
+        ? data.validators.validators
+        : [];
+      validators.forEach(function (validator) {
+        (validator.active_benchmarks || []).forEach(function (progress) {
+          if (!progress || !progress.agent_id) return;
+          var id = String(progress.agent_id);
+          if (!progressByAgent[id]) progressByAgent[id] = [];
+          progressByAgent[id].push(progress);
+        });
+      });
+      function withValidatorProgress(entry) {
+        var merged = (entry.active_benchmarks || []).slice();
+        var seen = Object.create(null);
+        merged.forEach(function (progress) {
+          seen[
+            String(progress.agent_id || entry.agent_id || "") + "|" +
+            String(progress.bench_version || "") + "|" +
+            String(progress.slot_id || "slot-0") + "|" +
+            String(progress.started_at || "")
+          ] = true;
+        });
+        (progressByAgent[String(entry.agent_id)] || []).forEach(function (progress) {
+          var key = String(progress.agent_id || entry.agent_id || "") + "|" +
+            String(progress.bench_version || "") + "|" +
+            String(progress.slot_id || "slot-0") + "|" +
+            String(progress.started_at || "");
+          if (!seen[key]) merged.push(progress);
+        });
+        return Object.assign({}, entry, { active_benchmarks: merged });
+      }
       var rolloutIds = Object.create(null);
       rollout.forEach(function (entry) { rolloutIds[String(entry.agent_id)] = true; });
-      var entries = (activity.entries || []).filter(function (entry) {
-        return !rolloutIds[String(entry.agent_id)];
-      });
+      var entries = (activity.entries || []).map(withValidatorProgress)
+        .filter(function (entry) { return !rolloutIds[String(entry.agent_id)]; });
       rollout.forEach(function (entry) {
-        entries.push({
+        entries.push(withValidatorProgress({
           agent_id: entry.agent_id,
           miner_hotkey: entry.miner_hotkey,
           name: entry.name,
@@ -8040,11 +8090,19 @@
           active_benchmarks: entry.active_benchmarks || [],
           rollout_position: entry.position,
           queue_bench_version: entry.bench_version
-        });
+        }));
       });
       var counts = Object.assign({}, activity.status_counts || {});
       rollout.forEach(function (entry) {
         counts[entry.status] = Number(counts[entry.status] || 0) + 1;
+      });
+      // Do not leave active slot work in the waiting headline merely because
+      // the older activity projection still labels it waiting_validator.
+      entries.forEach(function (entry) {
+        if ((entry.status === "waiting_validator" || entry.status === "below_score_floor") &&
+            pipelineBoardStage(entry) === "evaluating") {
+          counts[entry.status] = Math.max(0, Number(counts[entry.status] || 0) - 1);
+        }
       });
       return Object.assign({}, activity, { entries: entries, status_counts: counts });
     }
@@ -8098,6 +8156,9 @@
     };
 
     function queueGateLabel(entry) {
+      // A current live benchmark is stronger evidence than a lagging queue
+      // gate. Never badge work already running as "Not queued".
+      if ((entry.active_benchmarks || []).some(queueRelevantBenchmark)) return null;
       return QUEUE_GATES[entry.validator_queue_gate] || null;
     }
 
@@ -8370,6 +8431,93 @@
     var validatorNames = {};
     var validatorStakeWeights = {};
 
+    function hasBenchmarkTelemetry(progress) {
+      return !!(progress && (
+        progress.stage ||
+        progress.percent != null ||
+        progress.completed_checks != null
+      ));
+    }
+
+    function sameBenchmarkAssignment(left, right) {
+      return String(left && left.agent_id || "") === String(right && right.agent_id || "");
+    }
+
+    function preserveTransientValidatorTelemetry(report, nowMs) {
+      if (!report || !Array.isArray(report.validators)) return report;
+      var presentValidators = Object.create(null);
+      report.validators.forEach(function (entry) {
+        var hotkey = String(entry.validator_hotkey || "");
+        if (!hotkey) return;
+        presentValidators[hotkey] = true;
+        var cache = validatorTelemetryCache[hotkey] || Object.create(null);
+        validatorTelemetryCache[hotkey] = cache;
+        var active = Array.isArray(entry.active_benchmarks)
+          ? entry.active_benchmarks
+          : [];
+        var assignments = Array.isArray(entry.assigned_benchmarks)
+          ? entry.assigned_benchmarks
+          : [];
+        var expectedBySlot = Object.create(null);
+        assignments.concat(active).forEach(function (progress) {
+          if (!progress) return;
+          expectedBySlot[String(progress.slot_id || "slot-0")] = progress;
+        });
+        var normalized = [];
+        var renderedSlots = Object.create(null);
+        var injected = false;
+
+        active.forEach(function (progress) {
+          var slotId = String(progress.slot_id || "slot-0");
+          var prior = cache[slotId];
+          renderedSlots[slotId] = true;
+          if (hasBenchmarkTelemetry(progress)) {
+            cache[slotId] = { progress: Object.assign({}, progress), seenAt: nowMs };
+            normalized.push(progress);
+          } else if (prior && sameBenchmarkAssignment(prior.progress, progress) &&
+                     nowMs - prior.seenAt <= VALIDATOR_TELEMETRY_GRACE_MS) {
+            normalized.push(Object.assign({}, prior.progress, {
+              _telemetry_delayed: true,
+              _telemetry_delayed_at: new Date(prior.seenAt).toISOString()
+            }));
+            injected = true;
+          } else {
+            normalized.push(progress);
+          }
+        });
+
+        assignments.forEach(function (assignment) {
+          var slotId = String(assignment.slot_id || "slot-0");
+          if (renderedSlots[slotId]) return;
+          var prior = cache[slotId];
+          if (prior && sameBenchmarkAssignment(prior.progress, assignment) &&
+              nowMs - prior.seenAt <= VALIDATOR_TELEMETRY_GRACE_MS) {
+            normalized.push(Object.assign({}, prior.progress, {
+              _telemetry_delayed: true,
+              _telemetry_delayed_at: new Date(prior.seenAt).toISOString()
+            }));
+            renderedSlots[slotId] = true;
+            injected = true;
+          }
+        });
+
+        Object.keys(cache).forEach(function (slotId) {
+          var prior = cache[slotId];
+          var expected = expectedBySlot[slotId];
+          if (!expected || !sameBenchmarkAssignment(prior.progress, expected) ||
+              nowMs - prior.seenAt > VALIDATOR_TELEMETRY_GRACE_MS) {
+            delete cache[slotId];
+          }
+        });
+        entry.active_benchmarks = normalized;
+        entry._telemetry_grace = injected;
+      });
+      Object.keys(validatorTelemetryCache).forEach(function (hotkey) {
+        if (!presentValidators[hotkey]) delete validatorTelemetryCache[hotkey];
+      });
+      return report;
+    }
+
     function sortFleetEntries(entries, singular) {
       if (singular !== "validator") return entries;
       return entries.slice().sort(function (left, right) {
@@ -8500,6 +8648,9 @@
       if (entry.health === "critical") return ["Critical", "bad"];
       // A live-but-off-assignment validator (bad) is distinct from a quiet one
       // (warn); "assigning" is a normal hand-off and stays green via health below.
+      if (entry.assignment_state === "assignment_mismatch" && entry._telemetry_grace) {
+        return ["Telemetry delayed", "warn"];
+      }
       if (entry.assignment_state === "assignment_mismatch") return ["Mismatch", "bad"];
       if (entry.assignment_state === "heartbeat_stale") return ["Heartbeat stale", "warn"];
       if (entry.availability === "stale") return ["Stale", "warn"];
@@ -8544,6 +8695,10 @@
     }
 
     function renderValidatorAssignment(entry) {
+      if (entry.assignment_state === "assignment_mismatch" && entry._telemetry_grace) {
+        return '<span class="stage warn">Telemetry delayed</span>' +
+          '<span class="assignment-detail">Waiting for the next signed slot update; the last reported progress is retained briefly.</span>';
+      }
       if (entry.assignment_state === "assignment_mismatch") {
         var assigned = entry.assigned_agent_id
           ? entityAnchor("agent", entry.assigned_agent_id, (entry.assigned_agent_name || "Agent") + " · " + String(entry.assigned_agent_id).slice(0, 8))
@@ -9634,6 +9789,7 @@
           benchmarkRolloutStatus = data.benchmark_rollout_status || "inactive";
           renderBenchBadge();
           applyBenchVersion(benchmarkDisplayVersion());
+          data.validators = preserveTransientValidatorTelemetry(data.validators, Date.now());
           fleetReports.validators = data.validators;
           fleetUnavailable.validators = false;
           document.getElementById("h-validators").textContent = data.validators.reported_count;
