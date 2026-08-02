@@ -273,8 +273,11 @@ class TestDashboard:
             """esc(String(entry.agent_id || "").slice(0, 8))""" not in body
         )
         assert "Network operations" in body
-        assert "Waiting for screening" in body
-        assert "Waiting for scores" in body
+        assert "Waiting for admission" in body
+        assert "Image build &amp; admission" in body
+        assert "Waiting for validators" in body
+        assert "Conditional after scoring" in body
+        assert "Source integrity review" in body
         assert "function validatorQueueCompare(a, b)" in body
         assert "indexed.sort(validatorQueueCompare)" in body
         assert "var pipelineShowStuck = false" in body
@@ -308,10 +311,10 @@ class TestDashboard:
         assert 'class="pipeline-gate-badge"' in body
         for gate in ("previous_generation", "owner_serialized", "not_leasable"):
             assert gate + ": {" in body
-        assert "Evaluating" in body
+        assert 'id="pipeline-evaluating-title">Scoring' in body
         assert 'id="pipeline-scored"' in body
         assert 'data-pipeline-stage="scored"' in body
-        assert "Recent scores" in body
+        assert "Scored &amp; live" in body
         assert 'statuses: ["waiting_validator", "below_score_floor"]' in body
         assert 'statuses: ["scored", "live"]' in body
 
@@ -735,7 +738,7 @@ class TestDashboard:
         assert 'data-activity-filter="all" aria-pressed="true"' in body
         assert 'data-activity-filter="rejected" aria-pressed="false"' in body
         assert 'data-activity-filter="under_review" aria-pressed="false"' in body
-        assert "Operator review" in body
+        assert "Integrity review" in body
         assert 'data-activity-filter="waiting_validator" aria-pressed="false"' in body
         assert 'data-activity-filter="queued" aria-pressed="false"' in body
         assert (
@@ -745,7 +748,7 @@ class TestDashboard:
         assert 'below_score_floor: ["Low-priority completion", "warn"]' in body
         assert 'not_queued: ["Historical · not queued", ""]' in body
         assert 'retired: ["Retired · earlier benchmark", ""]' in body
-        assert 'under_review: ["Operator review", "warn"]' in body
+        assert 'under_review: ["Source integrity review", "warn"]' in body
         assert '"below_score_floor", "not_queued", "retired", "under_review"' in body
         assert "var provisionalScores = e.provisional_scores || [];" in body
         assert "if (!provisionalScores.length || !Number.isFinite(scoreFloor))" in body

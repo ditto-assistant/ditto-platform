@@ -2189,6 +2189,34 @@
     .pipeline-item-meta { font-size: 10.5px; }
     .pipeline-item .screener-progress { margin-top: 6px; }
     .pipeline-empty { padding: 7px 4px; text-align: center; font-size: 11px; }
+    .pipeline-review-branch {
+      position: relative;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 8px 16px;
+      width: calc(40% - 14px);
+      min-width: 300px;
+      margin: 16px 0 0 auto;
+      padding: 12px 13px;
+      border: 1px solid color-mix(in oklch, var(--accent-2) 44%, var(--border));
+      border-radius: 4px;
+      background: color-mix(in oklch, var(--accent-2) 7%, var(--bg-elev));
+    }
+    .pipeline-review-branch::before {
+      content: "";
+      position: absolute;
+      top: -17px;
+      right: 24%;
+      width: 1px;
+      height: 16px;
+      background: color-mix(in oklch, var(--accent-2) 52%, var(--border));
+    }
+    .pipeline-review-eyebrow { display: block; margin-bottom: 3px; color: var(--accent-2); font: 700 9px/1.2 var(--mono); letter-spacing: .05em; text-transform: uppercase; }
+    .pipeline-review-title { display: block; color: var(--text); font-size: 12px; line-height: 1.3; }
+    .pipeline-review-copy { grid-column: 1 / -1; margin: 0; color: var(--text-dim); font-size: 10.5px; line-height: 1.45; text-wrap: pretty; }
+    .pipeline-review-count { align-self: start; color: var(--text); font: 400 18px/1 var(--display); }
+    .pipeline-review-items { grid-column: 1 / -1; display: grid; gap: 3px; }
+    .pipeline-review-items .pipeline-item { border-top-color: color-mix(in oklch, var(--accent-2) 32%, var(--border)); }
 
     .fleet-ledger {
       padding: 48px 20px 20px;
@@ -2757,6 +2785,7 @@
           <div class="atlas-label">
             <div>
               <h2 class="atlas-title">Submission pipeline</h2>
+              <span class="atlas-note">Mechanical admission builds a verified image before validators. Source integrity review happens later only for qualifying or anomalous results.</span>
               <span class="atlas-note" id="operations-snapshot" aria-live="polite">Loading one shared operations snapshot…</span>
             </div>
           </div>
@@ -2776,30 +2805,36 @@
           <div class="pipeline-overview" id="pipeline-overview" aria-label="Live submission queues">
             <section class="pipeline-column" data-pipeline-stage="waiting_screening" aria-labelledby="pipeline-wait-screen-title">
               <div class="pipeline-node" aria-hidden="true">1</div>
-              <div class="pipeline-column-head"><h3 id="pipeline-wait-screen-title">Waiting for screening</h3><span class="pipeline-count" id="pipeline-wait-screen-count">–</span></div>
+              <div class="pipeline-column-head"><h3 id="pipeline-wait-screen-title">Waiting for admission</h3><span class="pipeline-count" id="pipeline-wait-screen-count">–</span></div>
               <div class="pipeline-items" id="pipeline-wait-screen"><div class="pipeline-empty">Loading…</div></div>
             </section>
             <section class="pipeline-column" data-pipeline-stage="screening" aria-labelledby="pipeline-screening-title">
               <div class="pipeline-node" aria-hidden="true">2</div>
-              <div class="pipeline-column-head"><h3 id="pipeline-screening-title">Screening</h3><span class="pipeline-count" id="pipeline-screening-count">–</span></div>
+              <div class="pipeline-column-head"><h3 id="pipeline-screening-title">Image build &amp; admission</h3><span class="pipeline-count" id="pipeline-screening-count">–</span></div>
               <div class="pipeline-items" id="pipeline-screening"><div class="pipeline-empty">Loading…</div></div>
             </section>
             <section class="pipeline-column" data-pipeline-stage="waiting_validator" aria-labelledby="pipeline-wait-validator-title">
               <div class="pipeline-node" aria-hidden="true">3</div>
-              <div class="pipeline-column-head"><h3 id="pipeline-wait-validator-title">Waiting for scores</h3><span class="pipeline-count" id="pipeline-wait-validator-count">–</span></div>
+              <div class="pipeline-column-head"><h3 id="pipeline-wait-validator-title">Waiting for validators</h3><span class="pipeline-count" id="pipeline-wait-validator-count">–</span></div>
               <div class="pipeline-items" id="pipeline-wait-validator"><div class="pipeline-empty">Loading…</div></div>
             </section>
             <section class="pipeline-column" data-pipeline-stage="evaluating" aria-labelledby="pipeline-evaluating-title">
               <div class="pipeline-node" aria-hidden="true">4</div>
-              <div class="pipeline-column-head"><h3 id="pipeline-evaluating-title">Evaluating</h3><span class="pipeline-count" id="pipeline-evaluating-count">–</span></div>
+              <div class="pipeline-column-head"><h3 id="pipeline-evaluating-title">Scoring</h3><span class="pipeline-count" id="pipeline-evaluating-count">–</span></div>
               <div class="pipeline-items" id="pipeline-evaluating"><div class="pipeline-empty">Loading…</div></div>
             </section>
             <section class="pipeline-column" data-pipeline-stage="scored" aria-labelledby="pipeline-scored-title">
               <div class="pipeline-node" aria-hidden="true">5</div>
-              <div class="pipeline-column-head"><h3 id="pipeline-scored-title">Recent scores</h3><span class="pipeline-count" id="pipeline-scored-count">–</span></div>
+              <div class="pipeline-column-head"><h3 id="pipeline-scored-title">Scored &amp; live</h3><span class="pipeline-count" id="pipeline-scored-count">–</span></div>
               <div class="pipeline-items" id="pipeline-scored"><div class="pipeline-empty">Loading…</div></div>
             </section>
           </div>
+          <aside class="pipeline-review-branch" aria-labelledby="pipeline-review-title">
+            <div><span class="pipeline-review-eyebrow">Conditional after scoring</span><strong class="pipeline-review-title" id="pipeline-review-title">Source integrity review</strong></div>
+            <span class="pipeline-review-count" id="pipeline-review-count">–</span>
+            <p class="pipeline-review-copy">Only leaderboard qualifiers and robust anomaly holds enter this branch. Other admitted submissions go directly through validator scoring.</p>
+            <div class="pipeline-review-items" id="pipeline-review-items"><div class="pipeline-empty">Loading…</div></div>
+          </aside>
         </div>
 
         <aside class="fleet-ledger" aria-label="Fleet status summary">
@@ -2870,8 +2905,8 @@
         <div class="activity-filter-list" role="group" aria-label="Quick submission filters">
           <button class="activity-filter" type="button" data-activity-filter="all" aria-pressed="true">All <span class="activity-filter-count" data-activity-count="all">–</span></button>
           <button class="activity-filter" type="button" data-activity-filter="rejected" aria-pressed="false">Rejected <span class="activity-filter-count" data-activity-count="rejected">–</span></button>
-          <button class="activity-filter" type="button" data-activity-filter="under_review" aria-pressed="false">Operator review <span class="activity-filter-count" data-activity-count="under_review">–</span></button>
-          <button class="activity-filter" type="button" data-activity-filter="waiting_validator" aria-pressed="false">Waiting for scores <span class="activity-filter-count" data-activity-count="waiting_validator">–</span></button>
+          <button class="activity-filter" type="button" data-activity-filter="under_review" aria-pressed="false">Integrity review <span class="activity-filter-count" data-activity-count="under_review">–</span></button>
+          <button class="activity-filter" type="button" data-activity-filter="waiting_validator" aria-pressed="false">Waiting for validators <span class="activity-filter-count" data-activity-count="waiting_validator">–</span></button>
           <button class="activity-filter" type="button" data-activity-filter="queued" aria-pressed="false">Queued work <span class="activity-filter-count" data-activity-count="queued">–</span></button>
         </div>
         <div class="activity-filter-meta">
@@ -6788,19 +6823,19 @@
 
     function activityStage(status) {
       var stages = {
-        uploaded: ["Waiting for screening", "progress"],
-        waiting_screening: ["Waiting for screening", "progress"],
-        screening: ["Screening", "progress"],
-        screening_passed: ["Screening passed", "good"],
-        screening_failed: ["Screening interrupted", "warn"],
-        waiting_validator: ["Waiting for scores", "progress"],
-        evaluating: ["Evaluating", "progress"],
+        uploaded: ["Waiting for admission", "progress"],
+        waiting_screening: ["Waiting for admission", "progress"],
+        screening: ["Image build & admission", "progress"],
+        screening_passed: ["Admitted", "good"],
+        screening_failed: ["Admission interrupted", "warn"],
+        waiting_validator: ["Waiting for validators", "progress"],
+        evaluating: ["Scoring", "progress"],
         below_score_floor: ["Low-priority completion", "warn"],
         not_queued: ["Historical · not queued", ""],
         retired: ["Retired · earlier benchmark", ""],
         scored: ["Scored", "good"],
         live: ["Live", "good"],
-        under_review: ["Operator review", "warn"],
+        under_review: ["Source integrity review", "warn"],
         rejected: ["Rejected", "bad"]
       };
       return stages[status] || ["Pending", ""];
@@ -6847,6 +6882,12 @@
     }
 
     function policyScreeningLabel(entry) {
+      if (entry.screening_build_only === true) {
+        return "Mechanical admission · verified image";
+      }
+      if (entry.screening_build_only === false && entry.status === "screening") {
+        return "Source integrity review";
+      }
       var completed = Number(entry.screening_policy_version);
       var required = Number(entry.required_screening_policy_version);
       if (!Number.isFinite(completed) || !Number.isFinite(required) || completed >= required) return "";
@@ -8094,6 +8135,7 @@
         updateSearch();
         return;
       }
+      renderIntegrityReviewBranch(unavailable);
       columns.forEach(function (column) {
         var body = document.getElementById(column.body);
         var count = document.getElementById(column.count);
@@ -8210,6 +8252,37 @@
       });
       refreshElapsedFlag();
       updateSearch();
+    }
+
+    function renderIntegrityReviewBranch(unavailable) {
+      var body = document.getElementById("pipeline-review-items");
+      var count = document.getElementById("pipeline-review-count");
+      if (unavailable) {
+        count.textContent = "–";
+        body.innerHTML = '<div class="pipeline-empty">Review state unavailable.</div>';
+        return;
+      }
+      var indexed = [];
+      pipelineEntries.forEach(function (entry, index) {
+        if (entry.status === "under_review") indexed.push({ entry: entry, index: index });
+      });
+      count.textContent = String(Number(pipelineStatusCounts.under_review || indexed.length));
+      if (!indexed.length) {
+        body.innerHTML = '<div class="pipeline-empty">No submissions are held for integrity review.</div>';
+        return;
+      }
+      body.innerHTML = indexed.slice(0, 3).map(function (item) {
+        var entry = item.entry;
+        var reason = entry.review_reason || entry.screening_reason || "Qualification or anomaly review";
+        return '<a class="pipeline-item" href="' + esc(entityHref("agent", entry.agent_id)) + '" data-entity-link="agent" data-pipeline-i="' + item.index + '" aria-label="View ' + esc(agentLabel(entry.name, entry.version)) + ' integrity review details">' +
+          '<span class="pipeline-item-heading"><span class="pipeline-item-identity"><span class="pipeline-item-name">' + esc(agentName(entry.name)) + '</span>' +
+          '<span class="pipeline-item-version">' + esc(pipelineAgentVersionLabel(entry.version)) + '</span></span></span>' +
+          '<span class="pipeline-item-meta"><span>' + esc(relTime(entry.review_opened_at || entry.submitted_at)) + '</span></span>' +
+          '<span class="pipeline-item-priority-detail">' + esc(reason) + '</span>' +
+          '</a>';
+      }).join("") + (indexed.length > 3
+        ? '<div class="pipeline-more">' + esc(String(indexed.length - 3)) + ' more in Activity</div>'
+        : '');
     }
 
     // The two pager rows are noise around a single unpaginated page: hide them

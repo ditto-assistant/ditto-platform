@@ -3966,6 +3966,7 @@ class TestPublicActivity:
             "screening_policy_version",
             "required_screening_policy_version",
             "screening_attempt_id",
+            "screening_build_only",
             "screening_started_at",
             "screening_deadline",
             "active_benchmarks",
@@ -4667,6 +4668,7 @@ class TestPublicActivity:
         assert activity["screening_policy_version"] == SCREENING_POLICY_VERSION - 1
         assert activity["required_screening_policy_version"] == SCREENING_POLICY_VERSION
         assert activity["screening_attempt_id"] == str(active_attempt_id)
+        assert activity["screening_build_only"] is False
 
         response = await client.get(f"/api/v1/public/agent/{agent_id}/pipeline")
         assert response.status_code == 200
@@ -8444,6 +8446,21 @@ class TestPublicProgressResolution:
         assert active_row in rows
         assert len(rows) == 51
         assert rows.count(active_row) == 1
+
+    def test_operations_keeps_conditional_integrity_review_visible(self) -> None:
+        review_row = (
+            SimpleNamespace(agent=SimpleNamespace(agent_id=uuid4())),
+            "under_review",
+        )
+
+        rows = public_endpoint._operations_activity_rows(
+            [review_row],
+            board_statuses={"evaluating", "under_review"},
+            board_active_agent_ids=set(),
+            terminal_history_limit=50,
+        )
+
+        assert rows == [review_row]
 
     @staticmethod
     def _progress(
