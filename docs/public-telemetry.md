@@ -152,7 +152,7 @@ rate-limited, `Cache-Control: public, max-age=30`. Read-only, aggregate-only.
   **Never** included: `seed` (anti-overfit), `per_case` `expected`/`called` (the
   answer key), sha256/signature/validator_hotkey (integrity-internal). The full
   submitted vector stays validator-side; only the explainable projection is public.
-- `GET /api/v1/public/activity?limit=` → `{ generated_at, count, entries: [
+- `GET /api/v1/public/activity?limit=&downloadable=true` → `{ generated_at, count, downloadable_count, entries: [
   { agent_id, miner_hotkey, name, status, submitted_at, screening_reason,
     duplicate_of, review_reason } ] }`.
   Recent uploads, newest first, including screening and evaluation stages so a
@@ -163,6 +163,10 @@ rate-limited, `Cache-Control: public, max-age=30`. Read-only, aggregate-only.
   release state;
   signed download URLs, source hashes, payments, and raw screener/build logs are
   never included in this listing.
+  `downloadable=true` narrows the listing to submissions whose derived release
+  state currently permits a public source download; it composes with status and
+  search filters. `downloadable_count` reports that population after search but
+  before status filtering so the dashboard can label the quick filter.
   Each waiting entry also carries `validator_queue_rank` and
   `validator_queue_gate` — the queue preview, described next.
 - **Queue preview (`validator_queue_rank` + `validator_queue_gate`).** Both the

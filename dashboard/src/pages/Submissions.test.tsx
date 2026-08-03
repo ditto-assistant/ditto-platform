@@ -147,6 +147,7 @@ describe("server-backed quick filters (row 10)", () => {
       ["under_review", "Integrity review 53", "false"],
       ["waiting_validator", "Waiting for validators 3", "false"],
       ["queued", "Queued work 3", "false"],
+      ["downloadable", "Downloadable 0", "false"],
     ]);
     // The summary is a live region; the clear affordance hides until a
     // filter is active.
@@ -176,6 +177,26 @@ describe("server-backed quick filters (row 10)", () => {
       ),
     );
     expect(document.getElementById("activity-clear")).toHaveProperty("hidden", false);
+  });
+
+  it("composes the downloadable filter with URL state and server requests", async () => {
+    stubActivityFetch(() => ({
+      ...activity,
+      downloadable_count: 7,
+    }));
+    render(() => <SubmissionsPage />);
+    await waitFor(() =>
+      expect(document.querySelector('[data-activity-count="downloadable"]')?.textContent).toBe("7"),
+    );
+    const downloadable = document.querySelector(
+      '[data-activity-filter="downloadable"]',
+    ) as HTMLButtonElement;
+    fireEvent.click(downloadable);
+    await waitFor(() => expect(downloadable).toHaveAttribute("aria-pressed", "true"));
+    const last = activityRequests().pop() as URLSearchParams;
+    expect(last.get("downloadable")).toBe("true");
+    expect(last.get("page")).toBe("1");
+    expect(location.hash).toBe("#/submissions?downloadable=true");
   });
 
   it("states unavailability outright — never sample rows", async () => {
@@ -234,14 +255,19 @@ describe("server-backed quick filters (row 10)", () => {
 // push.
 describe("URL filter/page restore and sanitize (row 12)", () => {
   it("restores canonical hash-query state without touching the URL", () => {
-    history.replaceState(null, "", "/#/submissions?status=under_review,rejected&q=bolt&page=3");
+    history.replaceState(
+      null,
+      "",
+      "/#/submissions?status=under_review,rejected&downloadable=true&q=bolt&page=3",
+    );
     const store = createActivityStore();
     expect(store.restore()).toBe(false);
     expect(store.statuses()).toEqual(["under_review", "rejected"]);
+    expect(store.downloadable()).toBe(true);
     expect(store.query()).toBe("bolt");
     expect(store.page()).toBe(3);
     expect(store.requestPath(store.page())).toBe(
-      "/public/activity?page=3&limit=10&status=under_review&status=rejected&q=bolt",
+      "/public/activity?page=3&limit=10&status=under_review&status=rejected&downloadable=true&q=bolt",
     );
   });
 
@@ -250,13 +276,14 @@ describe("URL filter/page restore and sanitize (row 12)", () => {
     history.replaceState(
       null,
       "",
-      "/#/submissions?status=bogus,rejected,rejected&q=" + longQ + "&page=007",
+      "/#/submissions?status=bogus,rejected,rejected&downloadable=maybe&q=" + longQ + "&page=007",
     );
     const store = createActivityStore();
     const pushSpy = vi.spyOn(history, "pushState");
     const replaceSpy = vi.spyOn(history, "replaceState");
     expect(store.restore()).toBe(true);
     expect(store.statuses()).toEqual(["rejected"]);
+    expect(store.downloadable()).toBe(false);
     expect(store.query()).toBe("x".repeat(200));
     // /^[1-9][0-9]*$/ rejects "007"; junk pages restore to 1.
     expect(store.page()).toBe(1);

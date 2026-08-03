@@ -23,11 +23,13 @@ import type { ActivityStatusEntry } from "./status";
 
 export interface ActivityStore {
   statuses: Accessor<string[]>;
+  downloadable: Accessor<boolean>;
   query: Accessor<string>;
   page: Accessor<number>;
   totalPages: Accessor<number>;
   total: Accessor<number | null>;
   statusCounts: Accessor<Record<string, number>>;
+  downloadableCount: Accessor<number>;
   entries: Accessor<ActivityStatusEntry[]>;
   unavailable: Accessor<boolean>;
   /** True while a USER-initiated load is in flight (drives aria-busy and the
@@ -58,11 +60,13 @@ export interface ActivityStore {
 
 export function createActivityStore(): ActivityStore {
   const [statuses, setStatuses] = createSignal<string[]>([]);
+  const [downloadable, setDownloadable] = createSignal(false);
   const [query, setQuery] = createSignal("");
   const [page, setPage] = createSignal(1);
   const [totalPages, setTotalPages] = createSignal(1);
   const [total, setTotal] = createSignal<number | null>(null);
   const [statusCounts, setStatusCounts] = createSignal<Record<string, number>>({});
+  const [downloadableCount, setDownloadableCount] = createSignal(0);
   const [entries, setEntries] = createSignal<ActivityStatusEntry[]>([]);
   const [unavailable, setUnavailable] = createSignal(false);
   const [busy, setBusy] = createSignal(false);
@@ -97,6 +101,7 @@ export function createActivityStore(): ActivityStore {
       (value, index) => ACTIVITY_STATUSES.indexOf(value) >= 0 && requested.indexOf(value) === index,
     );
     const nextStatuses = ACTIVITY_STATUSES.filter((value) => valid.indexOf(value) >= 0);
+    const nextDownloadable = source.get("downloadable") === "true";
     const nextQuery = (source.get("q") || "").trim().slice(0, 200);
     const requestedPage = currentPageName() === "submissions" ? source.get("page") : null;
     const parsedPage = Number(requestedPage);
@@ -108,6 +113,7 @@ export function createActivityStore(): ActivityStore {
         : 1;
     batch(() => {
       setStatuses(nextStatuses);
+      setDownloadable(nextDownloadable);
       setQuery(nextQuery);
       setPage(nextPage);
     });
@@ -116,6 +122,7 @@ export function createActivityStore(): ActivityStore {
     return (
       legacy ||
       valid.length !== values.length ||
+      (source.has("downloadable") && !nextDownloadable) ||
       nextQuery !== (source.get("q") || "") ||
       pageNeedsSanitizing
     );
@@ -129,6 +136,8 @@ export function createActivityStore(): ActivityStore {
     const urlQuery = parseHashRoute().query;
     urlQuery.delete("status");
     statuses().forEach((status) => urlQuery.append("status", status));
+    if (downloadable()) urlQuery.set("downloadable", "true");
+    else urlQuery.delete("downloadable");
     if (query()) urlQuery.set("q", query());
     else urlQuery.delete("q");
     // "page" is owned by whichever pager is on the active page; only manage
@@ -149,6 +158,7 @@ export function createActivityStore(): ActivityStore {
     requestQuery.set("page", String(pageNumber));
     requestQuery.set("limit", String(ACTIVITY_PAGE_SIZE));
     statuses().forEach((status) => requestQuery.append("status", status));
+    if (downloadable()) requestQuery.set("downloadable", "true");
     if (query()) requestQuery.set("q", query());
     return "/public/activity?" + requestQuery.toString();
   }
@@ -174,6 +184,7 @@ export function createActivityStore(): ActivityStore {
           setLoaded(true);
           setUnavailable(false);
           setStatusCounts(data.status_counts || {});
+          setDownloadableCount(Number(data.downloadable_count || 0));
           setEntries(list);
           setPage(data.page || 1);
           setTotalPages(data.total_pages || 1);
@@ -213,6 +224,7 @@ export function createActivityStore(): ActivityStore {
   }
 
   function filterCount(name: string): number {
+    if (name === "downloadable") return downloadableCount();
     const names = name === "all" ? ACTIVITY_STATUSES : ACTIVITY_FILTERS[name] || [];
     const counts = statusCounts();
     return names.reduce((sum, status) => sum + Number(counts[status] || 0), 0);
@@ -220,7 +232,8 @@ export function createActivityStore(): ActivityStore {
 
   function filterSelected(name: string): boolean {
     const active = statuses();
-    if (name === "all") return active.length === 0;
+    if (name === "downloadable") return downloadable();
+    if (name === "all") return active.length === 0 && !downloadable();
     const names = ACTIVITY_FILTERS[name] || [];
     return names.length > 0 && names.every((status) => active.indexOf(status) >= 0);
   }
@@ -230,6 +243,9 @@ export function createActivityStore(): ActivityStore {
   function applyFilter(name: string): void {
     if (name === "all") {
       setStatuses([]);
+      setDownloadable(false);
+    } else if (name === "downloadable") {
+      setDownloadable((value) => !value);
     } else {
       const names = ACTIVITY_FILTERS[name] || [];
       const current = statuses().slice();
@@ -261,6 +277,7 @@ export function createActivityStore(): ActivityStore {
   function clearFilters(anchor: HTMLElement | null): void {
     batch(() => {
       setStatuses([]);
+      setDownloadable(false);
       setQuery("");
       setPage(1);
     });
@@ -270,16 +287,18 @@ export function createActivityStore(): ActivityStore {
 
   return {
     statuses,
+    downloadable,
     query,
     page,
     totalPages,
     total,
     statusCounts,
+    downloadableCount,
     entries,
     unavailable,
     busy,
     loaded,
-    filtered: () => statuses().length > 0 || Boolean(query()),
+    filtered: () => statuses().length > 0 || downloadable() || Boolean(query()),
     filterCount,
     filterSelected,
     restore,

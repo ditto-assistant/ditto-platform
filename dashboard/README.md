@@ -70,7 +70,8 @@ API and links out to wandb for the per-epoch deep dive. This is Surface 3 in
   counts in the side ledger stay whole-fleet, and the closed summary names every
   fold reason and its count.
 - **Stable object links** — all SPA state (popup/selected-row params, the
-  submissions filters, and both pagers) lives in a query string inside the hash,
+  submissions filters (including `downloadable=true`), and both pagers) lives
+  in a query string inside the hash,
   on whatever page it was opened from (`#/submissions?agent={id}`,
   `#/overview?miner={hotkey}`, `#/operations?validator={hotkey}`,
   `#/submissions?status=rejected&page=2`, `#/overview?page=2` for the

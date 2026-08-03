@@ -45,6 +45,7 @@ export const ACTIVITY_FILTER_NAMES: readonly string[] = [
   "under_review",
   "waiting_validator",
   "queued",
+  "downloadable",
 ];
 
 /** Band button labels (markup 2906–2912; #623 renamed the review and
@@ -55,6 +56,7 @@ export const ACTIVITY_FILTER_LABELS: Record<string, string> = {
   under_review: "Integrity review",
   waiting_validator: "Waiting for validators",
   queued: "Queued work",
+  downloadable: "Downloadable",
 };
 
 /**
