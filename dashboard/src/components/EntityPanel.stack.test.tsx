@@ -222,14 +222,22 @@ describe("validator modal · Capabilities (9101–9114)", () => {
   });
 
   it("gives the scorer revision the mono/copy treatment, elided but copyable", () => {
+    // A git revision of the scorer source, not a credential — read from the
+    // recorded fixture rather than restated, so the two assertions below
+    // cannot drift from what the row actually renders.
+    const scorerRevision = String(
+      validatorRows.find((v) => v.validator_hotkey === MANAGED)?.capabilities?.scorer_benchmarks
+        ?.source_revision,
+    );
+    expect(scorerRevision).toMatch(/^[0-9a-f]{40}$/);
     open(MANAGED);
     const revision = row(section("Capabilities"), "Scorer revision");
     expect(revision.querySelector(".v")?.className).toBe("v mono");
     const copyable = revision.querySelector(".copyable");
-    expect(copyable).toHaveAttribute("title", "25e8f296a573673ea47610c7a133e50660f2f416");
+    expect(copyable).toHaveAttribute("title", scorerRevision);
     expect(copyable?.querySelector("span")?.textContent).toBe("25e8f296a573…0660f2f416");
     const copy = revision.querySelector("button.copy");
-    expect(copy).toHaveAttribute("data-key", "25e8f296a573673ea47610c7a133e50660f2f416");
+    expect(copy).toHaveAttribute("data-key", scorerRevision);
     expect(copy).toHaveAttribute("data-copy-label", "scorer source revision");
   });
 
