@@ -5,7 +5,7 @@
 // know ("No bench v7" instead of the no-version "Bench unsupported").
 import { fleetStatus, offlineAwareFleetStatus } from "../EntityPanel";
 import { relDuration, relTimeUntil } from "../../lib/format";
-import type { FleetEntry, FleetReport } from "../../types/fleet";
+import type { FleetEntry, FleetReport, ScorerProbe, StackIdentity } from "../../types/fleet";
 import type { BenchmarkProgress } from "../../types/pipeline";
 
 /** A slot whose lease an operator evicted while the validator's benchmark
@@ -396,6 +396,132 @@ export function anyBenchmarkStage(entry: FleetEntryExt): boolean {
     if (benchmarks[index] && benchmarks[index]?.stage) return true;
   }
   return !!(entry.active_benchmark && entry.active_benchmark.stage);
+}
+
+// ── Validator stack identity, capabilities and per-component health
+// (STACK_COMPONENT_LABELS 8881–8901, yesNo 8927–8931, identityRows 8933–8940,
+// identityComparisonNote 8942–8957, renderScorerBenchmarks 8992–9011,
+// renderScorerProbe 9013–9035) ──────────────────────────────────────────────
+
+/** Human labels for the components a validator's stack reports (8881–8888). */
+export const STACK_COMPONENT_LABELS: Record<string, string> = {
+  ditto_subnet: "Validator worker",
+  dittobench_api: "Scorer · dittobench-api",
+  sandbox_docker: "Sandbox Docker",
+  model_relay: "Model relay",
+  pylon: "Pylon",
+  ollama: "Ollama",
+};
+
+/** Render order (8889), fixed rather than payload order: a component one
+ * heartbeat omits must not shuffle the rows of the next. */
+export const STACK_COMPONENT_ORDER: readonly string[] = [
+  "ditto_subnet",
+  "dittobench_api",
+  "sandbox_docker",
+  "model_relay",
+  "pylon",
+  "ollama",
+];
+
+const COMPONENT_HEALTH_CHIPS: Record<string, [string, string]> = {
+  healthy: ["Healthy", "good"],
+  degraded: ["Degraded", "warn"],
+  unreachable: ["Unreachable", "bad"],
+  identity_mismatch: ["Identity mismatch", "bad"],
+  unknown: ["Not observed", "unknown"],
+};
+
+/** Per-component health chip (8890–8901). A component the validator reported
+ * as `unknown` reads "Not observed" — it answered, it just has not probed;
+ * one the heartbeat omits entirely reads "Unknown". The two are not the same
+ * claim and are deliberately not collapsed. */
+export function componentHealthChip(state: string | null | undefined): [string, string] {
+  return (state != null && COMPONENT_HEALTH_CHIPS[state]) || ["Unknown", "unknown"];
+}
+
+/** Tri-state boolean copy (8927–8931): a capability the heartbeat omits is
+ * "Not reported", never a silent "No". */
+export function yesNo(value: boolean | null | undefined): string {
+  if (value === true) return "Yes";
+  if (value === false) return "No";
+  return "Not reported";
+}
+
+/** True when an identity pins at least one field worth a row (8933–8940). */
+export function hasIdentityRows(identity: StackIdentity | null | undefined): boolean {
+  return Boolean(
+    identity && (identity.image_digest || identity.source_revision || identity.version),
+  );
+}
+
+export interface IdentityNote {
+  tone: "good" | "warn";
+  text: string;
+}
+
+/** The first identity field both sides pin, compared (8942–8957). Null when
+ * either side has nothing comparable: an absent pin is not a mismatch, and
+ * claiming one would be the dashboard inventing a fault. */
+export function identityComparisonNote(
+  configured: StackIdentity | null | undefined,
+  observed: StackIdentity | null | undefined,
+): IdentityNote | null {
+  if (!configured || !observed) return null;
+  const checks: Array<[keyof StackIdentity, string]> = [
+    ["image_digest", "image digest"],
+    ["source_revision", "source revision"],
+  ];
+  for (const [key, label] of checks) {
+    if (configured[key] && observed[key]) {
+      return configured[key] === observed[key]
+        ? { tone: "good", text: "Observed " + label + " matches the configured pin." }
+        : { tone: "warn", text: "Observed " + label + " differs from the configured pin." };
+    }
+  }
+  return null;
+}
+
+/** Stack provenance in one phrase (9119). Anything that is not the signed
+ * managed release is a source build. */
+export function stackModeLabel(mode: string | null | undefined): string {
+  return mode === "managed" ? "Managed (signed GHCR release)" : "Source build";
+}
+
+/** The validator's verdict on its own scorer (8992–9000). */
+export function scorerStatusChip(status: string | null | undefined): [string, string] {
+  const chips: Record<string, [string, string]> = {
+    fresh_verified: ["Fresh, identity-verified", "good"],
+    legacy_v2: ["Legacy scorer (v2 only)", "warn"],
+    unreachable: ["Scorer unreachable", "bad"],
+    identity_mismatch: ["Scorer identity mismatch", "bad"],
+  };
+  return (status != null && chips[status]) || [String(status), "unknown"];
+}
+
+/** What the probe saw, which is a different question from the verdict above
+ * (9014–9022): "answered with something unusable" is not "never answered". */
+export function scorerProbeChip(outcome: string | null | undefined): [string, string] {
+  const chips: Record<string, [string, string]> = {
+    served: ["Serving", "good"],
+    served_degraded: ["Serving, reply partly rejected", "warn"],
+    http_error: ["No usable answer", "bad"],
+    unreadable: ["Answered, reply unusable", "bad"],
+    timeout: ["Probe timed out", "bad"],
+    connect_error: ["Connection failed", "bad"],
+    not_probed: ["Not probed", "unknown"],
+  };
+  return (outcome != null && chips[outcome]) || [String(outcome), "unknown"];
+}
+
+/** The " · HTTP 404 · 3284 in a row" tail appended after the probe chip
+ * (9023–9026). Empty when the probe carries no detail. */
+export function scorerProbeDetail(probe: ScorerProbe): string {
+  let detail = "";
+  if (probe.http_status != null) detail += " · HTTP " + probe.http_status;
+  if (probe.reason) detail += " · " + probe.reason;
+  if (probe.consecutive_failures) detail += " · " + probe.consecutive_failures + " in a row";
+  return detail;
 }
 
 // ── Transient validator telemetry grace (weekend drift; monolith 3155–3164,

@@ -10,6 +10,7 @@
 // row on the operations page instead (resolveEntityRoute 9303–9399), which
 // is that page's job.
 import {
+  For,
   Match,
   Show,
   Switch,
@@ -23,7 +24,7 @@ import type { JSX } from "solid-js";
 
 import { getJSON } from "../lib/api";
 import { entityActions } from "../lib/entity-links";
-import { agentName, agentVersionLabel, fx, pct, relTime } from "../lib/format";
+import { agentName, agentVersionLabel, fx, monoDisplay, pct, relTime } from "../lib/format";
 import { entityHref } from "../lib/router";
 import type { EntityKind, EntityRoute } from "../lib/router";
 import {
@@ -37,11 +38,36 @@ import {
 } from "../lib/scoring";
 import type { ContinualAggregate } from "../lib/scoring";
 import { closeEntityRoute, currentPage, entityRoute, syncFromLocation } from "../stores/routeStore";
-import type { FleetEntry, OperationsPayload } from "../types/fleet";
+import type {
+  FleetEntry,
+  OperationsPayload,
+  ScorerBenchmarks,
+  ScorerProbe,
+  StackComponentHealth,
+  StackIdentity,
+} from "../types/fleet";
 import type { LeaderboardEntry } from "../types/leaderboard";
 import type { ActivityEntry, ActivityPayload } from "../types/pipeline";
 import { activityStage } from "./pipeline/status";
 import { AgentEvidence } from "./evidence/AgentEvidence";
+// Pure fleet logic the validator body reads: the numeric slot order the
+// per-slot rows sort on, plus the stack-identity/component-health vocabulary.
+// (fleet.ts imports the status ladder back out of this module; both edges are
+// plain declarations read at render time, never at module init.)
+import {
+  STACK_COMPONENT_LABELS,
+  STACK_COMPONENT_ORDER,
+  componentHealthChip,
+  hasIdentityRows,
+  identityComparisonNote,
+  scorerProbeChip,
+  scorerProbeDetail,
+  scorerStatusChip,
+  slotOrdinal,
+  stackModeLabel,
+  yesNo,
+} from "./operations/fleet";
+import { BenchmarkProgressView } from "./operations/progress";
 import { CopyButton } from "./shell/CopyButton";
 import { EntityButton } from "./ui/EntityButton";
 import { StatusChip } from "./ui/StatusChip";
@@ -107,6 +133,44 @@ function FleetTime(props: { iso: string | null | undefined }): JSX.Element {
         </span>
       )}
     </Show>
+  );
+}
+
+/** Unix-seconds twin of FleetTime (unixTimeHtml 8916–8920): per-component
+ * probe times arrive as epoch seconds, not ISO strings. Nothing renders for a
+ * missing timestamp, exactly as the original returned "". */
+function UnixTime(props: { seconds: number | null | undefined }): JSX.Element {
+  const iso = (): string | null =>
+    props.seconds == null ? null : new Date(props.seconds * 1000).toISOString();
+  return (
+    <Show when={iso()}>
+      {(value) => (
+        <span class="fleet-time" title={value()}>
+          {relTime(value())}
+        </span>
+      )}
+    </Show>
+  );
+}
+
+/** The mono/copy treatment for a digest or revision (monoValue 8908–8914):
+ * elided display, full value in the title, and a copy control beside it. */
+function MonoValue(props: { value: string; label: string }): JSX.Element {
+  return (
+    <span class="copyable" title={props.value}>
+      <span>{monoDisplay(props.value)}</span>
+      <CopyButton value={props.value} label={props.label} />
+    </span>
+  );
+}
+
+/** One collapsible section of the validator body (section() 9152–9155). */
+function Section(props: { title: string; open?: boolean; children: JSX.Element }): JSX.Element {
+  return (
+    <details class="cgroup" open={props.open}>
+      <summary class="cgsum">{props.title}</summary>
+      <div style={{ padding: "2px 0 10px 22px" }}>{props.children}</div>
+    </details>
   );
 }
 
@@ -662,6 +726,222 @@ function MinerSummary(props: { entry: RankedEntry; settled: boolean; total: numb
   );
 }
 
+// ── Validator stack identity + component health ─────────────────────────────
+
+/** Digest / revision / version rows for one identity (identityRows
+ * 8933–8940). Renders nothing when the identity pins none of the three —
+ * callers that need a placeholder supply their own. */
+function IdentityRows(props: { identity: StackIdentity; copyPrefix: string }): JSX.Element {
+  const identity = () => props.identity;
+  return (
+    <>
+      <Show when={identity().image_digest}>
+        {(digest) => (
+          <Stat
+            k="Image digest"
+            mono
+            v={<MonoValue value={digest()} label={props.copyPrefix + " image digest"} />}
+          />
+        )}
+      </Show>
+      <Show when={identity().source_revision}>
+        {(revision) => (
+          <Stat
+            k="Source revision"
+            mono
+            v={<MonoValue value={revision()} label={props.copyPrefix + " source revision"} />}
+          />
+        )}
+      </Show>
+      <Show when={identity().version}>{(version) => <Stat k="Version" v={version()} />}</Show>
+    </>
+  );
+}
+
+/** One stack component (renderStackComponent 8959–8990). Configured identity
+ * is what Compose intends to run and observed identity is what a live probe
+ * verified; the two are rendered side by side, never merged, because the whole
+ * point of the section is the difference between them. */
+function StackComponent(props: {
+  name: string;
+  configured: StackIdentity | null | undefined;
+  observed: StackComponentHealth | null | undefined;
+}): JSX.Element {
+  const label = () => STACK_COMPONENT_LABELS[props.name] || props.name;
+  const chip = () => componentHealthChip(props.observed ? props.observed.health : null);
+  const note = () => identityComparisonNote(props.configured, props.observed?.observed_identity);
+  return (
+    <details class="cgroup">
+      <summary class="cgsum">
+        <span>{label()}</span>
+        <Show when={props.observed?.observed_at != null}>
+          <span class="probe-time">
+            probed <UnixTime seconds={props.observed?.observed_at} />
+          </span>
+        </Show>
+        <StatusChip label={chip()[0]} tone={chip()[1]} />
+      </summary>
+      <div class="crow-body" style={{ padding: "2px 0 10px 22px" }}>
+        <Show
+          when={props.observed}
+          fallback={
+            <Stat
+              k="Health"
+              v={<span class="muted">Not reported (requires heartbeat protocol 9)</span>}
+            />
+          }
+        >
+          {(observed) => (
+            <>
+              <Stat k="Health" v={<StatusChip label={chip()[0]} tone={chip()[1]} />} />
+              <Stat k="Required component" v={yesNo(observed().required)} />
+              <Show when={observed().ready != null}>
+                <Stat k="Endpoint ready" v={yesNo(observed().ready)} />
+              </Show>
+              <Show when={observed().model_ready != null}>
+                <Stat
+                  k={props.name === "ollama" ? "Embedding model ready" : "Model route ready"}
+                  v={yesNo(observed().model_ready)}
+                />
+              </Show>
+              <Show when={observed().observed_at != null}>
+                <Stat k="Last probe" v={<UnixTime seconds={observed().observed_at} />} />
+              </Show>
+              <div class="subhead">Observed identity</div>
+              <Show
+                when={observed().observed_identity}
+                fallback={
+                  <Stat
+                    k="Observed identity"
+                    v={<span class="muted">Not independently observed</span>}
+                  />
+                }
+              >
+                {(identity) => (
+                  <IdentityRows identity={identity()} copyPrefix={label() + " observed"} />
+                )}
+              </Show>
+            </>
+          )}
+        </Show>
+        <Show when={props.configured}>
+          {(configured) => (
+            <>
+              <div class="subhead">Configured identity</div>
+              <Stat k="Provenance" v={configured().provenance || "unknown"} />
+              <Show
+                when={hasIdentityRows(configured())}
+                fallback={<Stat k="Identity" v={<span class="muted">None pinned</span>} />}
+              >
+                <IdentityRows identity={configured()} copyPrefix={label() + " configured"} />
+              </Show>
+            </>
+          )}
+        </Show>
+        <Show when={note()}>
+          {(value) => <span class={"identity-note " + value().tone}>{value().text}</span>}
+        </Show>
+      </div>
+    </details>
+  );
+}
+
+/** What the validator's probe of its own scorer saw (renderScorerProbe
+ * 9013–9035). The status row above is the conclusion; this is the evidence,
+ * and it is what separates a scorer that never answered from one that
+ * answered with something unusable. */
+function ScorerProbeRows(props: { probe: ScorerProbe | null | undefined }): JSX.Element {
+  return (
+    <Show
+      when={props.probe}
+      fallback={
+        <Stat
+          k="Scorer probe"
+          v={<span class="muted">Not reported (requires heartbeat protocol 15)</span>}
+        />
+      }
+    >
+      {(probe) => {
+        const chip = () => scorerProbeChip(probe().outcome);
+        return (
+          <>
+            <Stat
+              k="Scorer probe"
+              v={
+                <>
+                  <StatusChip label={chip()[0]} tone={chip()[1]} />
+                  {scorerProbeDetail(probe())}
+                </>
+              }
+            />
+            <Stat k="Probe observed" v={<UnixTime seconds={probe().observed_at} />} />
+            <Stat
+              k="Last served"
+              v={
+                probe().last_served_at != null ? (
+                  <UnixTime seconds={probe().last_served_at} />
+                ) : (
+                  <span class="muted">Not since this validator started</span>
+                )
+              }
+            />
+          </>
+        );
+      }}
+    </Show>
+  );
+}
+
+/** Scorer capability rows inside Capabilities (renderScorerBenchmarks
+ * 8992–9011). A validator whose heartbeat predates protocol 8 says so rather
+ * than reading as a scorer with no benchmarks. */
+function ScorerBenchmarkRows(props: { scorer: ScorerBenchmarks | null | undefined }): JSX.Element {
+  return (
+    <Show
+      when={props.scorer}
+      fallback={
+        <Stat
+          k="Scorer benchmarks"
+          v={<span class="muted">Not reported (requires heartbeat protocol 8)</span>}
+        />
+      }
+    >
+      {(scorer) => {
+        const chip = () => scorerStatusChip(scorer().status);
+        return (
+          <>
+            <Stat k="Scorer status" v={<StatusChip label={chip()[0]} tone={chip()[1]} />} />
+            <ScorerProbeRows probe={scorer().probe} />
+            <Stat
+              k="Supported benchmarks"
+              v={
+                (scorer().supported_bench_versions || [])
+                  .map((version) => "v" + version)
+                  .join(", ") || "–"
+              }
+            />
+            <Show when={scorer().observed_at != null}>
+              <Stat k="Capability observed" v={<UnixTime seconds={scorer().observed_at} />} />
+            </Show>
+            <Show when={scorer().software_version}>
+              {(version) => <Stat k="Scorer version" v={version()} />}
+            </Show>
+            <Show when={scorer().source_revision}>
+              {(revision) => (
+                <Stat
+                  k="Scorer revision"
+                  mono
+                  v={<MonoValue value={revision()} label="scorer source revision" />}
+                />
+              )}
+            </Show>
+          </>
+        );
+      }}
+    </Show>
+  );
+}
+
 // ── Validator tenant summary ────────────────────────────────────────────────
 
 function ValidatorSummary(props: {
@@ -682,11 +962,17 @@ function ValidatorSummary(props: {
     }
     return summary + " · " + String(e().admission || "accepting");
   };
+  // One row per running job, ordered by slot ordinal (9088–9096). The modal
+  // used to show only the lowest slot, so a second concurrent benchmark was
+  // invisible here — the #540 regression the slot-fan-out suite exists for.
+  const activeSlots = () =>
+    (e().active_benchmarks || [])
+      .slice()
+      .sort((left, right) => slotOrdinal(left.slot_id) - slotOrdinal(right.slot_id));
   return (
     <div class="vdetail">
-      <details class="cgroup" open>
-        <summary class="cgsum">Signed report</summary>
-        <div style={{ padding: "2px 0 10px 22px" }}>
+      <Section title="Signed report" open>
+        <>
           <Stat k="Fleet status" v={<StatusChip label={status()[0]} tone={status()[1]} />} />
           <Show when={e().bench_serviceability && e().bench_serviceability !== "serving"}>
             <Stat
@@ -710,36 +996,116 @@ function ValidatorSummary(props: {
           <Stat k="Validator reported" v={<FleetTime iso={e().reported_at} />} />
           <Stat k="Platform received" v={<FleetTime iso={e().seen_at} />} />
           <Stat k="Slots" v={slotSummary()} />
-        </div>
-      </details>
-      <details class="cgroup">
-        <summary class="cgsum">Host metrics</summary>
-        <div style={{ padding: "2px 0 10px 22px" }}>
-          <Show
-            when={e().system_metrics}
-            fallback={<Stat k="Host metrics" v={<span class="muted">Not reported</span>} />}
-          >
-            {(m) => (
-              <>
-                <Stat k="CPU" v={m().cpu_percent + "%"} />
-                <Stat k="Memory" v={m().memory_percent + "%"} />
-                <Stat k="Disk" v={m().disk_percent + "%"} />
-                <Stat
-                  k="Docker"
-                  v={
-                    m().docker_status +
-                    " · " +
-                    m().running_containers +
-                    " running, " +
-                    m().unhealthy_containers +
-                    " unhealthy"
-                  }
-                />
-              </>
+          <For each={activeSlots()}>
+            {(benchmark) => (
+              <Stat
+                k={benchmark.slot_id || "slot-0"}
+                v={<BenchmarkProgressView progress={benchmark} showAgent={true} />}
+              />
             )}
-          </Show>
-        </div>
-      </details>
+          </For>
+        </>
+      </Section>
+      <Section title="Capabilities">
+        <Show
+          when={e().capabilities}
+          fallback={
+            <Stat
+              k="Capabilities"
+              v={<span class="muted">Not reported (requires heartbeat protocol 7)</span>}
+            />
+          }
+        >
+          {(caps) => (
+            <>
+              <Stat k="Screened images" v={yesNo(caps().screened_images)} />
+              <Stat k="Requires screened image" v={yesNo(caps().require_screened_image)} />
+              <Stat k="Source-build fallback" v={yesNo(caps().source_build_fallback)} />
+              <Stat k="Managed full stack" v={yesNo(caps().full_stack_managed)} />
+              <Stat k="Stack auto-updater" v={yesNo(caps().stack_updater)} />
+              <Stat k="Sandbox egress restricted" v={yesNo(caps().sandbox_egress_restricted)} />
+              <Stat k="Executor isolation" v={caps().executor_isolation || "unknown"} />
+              <ScorerBenchmarkRows scorer={caps().scorer_benchmarks} />
+            </>
+          )}
+        </Show>
+      </Section>
+      <Section title="Stack identity">
+        <Show
+          when={e().stack}
+          fallback={
+            <Stat
+              k="Stack identity"
+              v={<span class="muted">Not reported (requires heartbeat protocol 7)</span>}
+            />
+          }
+        >
+          {(stack) => (
+            <>
+              <Stat k="Stack mode" v={stackModeLabel(stack().mode)} />
+              <Stat k="Compose schema" v={String(stack().compose_schema)} />
+              <Show when={stack().release_descriptor_digest}>
+                {(digest) => (
+                  <Stat
+                    k="Release descriptor"
+                    mono
+                    v={<MonoValue value={digest()} label="release descriptor digest" />}
+                  />
+                )}
+              </Show>
+            </>
+          )}
+        </Show>
+      </Section>
+      {/* Open by default: an operator who reaches this modal is usually asking
+          which part of the stack is broken, and the answer is one click deep. */}
+      <Section title="Component health" open>
+        <>
+          <p class="muted" style={{ margin: "4px 0 8px", "font-size": "12px" }}>
+            {e().stack_health
+              ? "Configured identity is what Compose intends to run; observed identity is what a " +
+                "live probe independently verified; readiness is a real request answered just " +
+                "now. Per-component probe times are independent of heartbeat freshness."
+              : "This validator reports heartbeat protocol " +
+                String(e().protocol_version) +
+                ". Per-component runtime health arrives with protocol 9."}
+          </p>
+          <For each={STACK_COMPONENT_ORDER}>
+            {(name) => (
+              <StackComponent
+                name={name}
+                configured={e().stack?.components?.[name] ?? null}
+                observed={e().stack_health?.[name] ?? null}
+              />
+            )}
+          </For>
+        </>
+      </Section>
+      <Section title="Host metrics">
+        <Show
+          when={e().system_metrics}
+          fallback={<Stat k="Host metrics" v={<span class="muted">Not reported</span>} />}
+        >
+          {(m) => (
+            <>
+              <Stat k="CPU" v={m().cpu_percent + "%"} />
+              <Stat k="Memory" v={m().memory_percent + "%"} />
+              <Stat k="Disk" v={m().disk_percent + "%"} />
+              <Stat
+                k="Docker"
+                v={
+                  m().docker_status +
+                  " · " +
+                  m().running_containers +
+                  " running, " +
+                  m().unhealthy_containers +
+                  " unhealthy"
+                }
+              />
+            </>
+          )}
+        </Show>
+      </Section>
     </div>
   );
 }

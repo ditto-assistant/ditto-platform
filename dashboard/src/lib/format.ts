@@ -132,6 +132,14 @@ export function shortKey(k: string | null | undefined): string {
   return k && k.length > 16 ? k.slice(0, 8) + "…" + k.slice(-6) : k || "";
 }
 
+/** The elided form of a long opaque value — a digest, a git revision — for
+ * the mono/copy treatment (monoValue 8908–8914): head 12 + "…" + tail 10 once
+ * past 26 characters, so a sha256 stays recognizable at both ends while the
+ * full value lives in the title and on the copy control. */
+export function monoDisplay(value: string): string {
+  return value.length > 26 ? value.slice(0, 12) + "…" + value.slice(-10) : value;
+}
+
 /** Strip the provider prefix from a model name (last "/" segment). */
 export function shortModel(name: string): string {
   return name.indexOf("/") >= 0 ? (name.split("/").pop() ?? name) : name;

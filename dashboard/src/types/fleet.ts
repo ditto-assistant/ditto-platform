@@ -22,6 +22,22 @@ export interface StackComponentHealth {
   observed_identity?: StackIdentity | null;
 }
 
+/** What the validator's own probe of its scorer actually saw. The status
+ * above is the validator's conclusion; this separates a scorer that never
+ * answered from one that answered with something unusable. */
+export interface ScorerProbe {
+  /** "served" | "served_degraded" | "http_error" | "unreadable" | "timeout" |
+   * "connect_error" | "not_probed". */
+  outcome?: string;
+  /** Unix seconds. */
+  observed_at?: number | null;
+  http_status?: number | null;
+  reason?: string | null;
+  /** Unix seconds; null means "not since this validator started". */
+  last_served_at?: number | null;
+  consecutive_failures?: number | null;
+}
+
 export interface ScorerBenchmarks {
   /** "fresh_verified" | "legacy_v2" | "unreachable" | "identity_mismatch". */
   status?: string;
@@ -30,6 +46,7 @@ export interface ScorerBenchmarks {
   observed_at?: number | null;
   software_version?: string | null;
   source_revision?: string | null;
+  probe?: ScorerProbe | null;
 }
 
 export interface ValidatorCapabilities {
