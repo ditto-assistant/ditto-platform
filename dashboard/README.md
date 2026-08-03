@@ -1,9 +1,9 @@
 # Ditto SN118 public dashboard
 
-A single self-contained `index.html` — the public "front door" for Subnet 118.
-No build step, no framework, no external requests, **no secrets**. It reads the
-platform's public API and links out to wandb for the per-epoch deep dive.
-This is Surface 3 in [`docs/public-telemetry.md`](../docs/public-telemetry.md).
+The public "front door" for Subnet 118: a Vite + SolidJS + TypeScript SPA. No
+external requests at runtime, **no secrets** — it reads the platform's public
+API and links out to wandb for the per-epoch deep dive. This is Surface 3 in
+[`docs/public-telemetry.md`](../docs/public-telemetry.md).
 
 ## What it shows
 
@@ -106,27 +106,45 @@ Resolved in priority order:
 | API base | `?api=https://api.host/api/v1` | `<meta name="ditto:api-base">` | same-origin `/api/v1` |
 | wandb link | `?wandb=https://wandb.ai/org/ditto-sn118` | `<meta name="ditto:wandb-url">` | `https://wandb.ai/` |
 
-For a deployed dashboard, edit the two `<meta>` tags in `index.html` so the
-defaults are correct and the query string is only needed for testing.
+For a deployed dashboard, edit the two `<meta>` tags in `index.html` (they
+pass through the build) so the defaults are correct and the query string is
+only needed for testing.
 
-## Run / preview
+## Develop / run
 
 ```sh
-# Preview the API-unavailable state:
-open dashboard/index.html            # or drag it into a browser
-
-# Against a locally-running API (make api-up):
-python -m http.server -d dashboard 8080
-# then visit http://localhost:8080/?api=http://localhost:8000/api/v1
+cd dashboard
+npm ci                # install (pinned lockfile)
+npm run dev           # Vite dev server on :8080, /api proxied to :8000 (make api-up)
+npm test              # vitest (jsdom, recorded fixtures — no network)
+npm run check         # tsc + oxlint + prettier --check
+npm run build         # production bundle -> dist/
 ```
+
+Override the dev proxy target without touching CORS:
+`DITTO_DASHBOARD_PROXY_TARGET=https://platform-api-dev.heyditto.ai npm run dev`.
 
 If the API can't be reached the page renders an explicit unavailable state. It
 never substitutes sample values for live subnet data.
 
+## Layout & tests
+
+- `src/pages/` — one module per sidebar page; `src/components/` — shell,
+  board, and per-domain components; `src/lib/` — pure logic (routing, scoring
+  and emissions math, bench rollout state, formatting); `src/data/` — the
+  polling endpoint resources; `src/types/` — wire shapes.
+- `fixtures/` is a recorded production snapshot (see `fixtures/README.md`);
+  the vitest suite renders against it with a frozen clock, so tests are
+  deterministic and offline.
+- Parity with the pre-SPA dashboard is tracked in `PARITY.md`: every
+  appearance assertion the served-HTML Python tests used to make maps to a
+  vitest test here. Add to it when you move or retire one.
+
 ## Deploy
 
 **Default (this repo): served by the platform, same-origin.** The API serves
-this file at `/` (see `factory.py`), so on the deployed hosts it's already live:
+the built `dist/` at `/` (see `factory.py`; `scripts/update.sh` runs the build
+during deploy), so on the deployed hosts it's already live:
 
 - dev  → `https://platform-api-dev.heyditto.ai/`
 - prod → `https://platform-api.heyditto.ai/`
@@ -135,8 +153,9 @@ Same-origin means the SPA's `/api/v1/public/*` calls need no CORS and the wandb
 link is injected from `DITTO_DASHBOARD_WANDB_URL` at serve time — no need to edit
 this file per environment. `DITTO_DASHBOARD_ENABLED=false` runs the API headless.
 
-**Alternative: host it yourself.** It's a plain static file — upload to object
-storage (S3/MinIO/GCS) behind a CDN, or any static host. A *cross-origin* host
+**Alternative: host it yourself.** `npm run build` emits a fully static
+`dist/` — upload it to object storage (S3/MinIO/GCS) behind a CDN, or any
+static host. A *cross-origin* host
 would additionally require CORS on the API's `/public/*` routes (not currently
 enabled, since the default is same-origin). The API sets
 `Cache-Control: public, max-age=30` on the data; the SPA auto-refreshes on the

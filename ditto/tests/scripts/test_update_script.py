@@ -144,6 +144,7 @@ def _run_update(
     health_commit: str | None = TARGET_SHA,
     health_timeout: str = "15",
     uv_source: str = ":\n",
+    npm_source: str | None = None,
     diverged_migrations: bool = False,
     last_deploy_record: str | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], str, str, int]:
@@ -197,6 +198,14 @@ def _run_update(
         "esac\n",
     )
     _write_executable(fake_bin / "uv", uv_source)
+    # The dashboard build stage is exercised only when a test opts in with
+    # npm_source: the fake repo then grows the dashboard/package.json the
+    # stage keys on. Without it the stage skips, like a checkout without the
+    # dashboard, so every other test stays focused on what it asserts.
+    if npm_source is not None:
+        (repo / "dashboard").mkdir()
+        (repo / "dashboard" / "package.json").write_text("{}\n")
+        _write_executable(fake_bin / "npm", npm_source)
     _write_executable(fake_bin / "docker", ":\n")
     _write_executable(
         fake_bin / "pm2",
@@ -509,6 +518,47 @@ def test_update_refuses_to_deploy_divergent_migration_heads(tmp_path: Path) -> N
     assert "alembic merge" in result.stderr
     # Preflight runs before pm2 is planned or touched.
     assert not (tmp_path / "repo" / "pm2-actions.log").exists()
+
+
+def test_update_rolls_the_checkout_back_when_the_dashboard_build_fails(
+    tmp_path: Path,
+) -> None:
+    """A broken dashboard build must abort before pm2 is touched.
+
+    The build sits with the other pre-pm2 stages, so its failure follows the
+    same rules as any preflight: the checkout goes back to the revision the
+    running process reports, pm2 is never asked to do anything, and the old
+    process — with the dist/ it was already serving — stays up.
+    """
+    result, _, _, _ = _run_update(
+        tmp_path,
+        gcloud_source="exit 1\n",
+        npm_source='echo "npm ERR! build exploded" >&2\nexit 1\n',
+        health_commit=RUNNING_SHA,
+    )
+
+    assert result.returncode != 0
+    assert f"git reset --hard {RUNNING_SHA}" in _git_actions(tmp_path)
+    assert _head(tmp_path) == RUNNING_SHA
+    assert not (tmp_path / "repo" / "pm2-actions.log").exists()
+
+    record = _deploy_record(tmp_path)
+    assert record["result"] == "failed"
+    assert record["stage"] == "dashboard-build"
+
+
+def test_update_builds_the_dashboard_before_touching_pm2(tmp_path: Path) -> None:
+    """When the checkout has a dashboard, the deploy builds it (ci + build)."""
+    result, _, _, _ = _run_update(
+        tmp_path,
+        gcloud_source="exit 1\n",
+        npm_source=f'printf "%s\\n" "npm $*" >> "{tmp_path}/repo/npm-actions.log"\n',
+    )
+
+    assert result.returncode == 0, result.stderr
+    npm_actions = (tmp_path / "repo" / "npm-actions.log").read_text()
+    assert "npm ci" in npm_actions
+    assert "npm run build" in npm_actions
 
 
 def test_update_rolls_the_checkout_back_when_a_migration_fails(

@@ -1,25 +1,122 @@
 """Tests for the same-origin dashboard SPA served at ``/``.
 
-The platform doubles as the transparency front door: it serves
-``dashboard/index.html`` at ``/`` so the SPA's ``/api/v1/public/*`` calls are
-same-origin (no CORS). The served HTML must carry the injected wandb project URL
-and be suppressible via config.
+The platform doubles as the transparency front door: it serves the Vite build
+output (``dashboard/dist``) at ``/`` so the SPA's ``/api/v1/public/*`` calls
+are same-origin (no CORS). These tests cover the *serving contract* only —
+wandb URL injection, cache/encoding headers, the ``/assets/`` route, and the
+disabled / missing-build fallbacks — against a minimal fake ``dist/`` fixture
+rather than a real build. The old monolith-era tests that asserted on the
+dashboard's rendered markup, copy, and inline JS were deleted: the shell is
+client-rendered now and that behavior is covered by the dashboard's own vitest
+suite (``dashboard/src/**/*.test.tsx``).
 """
 
 from __future__ import annotations
 
-import json
-import re
-import subprocess
+from pathlib import Path
 
 import httpx
 import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport
 
+from ditto.api_server import factory
 from ditto.api_server.factory import create_api_server
 
 from .conftest import make_api_server_config
+
+# A minimal but representative Vite build: the two ``ditto:`` meta tags the
+# server and SPA read, the inline theme bootstrap (runs before CSS paints),
+# the SPA mount point, and a content-hashed bundle reference. Kept above the
+# 1KB SizedGZipMiddleware floor so the gzip test exercises compression.
+_FAKE_INDEX_HTML = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Ditto SN118 · Subnet Leaderboard</title>
+  <meta name="ditto:api-base" content="" />
+  <meta name="ditto:wandb-url" content="https://wandb.ai/" />
+  <script>
+    // Apply the saved theme before CSS paints to avoid a light/dark flash.
+    (function () {
+      "use strict";
+      var STORAGE_KEY = "ditto:dashboard-theme";
+      var MODES = { system: true, light: true, dark: true, time: true };
+
+      function fromHour(hour) {
+        if (hour >= 5 && hour < 8) return "dawn";
+        if (hour >= 8 && hour < 12) return "morning";
+        if (hour >= 12 && hour < 17) return "afternoon";
+        if (hour >= 17 && hour < 20) return "dusk";
+        return "night";
+      }
+
+      function readMode() {
+        try {
+          var saved = localStorage.getItem(STORAGE_KEY);
+          return MODES[saved] ? saved : "system";
+        } catch (e) {
+          return "system";
+        }
+      }
+
+      function apply(mode) {
+        var root = document.documentElement;
+        root.dataset.theme = MODES[mode] ? mode : "system";
+        root.dataset.timePhase = fromHour(new Date().getHours());
+      }
+
+      apply(readMode());
+    })();
+  </script>
+  <script type="module" crossorigin src="/assets/index-Ab12Cd34.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+</body>
+</html>
+"""
+
+# Just the PNG signature plus filler; enough for signature assertions.
+_FAKE_PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+
+
+@pytest.fixture
+def fake_dist(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A fake ``dashboard/dist`` build the factory serves during the test.
+
+    Writes the minimal build into ``tmp_path`` and points the factory's
+    module-level paths at it, so the serving contract is tested without
+    running ``npm run build``.
+    """
+    dist = tmp_path / "dist"
+    assets = dist / "assets"
+    assets.mkdir(parents=True)
+    html = _FAKE_INDEX_HTML
+    # The gzip test relies on the body clearing SizedGZipMiddleware's floor.
+    assert len(html.encode("utf-8")) > 1024
+    (dist / "index.html").write_text(html, encoding="utf-8")
+    # Content-hashed bundle (cache forever) vs. a public/ passthrough file
+    # that keeps its name (cache for a day).
+    (assets / "index-Ab12Cd34.js").write_text(
+        'console.log("ditto dashboard bundle");\n', encoding="utf-8"
+    )
+    (assets / "paperditto-512.png").write_bytes(_FAKE_PNG)
+    monkeypatch.setattr(factory, "_DASHBOARD_DIST", dist)
+    monkeypatch.setattr(factory, "_DASHBOARD_FILE", dist / "index.html")
+    monkeypatch.setattr(factory, "_DASHBOARD_ASSETS", assets)
+    return dist
+
+
+@pytest.fixture
+def missing_dist(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Point the factory at a ``dist`` directory that was never built."""
+    dist = tmp_path / "dist"  # intentionally not created
+    monkeypatch.setattr(factory, "_DASHBOARD_DIST", dist)
+    monkeypatch.setattr(factory, "_DASHBOARD_FILE", dist / "index.html")
+    monkeypatch.setattr(factory, "_DASHBOARD_ASSETS", dist / "assets")
+    return dist
 
 
 async def _get(app: FastAPI, path: str) -> httpx.Response:
@@ -28,6 +125,7 @@ async def _get(app: FastAPI, path: str) -> httpx.Response:
         return await client.get(path)
 
 
+@pytest.mark.usefixtures("fake_dist")
 class TestDashboard:
     async def test_served_at_root_with_injected_wandb_url(self) -> None:
         url = "https://wandb.ai/ditto/ditto-sn118"
@@ -62,30 +160,8 @@ class TestDashboard:
         assert resp.status_code == 200
         assert resp.headers["content-type"].startswith("text/html")
         assert resp.headers["Cache-Control"] == "public, max-age=60, must-revalidate"
-        assert '<h1 id="page-title">Overview</h1>' in resp.text
-
-    async def test_includes_social_preview_metadata(self) -> None:
-        app = create_api_server(make_api_server_config(dashboard_enabled=True))
-        body = (await _get(app, "/")).text
-        image_url = "https://platform-api.heyditto.ai/assets/paperditto-512.png"
-        assert '<meta property="og:type" content="website"' in body
-        assert (
-            '<meta property="og:title" content="Ditto SN118 · Subnet Leaderboard"'
-            in body
-        )
-        assert f'<meta property="og:image" content="{image_url}"' in body
-        assert '<meta property="og:image:width" content="512"' in body
-        assert '<meta name="twitter:card" content="summary"' in body
-        assert f'<meta name="twitter:image" content="{image_url}"' in body
-        assert '<link rel="canonical" href="https://platform-api.heyditto.ai/"' in body
-
-    async def test_serves_social_preview_image(self) -> None:
-        app = create_api_server(make_api_server_config(dashboard_enabled=True))
-        resp = await _get(app, "/assets/paperditto-512.png")
-        assert resp.status_code == 200
-        assert resp.headers["content-type"] == "image/png"
-        assert resp.headers["Cache-Control"] == "public, max-age=86400"
-        assert resp.content.startswith(b"\x89PNG\r\n\x1a\n")
+        # Entity paths serve the same SPA shell as /.
+        assert resp.text == (await _get(app, "/")).text
 
     async def test_wandb_url_is_html_escaped(self) -> None:
         # A stray quote in the configured URL must not break out of the attribute.
@@ -114,7 +190,7 @@ class TestDashboard:
         assert resp.status_code == 200
         assert resp.headers["content-encoding"] == "gzip"
         # httpx transparently decodes; the decoded HTML is still the SPA shell.
-        assert '<h1 id="page-title">Overview</h1>' in resp.text
+        assert '<div id="root">' in resp.text
 
     async def test_dashboard_serves_strong_etag(self) -> None:
         app = create_api_server(make_api_server_config(dashboard_enabled=True))
@@ -161,9 +237,9 @@ class TestDashboard:
             "/api/v1/public/weights",
             "/api/v1/public/activity",
             "/api/v1/public/operations",
-            "/api/v1/public/agent/{agent_id}/summary",
             "/api/v1/public/validators",
             "/api/v1/public/screeners",
+            "/api/v1/public/agent/{agent_id}/summary",
         ],
     )
     async def test_api_still_mounted_alongside_dashboard(self, path: str) -> None:
@@ -172,1576 +248,64 @@ class TestDashboard:
         # 200 requires a DB; here we only assert the route exists (not 404).
         assert any(getattr(r, "path", None) == path for r in app.routes)
 
-    async def test_includes_submission_pipeline(self) -> None:
+
+@pytest.mark.usefixtures("fake_dist")
+class TestDashboardAssets:
+    """The ``/assets/{path}`` route serving the Vite build's static files."""
+
+    async def test_hashed_asset_is_cached_forever(self) -> None:
+        # Vite content-hashes bundle names, so the bytes behind a given name
+        # never change: safe to cache for a year and mark immutable.
         app = create_api_server(make_api_server_config(dashboard_enabled=True))
-        body = (await _get(app, "/")).text
-        assert '<h1 id="page-title">Overview</h1>' in body
-        assert '<h2 id="operations-title">Network operations</h2>' not in body
-        assert "<h2>Recent submissions</h2>" not in body
-        assert "<h2>What DittoBench v2 measures</h2>" not in body
-        assert "Submission pipeline" in body
-        assert body.index('id="leaderboard-title">Leaderboard</h2>') < body.index(
-            'class="operations"'
-        )
-        assert 'id="leaderboard-title">Leaderboard' in body
-        assert "one rank per payment-owner family" in body
-        assert 'class="family-toggle"' in body
-        assert "Scored, but not independently ranked" in body
-        assert "function renderFamilyStanding(pipeline)" in body
-        assert 'id="leaderboard-notice" role="status" aria-live="polite"' in body
-        assert "Provisional standings." in body
-        assert "not the required 3 of 3 scores" in body
-        assert "only final results drive emissions" in body
-        assert "Registration unavailable." in body
-        assert (
-            "function isRegistered(e) { return !!e && e.registered === true; }" in body
-        )
-        assert "e.emission_eligible === true" in body
-        assert ">unconfirmed</span>" in body
-        assert 'class="quorum-badge tip-chip"' in body
-        assert ">Best-scoring agent</span>" in body
-        assert 'class="miner-uid" title="Current SN118 UID">UID ' in body
-        assert ">Total scores</span>" in body
-        assert ">Validators</span>" in body
-        assert "Scoring Spend" not in body
-        assert "Avg latency" not in body
-        assert "Scores · 24h" not in body
-        assert ">Score rank</span>" in body
-        assert ">Emissions</span>" in body
-        assert 'id="emissions-strip" role="status" aria-live="polite"' in body
-        assert "function artifactReleaseCopy(release)" in body
-        assert "function artifactReleaseNote(release)" in body
-        assert "function renderArtifactRelease(release, agentId)" in body
-        assert "function downloadArtifact(agentId, button)" in body
-        assert '"/public/agent/" + encodeURIComponent(agentId) + "/artifact"' in body
-        assert 'cache: "no-store"' in body
-        assert "Download submitted source" in body
-        assert "This king's source" in body
-        assert "Number(release.embargo_hours) || 48" in body
-        assert "on-chain weights were set on this king" in body
-        assert "Awaiting that on-chain confirmation." in body
-        assert "its king reveal timing still applies" in body
-        assert "function relTimeUntil(iso)" in body
-        assert "relTimeUntil(release.available_at)" in body
-        assert "relTime(release.available_at)" not in body
-        assert "window.location.assign(data.download_url)" in body
-        assert "Download started" in body
-        assert "Download opened" not in body
-        assert "public/king/artifact" not in body
-        assert "continuous 24-hour reign" not in body
-        assert 'id="chain-observation"' in body
-        assert 'getJSON("/public/weights")' in body
-        assert "Commit-reveal can make this lag active commitments" in body
-        assert "Yuma combines validator inputs stake-weightedly" in body
-        assert 'return "Validator top choice · "' in body
-        assert 'return "Validator support · "' in body
-        assert "Chain · champion" not in body
-        assert "Chain · weighted" not in body
-        assert "is the validator top choice in" in body
-        assert "Revealed validator support" in body
-        assert "Top choice means the miner received" in body
-        assert '"ranked by settled v" + activeBench + " composite during the v"' in body
-        assert (
-            '" rollout · v" + data.desired_bench_version + " progress shown per row"'
-            in body
-        )
-        assert 'data-leaderboard-version="current"' in body
-        assert 'data-leaderboard-version="2"' in body
-        assert '"?bench_version=" + encodeURIComponent(leaderboardVersionView)' in body
-        assert "Raw score rank #" in body
-        assert 'emission.role === "champion"' in body
-        assert "must lead by more than" in body
-        # The margin is read from emissions.margin, not written into the copy.
-        assert '" protection margin and the " + method' in body
-        assert 'class="winner-identity"' in body
-        assert 'entityAnchor("agent", e.agent_id, displayAgentName)' in body
-        assert "agentVersionBadge(e.agent_version)" in body
-        assert "Legacy submission" in body
-        assert '"Compared with"' in body
-        assert "function isFinalized(e)" in body
-        assert '"Provisional leaderboard"' in body
-        assert '"P" + e.rank' in body
-        assert "getJSON(activityRequestPath(page))" in body
-        assert 'id="activity-rows"' in body
-        assert 'id="activity-pager"' in body
-        assert 'id="pipeline-overview"' in body
-        assert 'class="pipeline-item-identity"' in body
-        assert 'class="pipeline-item-version"' in body
-        assert 'class="pipeline-item-badges"' in body
-        assert ".pipeline-item-heading { display: flex; flex-wrap: wrap;" in body
-        assert ".pipeline-item-meta { flex: 0 0 auto; margin-left: auto;" in body
-        assert "'<span class=\"pipeline-item-meta\">' + esc(meta)" in body
-        assert "'<span class=\"pipeline-item-meta\"><span>'" not in body
-        assert 'return version == null ? "Legacy" : "v" + version;' in body
-        assert "agentVersionBadge(entry.version)" not in body
-        assert (
-            """'<span class="pipeline-item-meta"><span>' + """
-            """esc(String(entry.agent_id || "").slice(0, 8))""" not in body
-        )
-        assert "Network operations" in body
-        assert "Waiting for admission" in body
-        assert "Image build &amp; admission" in body
-        assert "Waiting for validators" in body
-        assert "Conditional after scoring" in body
-        assert "Source integrity review" in body
-        assert "function validatorQueueCompare(a, b)" in body
-        assert "indexed.sort(validatorQueueCompare)" in body
-        assert "var pipelineShowStuck = false" in body
-        assert "data-pipeline-stuck-filter" in body
-        assert 'aria-pressed="' in body
-        assert 'item.entry.retry_state !== "exhausted"' in body
-        assert 'item.entry.retry_state === "exhausted"' in body
-        assert "function queueRelevantBenchmark(progress)" in body
-        assert "Number(activeBench) || Number(currentBench)" in body
-        assert "version >= activeVersion" in body
-        assert "function pipelineBoardStage(entry)" in body
-        assert "function operationsPipelineActivity(data)" in body
-        assert "data.rollout_queue" in body
-        assert "data.validators.validators" in body
-        assert "progressByAgent" in body
-        assert ".map(withValidatorProgress)" in body
-        assert "Cohort #" in body
-        assert "(entry.active_benchmarks || []).some(queueRelevantBenchmark)" in body
-        assert ".filter(queueRelevantBenchmark)" in body
-        assert 'column.status === "evaluating"' in body
-        assert "var displayedCount" in body
-        assert "item.entry.active_benchmarks || []" in body
-        assert "column.statuses.indexOf(pipelineBoardStage(entry))" in body
-        assert '"Bench v" + rescore.targetVersion + " rescore"' in body
-        assert "validator_queue_rank" in body
-        assert "entry.provisional_composite" in body
-        assert '"Provisional " + fx(Number(entry.provisional_composite))' in body
-        assert "Highest current priority; validator eligibility can vary" in body
-        assert ">Up next</span>" in body
-        # Rank 1 alone must never earn the badge: a gated row can hold the head
-        # of the list while no validator is able to lease it.
-        assert "&& !queueGate;" in body
-        assert "function queueGateLabel(entry)" in body
-        assert "Never badge work already running" in body
-        assert 'class="pipeline-gate-badge"' in body
-        for gate in ("previous_generation", "owner_serialized", "not_leasable"):
-            assert gate + ": {" in body
-        assert 'id="pipeline-evaluating-title">Scoring' in body
-        assert 'id="pipeline-scored"' in body
-        assert 'data-pipeline-stage="scored"' in body
-        assert "Scored &amp; live" in body
-        assert 'statuses: ["waiting_validator", "below_score_floor"]' in body
-        assert 'statuses: ["scored", "live"]' in body
+        resp = await _get(app, "/assets/index-Ab12Cd34.js")
+        assert resp.status_code == 200
+        assert "javascript" in resp.headers["content-type"]
+        assert resp.headers["Cache-Control"] == "public, max-age=31536000, immutable"
+        assert b"ditto dashboard bundle" in resp.content
 
-        assert 'getJSON("/public/operations")' in body
-        assert "max-height: 390px" in body
-        assert "indexed.slice(0, 5)" not in body
-        assert body.count('type="button" data-activity-page="prev"') == 2
-        assert body.count('type="button" data-activity-page="next"') == 2
-        assert 'aria-label="Submission pages, bottom"' in body
-        assert 'class="activity-table-frame"' in body
-        assert "lockActivityFrameHeight" in body
-        assert "anchor.getBoundingClientRect().top - anchorTop" in body
-        assert "Validation" in body
-        assert "openActivityModal" in body
-        assert "scores received" in body
-        assert "renderAcceptedScores" in body
-        assert "Accepted validator scores" in body
-        assert '"Bench v" + score.bench_version' in body
-        assert '"Bench v" + a.bench_version' in body
-        assert 'class="bench-version-badge"' in body
-        assert "function benchmarkCohorts(pipeline)" in body
-        assert "function pipelineDisplayState(entry, pipeline)" in body
-        assert "function renderPreliminaryFact(cohort, quorum)" in body
-        assert " preliminary</dt><dd>" in body
-        assert 'class="pipeline-preliminary-value"' in body
-        assert "function cohortProgressSummary(cohort, quorum)" in body
-        assert "function retestAttemptCounts(attempts)" in body
-        assert 'attempt.purpose === "continual_retest"' in body
-        assert '" of " + quorum + " quorum inputs"' in body
-        assert '" legacy lease draining"' in body
-        assert '"Legacy lease unclassified · "' in body
-        assert 'retestState(retests.running, "running")' in body
-        assert 'retestState(retests.assigned, "assigned")' in body
-        assert "function renderConfirmationScores(pipeline)" in body
-        assert "Continual top-five retests" in body
-        assert "Aggregate-eligible shared wave" in body
-        assert "eligible shared " in body
-        assert "retained confirmation " in body
-        assert "retained " in body
-        assert "are not currently fold-eligible" in body
-        assert "Only aggregate-eligible shared-wave averages are shown here" in body
-        assert "Partial, legacy, and superseded confirmation seeds" in body
-        assert "Accepted shared seed" not in body
-        assert "function confirmationCohorts(pipeline)" not in body
-        assert "Accepted validator scores" in body
-        assert "Canonical quorum" in body
-        assert "canonical median of" in body
-        assert "Current leaderboard score" in body
-        assert "initial quorum aggregate" in body
-        assert "mean of the initial three scores" in body
-        assert "full cohort wave" in body
-        assert "continually adjusts up or down" in body
-        # The per-sample dot plot was a debugging view; the row now carries the
-        # seed-round count and keeps the mean's composition in the tooltip.
-        assert "function continualVarianceSvg(e)" not in body
-        assert "Score observations: initial quorum" not in body
-        assert "continual-retest seed " in body
-        assert 'class="rollout-chip settled seed-rounds-chip tip"' in body
-        assert "benchmarkVersionKey(pipeline.active_bench_version)" in body
-        assert "cohortMedian(cohort.scores)" in body
-        assert "pipeline.score_count) + ' of ' + esc(pipeline.quorum)" not in body
-        assert "pipeline.final_composite" not in body
-        assert "Per-question results" in body
-        assert "casesSection(score)" in body
-        assert "casesSection(s)" in body
-        assert "Provisional score " in body
-        assert "Provisional scores may change" in body
-        assert "final median is authoritative" in body
-        assert "No validator score has been accepted yet." in body
-        assert "initial quorum aggregate: ' + fx(median)" in body
-        assert "median of " in body
-        assert "score.reproduction_command" in body
-        assert "score.verification_command" in body
-        assert "score.dataset_sha256" in body
-        assert 'copyButton(score.seed, "benchmark seed")' in body
-        assert 'copyButton(score.reproduction_command, "dataset command")' in body
-        assert "esc(score.reproduction_command)" in body
-        assert "esc(score.verification_command)" in body
-        assert 'class="run-telemetry-load"' in body
-        assert "function loadRunTelemetry(button)" in body
-        assert "function renderRunTelemetry(transcript)" in body
-        assert "TRANSCRIPT_TELEMETRY_URL_TEMPLATE" in body
-        assert "telemetry.source_sha256 !== sha256" in body
-        assert "Run telemetry could not be verified or loaded." in body
-        assert "Per-question execution" in body
-        assert "Model relay:" in body
-        assert "caller_cancellations" in body
-        assert "infrastructure_failures" in body
-        assert "caseEntry.response" not in body
-        assert "caseEntry.error" not in body
-        assert (
-            "Derived from an on-chain block hash after submission commitment." in body
-        )
-        assert "random fallback after submission commitment" in body
-        assert "per-submission dataset pinning was not enabled" in body
-        assert "before per-submission dataset pinning was enabled" in body
-        assert "already-submitted artifact" in body
-        assert "validator is assigned; its score is pending" in body
-        assert "Score pending" in body
-        assert "has this assignment" in body
-        assert 'reopened: "Review reopened"' in body
-        assert '"Initial comparison"' in body
-        assert "screening_reason" in body
-        assert '<details class="old-screeners">' in body
-        assert "Old screener results" in body
-        assert "Screener result" in body
-        assert "Released from quarantine" in body
-        assert "a.quarantine_resolution_reason" in body
-        assert "esc(a.quarantine_resolution_reason)" in body
-        assert "Operator reason:" in body
-        assert "Sent for rescreening" in body
-        assert "Rejected after quarantine" in body
-        assert 'return ["Quarantined", "warn"]' in body
-        assert "a.quarantine_resolved_at || a.finished_at || a.started_at" in body
-        assert "Lease expired" not in body
-        assert "System failure" not in body
-        assert 'role === "validator" ? "Assignment expired" : "Expired"' in body
-        assert "Validator took too long to post a score." in body
-        assert "Another validator will score you soon." in body
-        assert 'class="retry-info" role="img" tabindex="0"' in body
-        assert 'data-tooltip="' in body
-        assert "validatorRetryInfo(a.actively_running" in body
-        assert 'failed: ["Could not complete", "warn"]' in body
-        assert 'class="pipeline-summary"' in body
-        assert 'class="pipeline-key-facts"' in body
-        assert 'class="pipeline-meta-list"' in body
-        assert 'class="pipeline-history"' in body
-        assert 'class="pipeline-detail-state"' in body
-        assert 'style="margin-top:18px">Validator progress' not in body
-        assert "Dispute screening decision" in body
-        assert "one private dispute" in body
-        assert "cannot be edited or replaced" in body
-        assert "ditto-dispute-v1:" in body
-        assert 'id="screening-dispute-wallet"' in body
-        assert 'id="screening-dispute-hotkey"' in body
-        assert "Ready-to-run btcli command" in body
-        assert "btcli wallet sign --wallet-name" in body
-        assert '" --wallet-hotkey "' in body
-        assert '" --use-hotkey --message "' in body
-        assert '" --json-output"' in body
-        assert 'data-copy-label="btcli signing command"' in body
-        assert "Wallet details stay in this browser and are not submitted." in body
-        assert 'maxlength="1000"' in body
-        assert 'maxlength="128"' in body
-        assert 'pattern="[0-9a-fA-F]{128}"' in body
-        assert 'postJSON("/public/agent/"' in body
-        assert "renderScreeningDispute(pipeline)" in body
-        assert "Your one dispute was submitted" in body
-        assert "private message" in body
-
-    async def test_includes_off_network_harness_memory_comparison(self) -> None:
+    async def test_unhashed_asset_is_cached_for_a_day(self) -> None:
+        # public/ passthrough files (the og:image PNG) keep their names, so
+        # they only get a day.
         app = create_api_server(make_api_server_config(dashboard_enabled=True))
-        body = (await _get(app, "/")).text
+        resp = await _get(app, "/assets/paperditto-512.png")
+        assert resp.status_code == 200
+        assert resp.headers["content-type"] == "image/png"
+        assert resp.headers["Cache-Control"] == "public, max-age=86400"
+        assert resp.content.startswith(b"\x89PNG\r\n\x1a\n")
 
-        overview_start = body.index(
-            '<section class="page active" data-page="overview">'
-        )
-        benchmark_start = body.index('<section class="page" data-page="benchmark">')
-        comparison_start = body.index('<section class="harness-comparison"')
-        # The timeline leads the overview now; it is no longer on the benchmark
-        # page it used to sit at the bottom of.
-        assert overview_start < comparison_start < benchmark_start
-        assert 'id="harness-comparison-title">How far miners have taken memory' in body
-        assert 'data-tooltip="This isolates memory performance.' in body
-        assert 'id="third-party-harness-filter"' not in body
-        assert '<details class="harness-comparison-method">' in body
-        assert "Method and comparability caveats" in body
-        assert "Hermes Agent and OpenClaw measured retrospectively" in body
-        assert "var THIRD_PARTY_HARNESSES = [{" in body
-        assert 'profile: "Native SessionDB session_search"' in body
-        assert 'model: "qwen/qwen3-32b"' in body
-        assert 'route: "OpenRouter · Nebius pinned"' in body
-        assert 'seed: "3058240546919425205"' in body
-        assert 'getJSON("/public/bench/timeline")' in body
-        assert 'class="memory-timeline-svg"' in body
-        assert 'class="timeline-path miner"' in body
-        assert 'class="timeline-release"' in body
-        assert 'class="timeline-data-details"' in body
-        assert "Exact timeline data" in body
-        assert "Their points are positioned in each immutable contract's band" in body
-        assert "v4 corrects v3 false positives" in body
-        assert "Third-party harnesses never enter score rank, KOTH" in body
-        assert "validator weights, or payouts." in body
-        assert 'subject: "OpenClaw 2026.7.1"' in body
-        assert 'profile: "Native memory-core FTS · 20-result recall"' in body
-        assert 'runId: "34178537-0529-48d8-8421-8b7c566db2d4"' in body
-        assert "memoryMean: 0.13636363636363635" in body
-        assert 'runId: "dd651606-bcfd-4ed8-83ae-926a0a19ee6b"' in body
-        assert "memoryMean: 0.22601010101010102" in body
-        assert 'model: "openai/gpt-oss-20b"' in body
-        assert 'route: "OpenRouter · aggregate throughput"' in body
-        assert "point.measuredAt || evidence.measuredAt" in body
-        assert "THIRD_PARTY_HARNESSES.map(function (evidence)" in body
-        assert "Hermes Agent evidence ↗" not in body
-        assert "esc(evidence.label) + ' evidence ↗</a>'" in body
-        assert "memory-chart-row" not in body
-        # The kicker above the title was dropped.
-        assert "Reference only · no emissions" not in body
-
-    async def test_overview_shows_the_full_board_without_a_disclosure(
-        self,
-    ) -> None:
-        """Standings are never hidden behind a click, wherever the board lives.
-
-        ditto-platform#383 collapsed the nine-column table behind a <details>;
-        that stays banned. The overview now runs a two-pane layout with a
-        compact board, and the full column set has a dedicated Leaderboard
-        page — compactness through a second surface, not through disclosure.
-        """
+    async def test_missing_asset_returns_404(self) -> None:
         app = create_api_server(make_api_server_config(dashboard_enabled=True))
-        body = (await _get(app, "/")).text
+        resp = await _get(app, "/assets/index-Zz99Yy88.js")
+        assert resp.status_code == 404
 
-        # The overview pairs a context rail with a compact board, and the full
-        # board lives on its own page; nothing is wrapped in a disclosure.
-        assert '<div class="overview-split">' in body
-        assert '<aside class="board-rail"' not in body
-        assert '<details class="board-full">' not in body
-        # The dedicated page restores every column the compact view hides.
-        assert (
-            '.page[data-page="leaderboard"] #board .hide-md,\n'
-            '    .page[data-page="leaderboard"] #board .hide-sm '
-            "{ display: table-cell; }" in body
-        )
-
-        # The strips that report emissions and the live rollout stay unwrapped,
-        # as closing context below the board.
-        board = body.index('<div class="board" tabindex="0"')
-        for marker in (
-            '<div class="emissions-strip" id="emissions-strip"',
-            '<div class="rollout-strip" id="rollout-strip"',
-            'id="leaderboard-notice"',
-        ):
-            assert marker in body
-            assert body.index(marker) > board
-        assert 'id="leaderboard-version-pills"' in body
-
-        # The columns the rail dropped are still column headers.
-        for sort_key in (
-            "rank",
-            "name",
-            "bench",
-            "composite",
-            "tool",
-            "memory",
-            "latency",
-            "first_seen",
-        ):
-            assert f'data-sort="{sort_key}"' in body
-        assert 'id="emissions-col-tip"' in body
-
-    async def test_leaderboard_carries_a_filter_over_name_uid_and_hotkey(
-        self,
-    ) -> None:
-        """The one capability worth keeping from #383's rail.
-
-        Filtering narrows the table in place, which the shell's global search
-        does not do: that jumps to a single record.
-        """
+    @pytest.mark.parametrize(
+        "path",
+        [
+            # Plain dot segments (normalized away by well-behaved clients,
+            # contained by the route for everyone else) and encoded variants
+            # that reach the handler with ".." in the decoded asset path.
+            "/assets/../index.html",
+            "/assets/..%2Findex.html",
+            "/assets/%2e%2e/index.html",
+        ],
+    )
+    async def test_traversal_attempt_returns_404(self, path: str) -> None:
+        # dist/index.html exists right outside assets/, so a containment miss
+        # would serve it; the route must 404 instead.
         app = create_api_server(make_api_server_config(dashboard_enabled=True))
-        body = (await _get(app, "/")).text
+        resp = await _get(app, path)
+        assert resp.status_code == 404
 
-        assert 'id="board-filter"' in body
-        assert 'id="board-filter-clear"' in body
-        assert "function boardMatches(entry, needle)" in body
-        assert "boardView.query.trim().toLowerCase()" in body
-        # The filter drives the same rows the tabs, pager, and counts describe.
-        assert "return boardMatches(e, needle);" in body
-        # A narrowed list rarely contains the page you were on.
-        assert "boardView.page = 1;" in body
-        assert "No miner matches that filter." in body
-        # It lives on the board's own toolbar, not in a sidebar.
-        assert '<div class="board-toolbar">' in body
 
-    async def test_memory_timeline_plots_the_field_and_crowns_the_champion(
-        self,
-    ) -> None:
+@pytest.mark.usefixtures("missing_dist")
+class TestDashboardMissingBuild:
+    """A checkout without ``dashboard/dist`` serves the API only."""
+
+    async def test_missing_build_serves_api_only(self) -> None:
         app = create_api_server(make_api_server_config(dashboard_enabled=True))
-        body = (await _get(app, "/")).text
-
-        # Every finalized run per contract, from the existing per-version board.
-        assert 'getJSON("/public/leaderboard?bench_version=" + version)' in body
-        assert 'class="timeline-field' in body
-        # Settled contracts are immutable, so only the newest board refetches.
-        assert "!memoryFieldByVersion[version] || version === activeVersion" in body
-        # The champion is the state the chart exists to show.
-        assert 'class="timeline-champion-plate"' in body
-        assert 'class="timeline-champion-halo"' in body
-        assert "lastEmissions ? lastEmissions.champion_miner_hotkey : null" in body
-        # Its label stays in a reserved gutter instead of masking chart data.
-        assert "var plateY = top - plateH - 5;" in body
-        # Contracts are banded, not spaced by wall clock.
-        assert "var bandWidth = plotWidth / eras.length;" in body
-        assert "Each contract gets an equal band, not equal clock time" in body
-        # The ordinal generation ramp, interpolated between two theme-aware ends.
-        assert "color-mix(in oklch, var(--era-to) " in body
-        assert "--era-from: oklch(" in body
-        # The viewBox is measured so type keeps its real size on a phone.
-        assert "var measured = Math.round((target.clientWidth || 960) - 2);" in body
-        assert "new ResizeObserver(function (entries) {" in body
-        # A reveal must enhance an already-visible default.
-        assert "@keyframes timeline-dot-in { from { opacity: 0;" in body
-        assert ".timeline-champion-pulse { display: none; }" in body
-
-    async def test_memory_timeline_names_the_gaps_instead_of_implying_data(
-        self,
-    ) -> None:
-        """A contract can outrun both the reference runs and its own rollout.
-
-        Neither may be papered over. A reference line that simply stops reads as
-        a third-party baseline collapsing to zero, and a band drawn like every
-        settled one implies a rank that can no longer move. Both states are
-        derived from data — the harness records and /public/bench/rollout — so a
-        later contract inherits the treatment without another edit here.
-        """
-        app = create_api_server(make_api_server_config(dashboard_enabled=True))
-        body = (await _get(app, "/")).text
-
-        # Which contracts a reference harness covers comes from its own points,
-        # never from a hardcoded version.
-        assert "function harnessUnmeasuredVersions(evidence, shownVersions)" in body
-        assert "unmeasured: harnessUnmeasuredVersions(evidence, shownVersions)" in body
-        # The gap is stated on the plot, in the legend, in the caption, and in
-        # the exact-data table — not left as blank space.
-        assert 'class="timeline-unmeasured"' in body
-        assert '"not yet measured"' in body
-        assert "' <em>· not on ' + esc(versionList(series.unmeasured))" in body
-        assert "not a score of zero" in body
-        assert 'measured: "not yet measured", score: null' in body
-        # The line ends deliberately rather than trailing off.
-        assert 'class="timeline-series-end ' in body
-        # Nothing is ever drawn across a contract with no measurement.
-        assert "harnessMeasuredVersions" in body
-
-        # An unsettled rollout borrows the rollout strip's own status word and
-        # accent rather than inventing a second vocabulary for the same state.
-        assert ".timeline-band.open { fill: color-mix(in oklch, var(--accent-2)" in body
-        assert 'rolloutStatus !== "activated" && rolloutStatus !== "superseded"' in body
-        assert '(era.open ? " collecting" : "")' in body
-        assert "rollout still collecting" in body
-        # Provisional runs stay off the plot but are counted, so a band that can
-        # still change never looks complete.
-        assert "return entry.finalized === false;" in body
-        assert "awaiting quorum" in body
-        assert "a rank here can never move retroactively" in body
-
-    async def test_memory_timeline_window_is_not_pinned_to_a_bench_version(
-        self,
-    ) -> None:
-        app = create_api_server(make_api_server_config(dashboard_enabled=True))
-        body = (await _get(app, "/")).text
-
-        # The bands are whatever the timeline endpoint returns, windowed by
-        # count. No version literal decides what is drawn.
-        assert "var releases = allReleases.slice(-TIMELINE_MAX_ERAS);" in body
-        assert "var TIMELINE_MAX_ERAS = 6;" in body
-        assert "Number(release.bench_version) >= 2" in body
-        for version in range(3, 12):
-            assert f"bench_version === {version}" not in body
-            assert f"version === {version}" not in body
-
-    async def test_api_failures_do_not_render_sample_data(self) -> None:
-        app = create_api_server(make_api_server_config(dashboard_enabled=True))
-        body = (await _get(app, "/")).text
-
-        assert "var SAMPLE" not in body
-        assert "SAMPLE_HEALTH" not in body
-        assert "render(SAMPLE" not in body
-        assert "function renderLeaderboardUnavailable()" in body
-        assert "function renderHealthUnavailable()" in body
-        assert "<b>Live data unavailable.</b>" in body
-        assert "No example data is shown." in body
-        assert (
-            "Promise.allSettled([getJSON(leaderboardPath), "
-            'getJSON("/public/weights"), getJSON("/public/bench/rollout")])' in body
+        assert (await _get(app, "/")).status_code == 404
+        assert (await _get(app, "/assets/index-Ab12Cd34.js")).status_code == 404
+        # The API itself is unaffected by the absent build.
+        assert any(
+            getattr(r, "path", None) == "/api/v1/public/leaderboard" for r in app.routes
         )
-        assert "lastLeaderboardData = null;" in body
-        assert 'setStatus("error", "Data unavailable");' in body
-        assert "renderLeaderboardUnavailable();" in body
-        assert ".catch(function () { renderHealthUnavailable(); });" in body
-
-    async def test_includes_public_miner_facing_ath_review_queue(self) -> None:
-        app = create_api_server(make_api_server_config(dashboard_enabled=True))
-        body = (await _get(app, "/")).text
-
-        assert 'href="#/reviews" data-page="reviews"' in body
-        assert '<section class="page" data-page="reviews">' in body
-        assert "High scores get a second look." in body
-        assert "Recorded scores stay preserved" in body
-        assert "emission eligibility pauses" in body
-        assert "A clear restores eligibility" in body
-        assert "A fresh evaluation replaces the held result" in body
-        assert 'id="ath-review-list" class="ath-review-list" aria-live="polite"' in body
-        assert 'id="ath-review-state" class="ath-state"' in body
-        assert "No active ATH reviews." in body
-        assert "Could not load active reviews." in body
-        assert "Cached snapshot" in body
-        assert "Refresh failed · showing last public snapshot" in body
-        assert 'var path = "/public/activity?review=ath&status=' in body
-        assert 'under_review&limit=200&page=1"' in body
-        assert "return poolMap(pageNumbers, 4, function (pageNumber) {" in body
-        assert 'return getJSON(path.replace("page=1", "page=" + pageNumber));' in body
-        assert "entry.review_opened_at" in body
-        assert 'reopened: "Review reopened"' in body
-        assert 'cleared: "Review cleared"' in body
-        assert 'rejected: "Review rejected"' in body
-        assert "reviewEvidenceText(e)" in body
-        assert "reviewEvidenceHtml(e)" in body
-        assert "Current operator reason" in body
-        assert "Initial hold reason" in body
-        assert "entry.preserved_composite" in body
-        assert 'copyButton(hotkey, "miner hotkey")' in body
-        assert 'entityAnchor("agent", agentId' in body
-        assert 'entityAnchor("miner", hotkey' in body
-        assert "Authorization" not in body
-        assert "/admin/copy-reviews" not in body
-
-    async def test_includes_server_backed_submission_quick_filters(self) -> None:
-        app = create_api_server(make_api_server_config(dashboard_enabled=True))
-        body = (await _get(app, "/")).text
-        assert 'aria-label="Quick submission filters"' in body
-        assert 'data-activity-filter="all" aria-pressed="true"' in body
-        assert 'data-activity-filter="rejected" aria-pressed="false"' in body
-        assert 'data-activity-filter="under_review" aria-pressed="false"' in body
-        assert "Integrity review" in body
-        assert 'data-activity-filter="waiting_validator" aria-pressed="false"' in body
-        assert 'data-activity-filter="queued" aria-pressed="false"' in body
-        assert (
-            'waiting_screening", "screening", "waiting_validator", "below_score_floor'
-            in body
-        )
-        assert 'below_score_floor: ["Low-priority completion", "warn"]' in body
-        assert 'not_queued: ["Historical · not queued", ""]' in body
-        assert 'retired: ["Retired · earlier benchmark", ""]' in body
-        assert 'under_review: ["Source integrity review", "warn"]' in body
-        assert '"below_score_floor", "not_queued", "retired", "under_review"' in body
-        assert "var provisionalScores = e.provisional_scores || [];" in body
-        assert "if (!provisionalScores.length || !Number.isFinite(scoreFloor))" in body
-        assert (
-            "Two accepted scores are below the current same-benchmark score floor."
-            in body
-        )
-        assert "The final score is still queued" in body
-        assert "The third score is still queued at low priority" in body
-        assert (
-            "Automated processing is paused while an operator reviews this submission."
-            in body
-        )
-        assert "No screener or validator is currently working on it." in body
-        assert 'id="activity-clear" type="button" hidden' in body
-        assert 'id="activity-filter-summary" role="status" aria-live="polite"' in body
-        assert 'query.append("status", status)' in body
-        assert 'if (activityQuery) query.set("q", activityQuery)' in body
-        assert "getJSON(activityRequestPath(page))" in body
-        assert "activityPage = 1;" in body
-        assert "No submissions match these filters." in body
-        assert "Could not load submissions. Try again." in body
-
-    async def test_score_floor_message_attributes_the_number_it_quotes(
-        self,
-    ) -> None:
-        """The low-priority explanation has to be falsifiable from public data.
-
-        It used to say "below the current fifth-place score of 0.886", which a
-        miner could not check: the floor was the fifth-highest ``composite``
-        while the leaderboard's rank column orders by ``official_composite``, so
-        the row displayed at rank 5 was routinely a different agent with a
-        different number. Both readings were live and they disagreed, which is
-        what generated the support report.
-
-        Both surfaces now cut with the one canonical ordering
-        (:mod:`ditto.score_order`) on ``official_composite``, so the copy must
-        say so and must still name the holder -- the number is only checkable if
-        the miner knows whose submission to open.
-        """
-        app = create_api_server(make_api_server_config(dashboard_enabled=True))
-        body = (await _get(app, "/")).text
-
-        # The unfalsifiable phrasing must not come back.
-        assert "fifth-place score of" not in body
-        assert "the current fifth-place score" not in body
-
-        assert "function scoreFloorAttribution(e) {" in body
-        assert (
-            '"That floor is the 5th-highest finalized official_composite" + where'
-            in body
-        )
-        assert "the same score and the same ordering the leaderboard ranks by" in body
-        assert 'if (!e.score_floor_agent_id) return basis + ".";' in body
-        assert (
-            "agentLabel(e.score_floor_agent_name, e.score_floor_agent_version)" in body
-        )
-        assert "Open that submission to read the same number back." in body
-        # The retired claim -- true only while the two surfaces used different
-        # orderings -- must not survive the unification that made it false.
-        assert "can belong to a different agent" not in body
-
-        # Both surfaces that quote the floor go through the same attribution.
-        assert (
-            'fx(bestPossible) + ", below the continuation floor of " '
-            '+ fx(scoreFloor) + ". " +' in body
-        )
-        assert "          scoreFloorAttribution(e) +" in body
-        assert (
-            'the best reachable median is below the continuation floor. " '
-            '+ scoreFloorAttribution(pipeline) + " This result remains provisional'
-            in body
-        )
-        assert "The third score is still queued at low priority" in body
-
-    async def test_submission_filters_and_page_restore_and_sanitize_the_url(
-        self,
-    ) -> None:
-        app = create_api_server(make_api_server_config(dashboard_enabled=True))
-        body = (await _get(app, "/")).text
-        assert "function restoreActivityUrl()" in body
-        # Filters live in the hash query; legacy real-query filters are honored
-        # once and normalized into the hash form.
-        assert "var hashQuery = parseHashRoute().query" in body
-        assert "var legacy = !hasIn(hashQuery) && hasIn(searchQuery)" in body
-        assert 'source.getAll("status")' in body
-        assert "ACTIVITY_STATUSES.indexOf(value) >= 0" in body
-        assert "function writeActivityUrl(push)" in body
-        assert 'query.append("status", status)' in body
-        assert 'query.set("q", activityQuery)' in body
-        assert 'source.get("page")' in body
-        assert "/^[1-9][0-9]*$/.test(requestedPage)" in body
-        assert "Number.isSafeInteger(parsedPage)" in body
-        assert 'query.set("page", String(activityPage))' in body
-        assert 'query.delete("page")' in body
-        assert "spaHref(page, query)" in body
-        assert (
-            "function navigateActivityPage(page, anchor, push, userInitiated)" in body
-        )
-        assert "navigateActivityPage(activityPage - 1, control, true, true)" in body
-        assert "navigateActivityPage(activityPage + 1, control, true, true)" in body
-        assert (
-            "navigateActivityPage(Math.max(1, data.total_pages), anchor, false, "
-            "userInitiated === true)" in body
-        )
-        assert 'history[push ? "pushState" : "replaceState"]' in body
-        assert 'window.addEventListener("popstate"' in body
-        assert "if (activityUrlWasSanitized) writeActivityUrl(false)" in body
-        assert "searchInput.value = activityQuery" in body
-        assert "loadActivity(activityPage, null, true)" in body
-
-    async def test_submission_filters_are_mobile_and_keyboard_accessible(self) -> None:
-        app = create_api_server(make_api_server_config(dashboard_enabled=True))
-        body = (await _get(app, "/")).text
-        assert '.activity-filter[aria-pressed="true"]' in body
-        assert ".activity-filter { min-height: 44px; }" in body
-        assert ".activity-filter-list { width: 100%; }" in body
-        assert ".activity-table-frame { min-width: 680px; }" in body
-        assert (
-            'button.setAttribute("aria-pressed", selected ? "true" : "false")' in body
-        )
-        assert "[data-activity-filter]" in body
-        assert ":focus-visible { outline: 2px solid var(--focus)" in body
-
-    async def test_explains_policy_rescreen_from_public_activity_state(self) -> None:
-        app = create_api_server(make_api_server_config(dashboard_enabled=True))
-        body = (await _get(app, "/")).text
-        assert 'id="rescreen-notice"' in body
-        assert 'id="rescreen-count"' in body
-        assert 'id="rescreen-scored"' in body
-        assert "function renderPolicyRescreenNotice(entries, unavailable)" in body
-        assert (
-            'entry.status === "waiting_screening" || entry.status === "screening"'
-            in body
-        )
-        assert "completed < required" in body
-        assert "Number(entry.screening_policy_version) > 0" in body
-        assert "Prior scores remain preserved" in body
-        assert "validators may intentionally idle" in body
-        assert "lower-score submissions clear screening" in body
-        assert "This is not data loss" in body
-        assert "policyScreeningLabel(entry)" in body
-        assert 'if (entry.screening_build_only === true) return ""' in body
-        assert "Mechanical admission · verified image" not in body
-        assert 'return "Rescreen · policy v" + completed + " → v" + required' in body
-
-    async def test_includes_accessible_fleet_status(self) -> None:
-        app = create_api_server(make_api_server_config(dashboard_enabled=True))
-        body = (await _get(app, "/")).text
-        assert "Fleet health" in body
-        assert 'id="fleet-summary"' in body
-        assert 'id="fleet-rows"' in body
-        assert 'id="fleet-retired" hidden' in body
-        assert 'id="fleet-retired-rows"' in body
-        assert "Recently offline" in body
-        assert "Heartbeat history remains visible for 24 hours" in body
-        assert 'id="show-screeners"' in body
-        assert 'type="checkbox"' in body
-        assert '<label class="fleet-toggle" for="show-screeners">' in body
-        assert '<table class="fleet-table"' in body
-        assert (
-            '<th scope="col" id="fleet-node-heading" style="width:240px">Validator</th>'
-            in body
-        )
-        assert '<th scope="col" style="width:88px">First seen</th>' in body
-        assert '<th scope="col" style="width:96px">Last heartbeat</th>' in body
-        assert '<th scope="col" style="width:100px">Status</th>' in body
-        assert '<th scope="col" style="width:88px">CPU</th>' in body
-        assert '<th scope="col" style="width:78px">Containers</th>' in body
-        assert 'showScreeners ? "Screener" : "Validator"' in body
-        assert "Missing optional telemetry is not an outage." in body
-        assert "allowlisted" not in body
-        assert 'id="fleet-count-unknown"' in body
-        assert 'getJSON("/public/operations")' in body
-        assert 'getJSON("/public/validator-names")' in body
-        assert 'getJSON("/public/screeners")' in body
-        assert 'getElementById("show-screeners").addEventListener' in body
-        assert 'showScreeners ? "Screener" : "Validator"' in body
-        assert "running_benchmark" in body
-        assert "metrics.cpu_percent >= 95" not in body
-        assert 'fleetMeter(metrics.cpu_percent, "")' in body
-        assert 'metrics.disk_percent >= 95 ? "warn" : ""' in body
-        assert "metrics.disk_percent >= 85" not in body
-        assert "privacy-note" not in body
-        assert "fleet-health-note" not in body
-        assert '" reporting " + kind' not in body
-        assert 'available + " of " + entries.length + " active " + kind' in body
-        assert 'entry.availability === "offline"' in body
-        assert "retired.hidden = !retiredEntries.length" in body
-        assert '" · " + retiredEntries.length + " inoperative"' in body
-
-    async def test_inoperative_fleet_nodes_fold_into_the_collapsible(self) -> None:
-        app = create_api_server(make_api_server_config(dashboard_enabled=True))
-        body = (await _get(app, "/")).text
-        # One offline rule for both fleets: a validator hotkey's last report is
-        # never pruned, so without the fold the table fills with dead hosts.
-        assert "var retiredEntries = allEntries.filter" in body
-        assert "showScreeners ? allEntries.filter" not in body
-        assert "retired.hidden = !retiredEntries.length" in body
-        assert "Inoperative validators" in body
-        assert 'id="fleet-retired-title"' in body
-        assert 'id="fleet-retired-note"' in body
-        assert 'id="fleet-retired-node-heading"' in body
-        # The offline window is read from the snapshot, never restated in copy.
-        assert "fleetWindowLabel(data.stale_window_seconds)" in body
-        assert "No heartbeat for over 15" not in body
-        # A folded validator keeps its badge, its drill-down and its deep link.
-        assert "function offlineAwareFleetStatus(entry)" in body
-        assert (
-            'if (entry.availability === "offline" && status[1] !== "bad") '
-            'return ["Offline", "bad"];' in body
-        )
-        assert "var status = offlineAwareFleetStatus(entry);" in body
-        assert 'data-entity-kind="validator" data-entity-id="' in body
-        assert (
-            'bindFleetRowActivation(document.getElementById("fleet-retired-rows"))'
-            in body
-        )
-        assert (
-            '"#fleet-rows tr[data-entity-id], #fleet-retired-rows tr[data-entity-id]"'
-            in body
-        )
-        assert "if (folded) folded.open = true;" in body
-        # A ledger count with no row in the open table is how a broken validator
-        # went invisible before; the closed summary names every fold reason.
-        assert 'retiredWhy.push(retiredOffline + " offline")' in body
-        assert 'retiredObsolete + " obsolete build"' in body
-
-    async def test_a_validator_that_cannot_serve_the_scored_bench_is_gated(
-        self,
-    ) -> None:
-        app = create_api_server(make_api_server_config(dashboard_enabled=True))
-        body = (await _get(app, "/")).text
-        # Obsolete software folds away with the offline nodes: the platform leases
-        # it nothing, so "Healthy · Idle" beside the working fleet was a fiction.
-        assert "function isInoperativeFleetEntry(entry)" in body
-        assert (
-            'entry.availability === "offline" || '
-            'entry.bench_serviceability === "software_obsolete"' in body
-        )
-        assert "var retiredEntries = allEntries.filter(isInoperativeFleetEntry)" in body
-        # A CURRENT validator whose scorer broke stays visible — that is an
-        # incident, not an obsolete build, and hiding it would repeat #511.
-        assert '"scorer_unverified"' in body
-        assert (
-            'entry.availability === "offline" || '
-            'entry.bench_serviceability !== "serving"' not in body
-        )
-        # Obsolete software outranks every other badge; a dead scorer keeps
-        # "Scorer down", which names the cause the bench gate only implies.
-        assert (
-            'if (entry.bench_serviceability === "software_obsolete") '
-            'return ["Obsolete build", "bad"];' in body
-        )
-        assert body.index('return ["Obsolete build", "bad"]') < body.index(
-            'return ["Scorer down", "bad"]'
-        )
-        assert body.index('return ["Scorer down", "bad"]') < body.index(
-            'return [benchGateLabel(), "bad"]'
-        )
-        assert '"No bench v" + version' in body
-        # The version comes from the snapshot that produced the verdicts.
-        assert "function activeBenchVersion()" in body
-        assert "report && Number(report.active_bench_version)" in body
-        assert '"No bench v7"' not in body
-        # The drill-down says what to do about it instead of only that it is bad.
-        assert "Benchmark eligibility" in body
-        assert '"Cannot serve " + scored + " · needs a software upgrade"' in body
-        assert '"Scorer is not advertising " + scored' in body
-
-    async def test_operations_panels_share_one_snapshot_and_show_skew(self) -> None:
-        app = create_api_server(make_api_server_config(dashboard_enabled=True))
-        body = (await _get(app, "/")).text
-        assert body.count('getJSON("/public/operations")') == 1
-        assert "data.active_bench_version" in body
-        assert "data.desired_bench_version" in body
-        assert "data.benchmark_rollout_status" in body
-        assert "function renderBenchBadge()" in body
-        assert "activeBench || currentBench" in body
-        assert "return Number(activeBench) || Number(currentBench) || null" in body
-        assert "Math.max(Number(currentBench)" not in body
-        assert '" → v" + desired + " rollout"' in body
-        assert 'getJSON("/public/validators")' not in body
-        assert 'getJSON("/public/activity?page=1&limit=200")' not in body
-        assert 'id="operations-snapshot" aria-live="polite"' in body
-        assert "Pipeline and fleet reconciled" in body
-        assert 'entry.assignment_state === "assignment_mismatch"' in body
-        assert 'entry.assignment_state === "assigning"' in body
-        assert 'entry.assignment_state === "heartbeat_stale"' in body
-        assert "VALIDATOR_TELEMETRY_GRACE_MS = 20000" in body
-        assert "function preserveTransientValidatorTelemetry(report, nowMs)" in body
-        assert "_telemetry_delayed: true" in body
-        assert "Progress update delayed" in body
-        assert 'return ["Telemetry delayed", "warn"]' in body
-        assert 'return ["Mismatch", "bad"]' in body
-        assert "counts.warning++" in body
-        assert "Assignment mismatch" in body
-        assert "Heartbeat stale" in body
-        assert "<b>Platform</b>" in body
-        assert "<b>Heartbeat</b>" in body
-
-    async def test_operations_refresh_keeps_last_successful_snapshot(self) -> None:
-        app = create_api_server(make_api_server_config(dashboard_enabled=True))
-        body = (await _get(app, "/")).text
-        match = re.search(
-            r"(function loadOperations\(\).*?\n    \})"
-            r"\n\n    function loadValidatorNames",
-            body,
-            re.DOTALL,
-        )
-        assert match is not None
-        loader = match.group(1)
-        assert "if (operationsRequest) return operationsRequest" in loader
-        assert "operationsSnapshotAt = data.generated_at || null" in loader
-        assert (
-            "pipelineLoaded && !pipelineUnavailable &&\n"
-            "              fleetReports.validators !== null && "
-            "!fleetUnavailable.validators"
-        ) in loader
-        assert "Refresh delayed · showing last reconciled snapshot" in loader
-        delayed = loader.index("Refresh delayed · showing last reconciled snapshot")
-        assert delayed < loader.index(
-            "fleetUnavailable.validators = true",
-        )
-        assert "renderPipelineBoard(null, true)" in loader
-        assert "operationsRequest = null" in loader
-        assert "operationsRefreshFailed" in body
-
-    async def test_transient_validator_telemetry_uses_a_bounded_grace(self) -> None:
-        app = create_api_server(make_api_server_config(dashboard_enabled=True))
-        body = (await _get(app, "/")).text
-        match = re.search(
-            r"(function hasBenchmarkTelemetry.*?return report;\n    \})"
-            r"\n\n    function sortFleetEntries",
-            body,
-            re.DOTALL,
-        )
-        assert match is not None
-        report = {
-            "validators": [
-                {
-                    "validator_hotkey": "validator",
-                    "active_benchmarks": [
-                        {
-                            "agent_id": "agent",
-                            "slot_id": "slot-0",
-                            "stage": "running_benchmark",
-                            "percent": 37,
-                        }
-                    ],
-                    "assigned_benchmarks": [{"agent_id": "agent", "slot_id": "slot-0"}],
-                }
-            ]
-        }
-        gap = {
-            "validators": [
-                {
-                    "validator_hotkey": "validator",
-                    "active_benchmarks": [],
-                    "assigned_benchmarks": [{"agent_id": "agent", "slot_id": "slot-0"}],
-                }
-            ]
-        }
-        script = (
-            "var VALIDATOR_TELEMETRY_GRACE_MS = 20000;\n"
-            "var validatorTelemetryCache = Object.create(null);\n"
-            + match.group(1)
-            + "\nvar first = preserveTransientValidatorTelemetry("
-            + json.dumps(report)
-            + ", 1000);"
-            + "\nvar delayed = preserveTransientValidatorTelemetry("
-            + json.dumps(gap)
-            + ", 6000);"
-            + "\nvar expired = preserveTransientValidatorTelemetry("
-            + json.dumps(gap)
-            + ", 22001);"
-            + "\nconsole.log(JSON.stringify({"
-            + "first:first, delayed:delayed, expired:expired}));"
-        )
-        result = subprocess.run(
-            ["node", "-e", script],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        observed = json.loads(result.stdout)
-        assert observed["first"]["validators"][0]["_telemetry_grace"] is False
-        assert observed["delayed"]["validators"][0]["_telemetry_grace"] is True
-        assert observed["delayed"]["validators"][0]["active_benchmarks"] == [
-            {
-                "agent_id": "agent",
-                "slot_id": "slot-0",
-                "stage": "running_benchmark",
-                "percent": 37,
-                "_telemetry_delayed": True,
-                "_telemetry_delayed_at": "1970-01-01T00:00:01.000Z",
-            }
-        ]
-        assert observed["expired"]["validators"][0]["_telemetry_grace"] is False
-        assert observed["expired"]["validators"][0]["active_benchmarks"] == []
-
-    async def test_benchmark_authority_state_never_promotes_rollout_target(
-        self,
-    ) -> None:
-        app = create_api_server(make_api_server_config(dashboard_enabled=True))
-        body = (await _get(app, "/")).text
-        match = re.search(
-            r"(function benchmarkAuthorityState\(.*?\n    \})"
-            r"\n\n    function renderBenchBadge",
-            body,
-            re.DOTALL,
-        )
-        assert match is not None
-        cases = [
-            [6, 7, "collecting"],
-            [6, 7, "blocked_ineligible"],
-            [6, 7, "activated"],
-            [6, None, "inactive"],
-        ]
-        script = (
-            match.group(1)
-            + "\nconsole.log(JSON.stringify("
-            + json.dumps(cases)
-            + ".map(function (args) { "
-            + "return benchmarkAuthorityState.apply(null, args); })));"
-        )
-        result = subprocess.run(
-            ["node", "-e", script],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        assert json.loads(result.stdout) == [
-            {"active": 6, "desired": 7, "rolling": True},
-            {"active": 6, "desired": 7, "rolling": True},
-            {"active": 6, "desired": 7, "rolling": False},
-            {"active": 6, "desired": 6, "rolling": False},
-        ]
-
-    async def test_leaderboard_state_separates_active_desired_and_history(
-        self,
-    ) -> None:
-        app = create_api_server(make_api_server_config(dashboard_enabled=True))
-        body = (await _get(app, "/")).text
-        match = re.search(
-            r"(function leaderboardBenchState\(.*?\n    \})"
-            r"\n\n    function renderBenchBadge",
-            body,
-            re.DOTALL,
-        )
-        assert match is not None
-        cases = [
-            ["authoritative", 7, 6, 7, None],
-            ["authoritative", 7, 6, 7, 7],
-            ["historical", 5, 6, 7, None],
-            ["authoritative", 6, None, None, 6],
-        ]
-        script = (
-            match.group(1)
-            + "\nconsole.log(JSON.stringify("
-            + json.dumps(cases)
-            + ".map(function (args) { "
-            + "return leaderboardBenchState.apply(null, args); })));"
-        )
-        result = subprocess.run(
-            ["node", "-e", script],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        assert json.loads(result.stdout) == [
-            {"active": 6, "desired": 7, "selected": 6},
-            {"active": 6, "desired": 7, "selected": 6},
-            {"active": 6, "desired": 7, "selected": 5},
-            {"active": None, "desired": None, "selected": 6},
-        ]
-        assert "currentBench = data.desired_bench_version" not in body
-
-    async def test_validator_progress_keeps_superseded_failures_as_history(
-        self,
-    ) -> None:
-        """A retried lease must render its real outcome, not its old failure.
-
-        ``validator_tickets`` is one mutable row per (agent, version, validator):
-        a reissue resets ``issued_at`` and bumps ``attempt_count`` while
-        ``failure_reason``/``failed_at`` are preserved as an audit trail. The
-        drawer used to let that preserved failure win outright, so a submission
-        whose three validators each failed once and then scored rendered as three
-        "Scoring run failed · deferred" rows stamped with the superseded failure
-        times -- with three accepted scores sitting above them, unexplained.
-        """
-        app = create_api_server(make_api_server_config(dashboard_enabled=True))
-        body = (await _get(app, "/")).text
-        helpers = []
-        for name in ("attemptLabel", "validatorFailureLabel", "validatorRetryInfo"):
-            match = re.search(r"(function " + name + r"\(.*?\n    \})", body, re.DOTALL)
-            assert match is not None, name
-            helpers.append(match.group(1))
-        render = re.search(
-            r"(function renderValidationAttempt\(a\) \{.*?\n      \})"
-            r"\n      var validation",
-            body,
-            re.DOTALL,
-        )
-        assert render is not None
-        cases = [
-            # The production shape: scored, carrying a failure from the lease
-            # that preceded the reissue (failed_at < issued_at).
-            {
-                "validator_hotkey": "5CqJAjSj",
-                "status": "scored",
-                "purpose": "canonical_quorum",
-                "issued_at": "2026-07-25T21:26:27Z",
-                "deadline": "2026-07-25T23:26:27Z",
-                "bench_version": 7,
-                "actively_running": False,
-                "failure_reason": "scoring_error",
-                "failed_at": "2026-07-25T20:54:41Z",
-                "attempt_count": 2,
-            },
-            # Still live and failing now: the failure IS the current state.
-            {
-                "validator_hotkey": "5CFtzzb4",
-                "status": "expired",
-                "purpose": "canonical_quorum",
-                "issued_at": "2026-07-25T20:00:00Z",
-                "deadline": "2026-07-25T22:00:00Z",
-                "bench_version": 7,
-                "actively_running": False,
-                "failure_reason": "infrastructure",
-                "failed_at": "2026-07-25T21:00:00Z",
-                "attempt_count": 1,
-            },
-            # A clean first-attempt score keeps its plain wording.
-            {
-                "validator_hotkey": "5HmP9732",
-                "status": "scored",
-                "purpose": "canonical_quorum",
-                "issued_at": "2026-07-25T20:56:19Z",
-                "deadline": "2026-07-25T22:56:19Z",
-                "bench_version": 7,
-                "actively_running": False,
-                "failure_reason": None,
-                "failed_at": None,
-                "attempt_count": 1,
-            },
-        ]
-        script = (
-            'var VALIDATOR_RETRY_EXPLANATION = "";\n'
-            "function esc(s) { return String(s == null ? '' : s); }\n"
-            "function shortKey(k) { return String(k); }\n"
-            "function relTime(t) { return 'AT:' + String(t); }\n"
-            "function entityAnchor(kind, key, text) { return esc(text); }\n"
-            "function renderBenchmarkProgress(p, f) { return ''; }\n"
-            + "\n".join(helpers)
-            + "\n"
-            + render.group(1)
-            + "\nconsole.log(JSON.stringify("
-            + json.dumps(cases)
-            + ".map(renderValidationAttempt)));"
-        )
-        result = subprocess.run(
-            ["node", "-e", script],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        retried, failing, clean = json.loads(result.stdout)
-
-        # The retried lease reports what actually happened, dated by the lease it
-        # describes -- with the old failure demoted to a trailing note.
-        assert "Score submitted" in retried
-        assert "deferred" not in retried
-        assert "submitted a score on attempt 2" in retried
-        assert "an earlier attempt reported scoring run failed" in retried
-        assert "AT:2026-07-25T21:26:27Z" in retried
-        assert "2026-07-25T20:54:41Z" not in retried
-
-        # An unsuperseded failure is untouched: still the headline, still dated
-        # by the failure itself.
-        assert "Validator infrastructure failure · deferred" in failing
-        assert "reported validator infrastructure failure" in failing
-        assert "an earlier attempt" not in failing
-        assert "AT:2026-07-25T21:00:00Z" in failing
-
-        assert "Score submitted" in clean
-        assert "on attempt" not in clean
-        assert "deferred" not in clean
-
-    async def test_includes_accessible_benchmark_progress(self) -> None:
-        app = create_api_server(make_api_server_config(dashboard_enabled=True))
-        body = (await _get(app, "/")).text
-        assert "benchmarkStageLabel" in body
-        assert "active_benchmarks" in body
-        assert "active_benchmark" in body
-        assert "progress.bench_version" in body
-        assert 'class="benchmark-version-chip"' in body
-        assert "function pipelineRescoreState(entry)" in body
-        assert " score stays live until v" in body
-        assert 'class="pipeline-qualification-badge"' in body
-        assert "Cohort → v" in body
-        assert '<progress max="100" value="' in body
-        assert "aria-label" in body
-        assert "Benchmark progress not reported" in body
-        assert "Starting benchmark · awaiting first progress" in body
-        assert "Date.now() - started < 60000" in body
-        assert "var OPS_REFRESH_MS = 5000" in body
-        assert "failed_retrying" in body
-        assert "waiting_for_relay" in body
-        assert "Waiting for relay" in body
-        assert "Scoring and finalizing" in body
-        assert "Signing and submitting result" in body
-        assert "prefers-reduced-motion" in body
-        assert "@media (forced-colors: active)" in body
-        assert "@media (max-width: 720px)" in body
-        assert 'class="fleet-work-col"' in body
-        assert "Current work" in body
-        assert "screenerStageLabel" in body
-        assert "screening_progress" in body
-        assert "Building image" in body
-        assert "L1 source review" in body
-        assert "L2/L3 deep review" in body
-        assert "source_review_" in body
-        assert "elapsedDuration" in body
-        assert "benchmark-progress-time" in body
-        assert "progress.started_at" in body
-        assert "renderPipelineScreenerProgress" in body
-        assert "activeScreenerFor" in body
-        assert "pipelineScreenerStage" in body
-        assert "renderPipelineBoard({ entries: pipelineEntries }, false)" in body
-        assert "data-started-at" in body
-        assert "active_agent_name" in body
-        assert "setInterval(updateElapsedTimes, 1000)" in body
-
-    async def test_includes_public_terminal_screening_review_cards(self) -> None:
-        app = create_api_server(make_api_server_config(dashboard_enabled=True))
-        body = (await _get(app, "/")).text
-        assert "function renderScreeningReview(attempt)" in body
-        assert "Why this submission was rejected" in body
-        assert "Source locations in the served path" in body
-        assert "Policy observations" in body
-        assert "Digest-verified public review" in body
-        assert "no source text or private challenge data" in body
-        assert "finding.reviewer_revision" in body
-        assert 'aria-label="Detailed screening rejection"' in body
-        assert ".screening-review-location code" in body
-        assert "grid-column: 1 / -1" in body
-
-    async def test_includes_copy_controls_for_operational_identifiers(self) -> None:
-        app = create_api_server(make_api_server_config(dashboard_enabled=True))
-        body = (await _get(app, "/")).text
-        assert 'id="d-hotkey-copy"' in body
-        assert 'copyButton(e.dataset_sha256, "dataset SHA-256")' in body
-        assert 'copyButton(e.agent_id, "agent ID")' in body
-        assert 'copyButton(e.miner_hotkey, "miner hotkey")' in body
-        assert 'copyButton(hotkey, singular + " hotkey")' in body
-        assert 'copyButton(s.validator_hotkey, "validator hotkey")' in body
-        assert 'id="copy-status"' in body
-        assert 'role="status"' in body
-        assert 'aria-live="polite"' in body
-        assert 'aria-describedby="copy-status"' in body
-        assert 'type="button" class="copy"' in body
-        assert 'document.addEventListener("click"' in body
-        assert 'document.addEventListener("keydown"' in body
-        assert 'ev.key !== "Enter" && ev.key !== " "' in body
-        assert 'document.execCommand("copy")' in body
-        assert "navigator.clipboard.writeText(value).catch" in body
-        assert 'btn.classList.add("failed")' in body
-        assert "Could not copy " in body
-        assert "Select the full value and copy it manually." in body
-
-    async def test_includes_miner_facing_review_details_copy(self) -> None:
-        app = create_api_server(make_api_server_config(dashboard_enabled=True))
-        body = (await _get(app, "/")).text
-
-        assert "function reviewPacket(entry)" in body
-        assert '"Please review agent " + agentId' in body
-        assert '"Name: " + name + " (" + agentVersionLabel(version) + ")"' in body
-        assert '"Miner hotkey: " + reviewPacketLine(entry.miner_hotkey)' in body
-        assert 'lines.push("Status: " + reviewPacketLine(entry.status))' in body
-        assert 'lines.push("Artifact SHA-256: "' in body
-        assert 'canonicalEntityUrl("agent", agentId)' in body
-        assert 'class="copy review-copy"' in body
-        assert body.count("reviewPacketButton(e)") == 2
-        assert 'aria-label="Copy review details"' in body
-        assert ".review-copy { width: 100%;" in body
-
-    async def test_validator_names_remain_optional_untrusted_decoration(self) -> None:
-        app = create_api_server(make_api_server_config(dashboard_enabled=True))
-        body = (await _get(app, "/")).text
-        assert "var validatorNames = {};" in body
-        assert "var validatorStakeWeights = {};" in body
-        assert "validatorNames = {};" in body
-        assert "validatorStakeWeights = {};" in body
-        assert "(data.validators || []).forEach" in body
-        assert "validatorNames[entry.validator_hotkey] = entry.display_name" in body
-        assert (
-            "validatorStakeWeights[entry.validator_hotkey] = entry.stake_weight" in body
-        )
-        assert "function sortFleetEntries(entries, singular)" in body
-        assert "return rightStake - leftStake" in body
-        assert "if (leftHotkey < rightHotkey) return -1" in body
-        assert "if (leftHotkey > rightHotkey) return 1" in body
-        assert "sortFleetEntries(data[kind] || [], singular)" in body
-        assert (
-            'var displayName = singular === "validator" ? validatorNames[hotkey]'
-            in body
-        )
-        assert "esc(displayName)" in body
-        assert "entityAnchor(singular, hotkey, shortKey(hotkey))" in body
-        assert "fleet-node-key copyable" in body
-        assert "title=\"' + esc(hotkey)" in body
-        assert 'copyButton(hotkey, singular + " hotkey")' in body
-        assert "fleetUnavailable.validators = true" in body
-
-    async def test_includes_system_and_time_aware_theme_switcher(self) -> None:
-        app = create_api_server(make_api_server_config(dashboard_enabled=True))
-        body = (await _get(app, "/")).text
-        assert 'data-theme-choice="system"' in body
-        assert 'data-theme-choice="light"' in body
-        assert 'data-theme-choice="dark"' in body
-        assert 'data-theme-choice="time"' in body
-        assert 'var STORAGE_KEY = "ditto:dashboard-theme"' in body
-        assert 'return MODES[saved] ? saved : "system"' in body
-        assert 'window.matchMedia("(prefers-color-scheme: dark)")' in body
-        assert "root.dataset.systemTheme" in body
-        assert "root.dataset.timePhase = fromHour(new Date().getHours())" in body
-        assert 'if (hour >= 5 && hour < 8) return "dawn"' in body
-        assert (
-            ".side-theme { order: 3; flex: 1 0 100%; width: 100%; min-width: 0; "
-            "margin-top: 0; }" in body
-        )
-        assert (
-            ".side-theme .theme-switch { display: grid; "
-            "grid-template-columns: repeat(4, minmax(0, 1fr)); width: 100%; }" in body
-        )
-        assert ".side-theme .theme-option { min-height: 36px;" in body
-
-    async def test_sidebar_shell_routes_every_section(self) -> None:
-        # The dashboard is a sidebar shell with hash-routed pages; the theme
-        # switcher lives in the sidebar and the leaderboard has a dedicated
-        # page alongside its compact home in the overview.
-        app = create_api_server(make_api_server_config(dashboard_enabled=True))
-        body = (await _get(app, "/")).text
-        assert '<aside class="sidebar"' in body
-        for page in (
-            "overview",
-            "leaderboard",
-            "operations",
-            "submissions",
-            "benchmark",
-        ):
-            assert f'href="#/{page}"' in body
-            assert f'data-page="{page}"' in body
-        assert 'id="leaderboard-title">Leaderboard</h2>' in body
-        assert 'id="leaderboard-page-host"' in body  # the page's portal target
-        assert 'data-theme-choice="system"' in body  # switcher still wired
-
-    async def test_advertises_public_source_repositories(self) -> None:
-        app = create_api_server(make_api_server_config(dashboard_enabled=True))
-        body = (await _get(app, "/")).text
-        assert 'aria-label="Platform source on GitHub"' in body
-        assert body.count("https://github.com/ditto-assistant/ditto-platform") == 2
-        assert "https://github.com/ditto-assistant/ditto-subnet" in body
-        assert "https://github.com/ditto-assistant/ditto-screener" in body
-        assert 'aria-label="Open-source Ditto repositories"' in body
-
-    async def test_dashboard_entities_use_query_popovers_and_pages(self) -> None:
-        app = create_api_server(make_api_server_config(dashboard_enabled=True))
-        body = (await _get(app, "/")).text
-        assert 'agents: "submissions"' in body
-        assert 'miners: "overview"' in body
-        assert 'validators: "operations"' in body
-        assert 'screeners: "operations"' in body
-        # Entity params live in the hash query; the real query carries config
-        # knobs only. Drilldowns are overlays over the current page and
-        # ENTITY_PAGES is only the cold-link fallback when no page route exists.
-        assert "query.set(ENTITY_PARAMS[plural], String(identifier))" in body
-        assert (
-            "return spaHref(page || currentPageName() || ENTITY_PAGES[plural], query)"
-            in body
-        )
-        assert "function parseHashRoute()" in body
-        assert "function configSearch()" in body
-        # Legacy real-query entity links are recognized and normalized.
-        assert "searchEntity.legacy = true" in body
-        assert (
-            'return "/" + singular + "/" + encodeURIComponent(String(identifier))'
-            in body
-        )
-        assert 'id="d-open-full"' in body
-        assert 'id="d-back-dashboard"' in body
-        assert r"/^\/(agent|miner)\/([^/]+)\/?$/" in body
-        assert "query.has(ENTITY_PARAMS[candidate])" in body
-        assert r"/^#\/(agents|miners|validators|screeners)\/([^/?#]+)\/?$/" in body
-        assert "if (entity.legacy)" in body
-        assert 'history.replaceState(history.state || {}, "", entityHref(' in body
-        assert 'data-entity-link="agent"' in body
-        assert 'entityAnchor("validator", a.validator_hotkey' in body
-        assert 'entityAnchor("screener", a.screener_hotkey' in body
-        assert 'data-entity-kind="' in body
-        assert 'history.pushState({ entity: true }, "", href)' in body
-        assert 'window.addEventListener("popstate"' in body
-        assert (
-            'showAgentRouteState(entity, "Loading submission details…", "loading")'
-            in body
-        )
-        assert '"Loading submission details…", "loading"' in body
-        assert '"Submission details are temporarily unavailable.' in body
-        assert (
-            'getJSON("/public/agent/" + encodeURIComponent(entity.id) + "/summary")'
-            in body
-        )
-        assert 'getJSON("/public/activity?page=1&limit=1&q="' not in body
-        assert "data-agent-history" in body
-        assert "Open to load the full evidence record." in body
-        assert (
-            'getJSON("/public/agent/" + encodeURIComponent(e.agent_id) + "/pipeline")'
-            in body
-        )
-        assert 'if (entity && entity.kind === "agents") return;' in body
-        assert 'target.setAttribute("aria-current", "true")' in body
-
-    async def test_mobile_sidebar_stays_below_modal(self) -> None:
-        app = create_api_server(make_api_server_config(dashboard_enabled=True))
-        body = (await _get(app, "/")).text
-        assert ".modal-back { position: fixed;" in body
-        assert "z-index: 40;" in body
-        assert "position: fixed; top: 50%; left: 50%; z-index: 50;" in body
-        assert ".sidebar { position: sticky; top: 0; z-index: 30;" in body
-
-    async def test_includes_accessible_global_search(self) -> None:
-        app = create_api_server(make_api_server_config(dashboard_enabled=True))
-        body = (await _get(app, "/")).text
-        assert 'id="global-search"' in body
-        assert 'id="search-input" type="search" role="combobox"' in body
-        assert 'aria-controls="search-results"' in body
-        assert 'id="search-results" role="listbox"' in body
-        assert 'role="option" aria-selected="false"' in body
-        assert "function searchCorpus()" in body
-        assert "pipelineEntries.forEach" in body
-        assert 'history.pushState({}, "", dashboardHref("overview"))' in body
-        assert 'history.pushState({}, "", dashboardHref("submissions"))' in body
-        assert 'event.key === "/"' in body
-        assert 'event.key.toLowerCase() === "k"' in body
-        assert 'event.key === "ArrowDown"' in body
-        assert 'event.key === "Escape"' in body
-
-    async def test_benchmark_badge_communicates_rollout_transition(self) -> None:
-        app = create_api_server(make_api_server_config(dashboard_enabled=True))
-        body = (await _get(app, "/")).text
-        assert '"DittoBench v" + active + " → v" + desired + " rollout"' in body
-        assert '"DittoBench v" + active + (benchHasOlderRuns' in body
-        assert 'currentBench + " · latest"' not in body
-
-    async def test_leaderboard_omits_tie_labels(self) -> None:
-        app = create_api_server(make_api_server_config(dashboard_enabled=True))
-        body = (await _get(app, "/")).text
-        assert "≈ tie" not in body
-        assert "function tieChip(" not in body
-
-
-class TestDashboardScoringTransparency:
-    """The SPA must not restate consensus parameters as literals.
-
-    Every number here (the incumbent margin, the champion share, the tail size,
-    the authority-switch threshold, the benchmark version) is served by the API
-    and can change without touching this file. A literal in the markup is a
-    claim that silently stops being true, which is worse than no claim at all:
-    a miner reads it as the rule they are being judged by.
-    """
-
-    async def _body(self) -> str:
-        app = create_api_server(make_api_server_config(dashboard_enabled=True))
-        return (await _get(app, "/")).text
-
-    async def test_no_hardcoded_fold_constants(self) -> None:
-        body = await self._body()
-        for literal in (
-            "2% protection margin",
-            "2% incumbent margin",
-            "receives 90% of the miner pool",
-            "up to four participation-tail recipients",
-            "up to 25 miners",
-        ):
-            assert literal not in body, f"hardcoded fold constant: {literal}"
-
-    async def test_renders_the_dethrone_floor_and_rollout_state(self) -> None:
-        body = await self._body()
-        # The score to beat is its own element, so it can be shown whether or
-        # not there is an active contest.
-        assert 'id="emissions-threshold"' in body
-        assert "Beat this to contend" in body
-        assert "var floor = champComposite + effectiveMargin" in body
-        assert "dethroneBandScale" in body
-        assert "champComposite * (1 + margin)" not in body
-        # And it is published as a floor, never as a sufficient score.
-        assert "this is a floor, not a guarantee" in body
-        # Rollout / authority state, with the threshold read from the API.
-        assert 'id="rollout-strip"' in body
-        assert "/public/bench/rollout" in body
-        assert "ranked_quorum_agents" in body
-        assert "min_ranked_quorum_agents" in body
-        assert "This rollout's bounded inherited cohort has " in body
-        assert "Number(state.cohort_size)" in body
-
-    async def test_explainer_covers_scoring_emissions_and_koth(self) -> None:
-        body = await self._body()
-        assert '<details class="bench-disclosure" id="scoring-explainer">' in body
-        assert '<details class="bench-disclosure" id="bench-setup">' in body
-        assert '<details class="bench-disclosure" id="bench-versions">' in body
-        assert '<details class="bench-disclosure" id="bench-glossary">' in body
-        assert "the active version is highlighted" in body
-        assert "var activeVersion = Number(activeBench)" in body
-        assert "var rolloutVersion = Number(desiredBench)" in body
-        assert '<span class="ver-now">active</span>' in body
-        assert '<span class="ver-next">rollout</span>' in body
-        assert "Memory cases contribute half of the unadjusted composite." in body
-        assert "Tool-use cases contribute the other half" in body
-        for heading in (
-            "What a score is.",
-            "Which runs rank.",
-            "Scores compare only within one benchmark version.",
-            "How emissions work.",
-            "How the crown changes hands.",
-            "When weights move to a new version.",
-        ):
-            assert heading in body, f"explainer is missing: {heading}"
-        assert "0.5 × tool mean + 0.5 × memory mean" in body
-        assert "token efficiency, which can remove <b>at most 10%</b>" in body
-
-    async def test_composite_detail_separates_quality_and_token_adjustments(
-        self,
-    ) -> None:
-        body = await self._body()
-        assert "Composite calculation" in body
-        assert "Tool/memory base" in body
-        assert "Benchmark quality gates" in body
-        assert "Pre-token composite" in body
-        assert "Token efficiency" in body
-        assert "token no penalty" in body
-        assert "token −" in body
-        assert "Token efficiency is separate and can never remove more than 10%" in body
-
-    async def test_benchmark_version_is_never_a_literal(self) -> None:
-        body = await self._body()
-        # The frozen-setup tag and the version-specific copy are both filled
-        # from the API; the static markup carries only a placeholder.
-        assert '<span class="tag" id="bs-version">v–</span>' in body
-        assert 'class="bv-desired"' in body
-
-    async def test_no_reference_baseline_stat(self) -> None:
-        """The stock-harness reference baseline is deliberately not published.
-
-        A single composite cannot represent that measurement honestly. The stock
-        kit's v7 calibration runs are sharply bimodal: 15 of 20 seeds score
-        conversational_sanity exactly 0.000 and land at composite 0.185-0.221,
-        while the 5 that clear the gate land at 0.344-0.450. The distribution has
-        no mass at its own mean (0.248, sd 0.087), so any one number on the card
-        would describe a run that does not exist and would misinform a reader
-        deciding whether a submission is worth making.
-
-        If a baseline is ever published again it needs to carry the shape of the
-        distribution, not a point estimate, so this guards against the stat
-        reappearing as a bare composite.
-        """
-        body = await self._body()
-        assert "REFERENCE_BASELINES" not in body
-        assert "Reference Baseline" not in body
-        assert 'id="c-baseline"' not in body
-        assert 'id="c-baseline-tip"' not in body
-        assert "reference baseline" not in body.lower()
-        assert "must beat" not in body
-
-    async def test_neighbouring_comparison_features_survive(self) -> None:
-        """Removing the baseline must not touch the features that sat near it.
-
-        The off-network harness comparison and the token-efficiency budget are
-        separate measurements that merely live beside the removed card in the
-        same file; both stay.
-        """
-        body = await self._body()
-        assert "var THIRD_PARTY_HARNESSES = [" in body
-        assert "Hermes Agent" in body
-        assert "OpenClaw" in body
-        assert "baseline_total_tokens" in body

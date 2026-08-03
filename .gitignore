@@ -38,3 +38,4 @@ docs/validator/or_gh_secrets.yml
 # scripts/update.sh resets the deploy checkout to origin, and a committed
 # override repoints prod Pylon at a nonexistent local subtensor (2026-07-16).
 docker-compose.override.yml
+dashboard-refactor-notes/

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 from dataclasses import dataclass
@@ -454,35 +455,87 @@ async def list_active_validator_work(
     cutoff: datetime,
     agent_id: UUID | None = None,
 ) -> list[ActiveValidatorWork]:
-    """Return only fresh heartbeats still bound to the exact live ticket.
+    """Return every fresh heartbeat slot still bound to a live ticket.
 
-    Protocol v4 binds the deadline cryptographically. Legacy v2/v3 rows remain
-    compatible, but only when their signed report is newer than the current ticket
-    issuance; this prevents a stale row from reviving after a same-agent requeue.
+    Protocol v10+ stores an ingest-validated capacity payload containing every
+    active slot. ``active_agent_id`` mirrors only the first slot for legacy
+    consumers, so treating it as the whole heartbeat hides concurrent work from
+    activity and pipeline projections. Match every capacity slot back to its live
+    ticket identity here. Legacy v2-v9 rows retain their deadline-bound scalar
+    progress validation so a stale heartbeat cannot revive after a requeue.
     """
-    statement = (
-        select(ValidatorHeartbeat, ValidatorTicket, Agent)
-        .join(
-            ValidatorTicket,
-            (ValidatorTicket.agent_id == ValidatorHeartbeat.active_agent_id)
-            & (ValidatorTicket.validator_hotkey == ValidatorHeartbeat.validator_hotkey),
+    heartbeat_rows = list(
+        await session.scalars(
+            select(ValidatorHeartbeat)
+            .where(
+                ValidatorHeartbeat.state == "running_benchmark",
+                ValidatorHeartbeat.seen_at >= cutoff,
+            )
+            .order_by(ValidatorHeartbeat.validator_hotkey)
         )
-        .join(Agent, Agent.agent_id == ValidatorHeartbeat.active_agent_id)
+    )
+    if not heartbeat_rows:
+        return []
+
+    hotkeys = [heartbeat.validator_hotkey for heartbeat in heartbeat_rows]
+    assignment_statement = (
+        select(ValidatorTicket, Agent)
+        .join(Agent, Agent.agent_id == ValidatorTicket.agent_id)
         .where(
-            ValidatorHeartbeat.state == "running_benchmark",
-            ValidatorHeartbeat.active_agent_id.is_not(None),
-            ValidatorHeartbeat.seen_at >= cutoff,
+            ValidatorTicket.validator_hotkey.in_(hotkeys),
             ValidatorTicket.status == TicketStatus.ISSUED,
             ValidatorTicket.deadline > now,
             Agent.status.in_(SCOREABLE_AGENT_STATUSES),
         )
-        .order_by(ValidatorHeartbeat.validator_hotkey)
     )
     if agent_id is not None:
-        statement = statement.where(ValidatorHeartbeat.active_agent_id == agent_id)
-    rows = (await session.execute(statement)).all()
+        assignment_statement = assignment_statement.where(Agent.agent_id == agent_id)
+    assignments = (await session.execute(assignment_statement)).all()
+    assignments_by_identity = {
+        (ticket.validator_hotkey, ticket.slot_id, ticket.agent_id): (ticket, agent)
+        for ticket, agent in assignments
+    }
+
     active: list[ActiveValidatorWork] = []
-    for heartbeat, ticket, agent in rows:
+    for heartbeat in heartbeat_rows:
+        capacity: BenchmarkCapacity | None = None
+        if heartbeat.protocol_version >= 10:
+            with contextlib.suppress(ValidationError):
+                capacity = BenchmarkCapacity.model_validate(
+                    heartbeat.benchmark_capacity
+                )
+        if capacity is not None:
+            for slot in sorted(capacity.active, key=lambda item: item.slot_id):
+                assignment = assignments_by_identity.get(
+                    (heartbeat.validator_hotkey, slot.slot_id, slot.agent_id)
+                )
+                if assignment is None:
+                    continue
+                ticket, agent = assignment
+                if ticket.bench_version != slot.bench_version:
+                    continue
+                active.append(
+                    ActiveValidatorWork(
+                        heartbeat=heartbeat,
+                        ticket=ticket,
+                        agent=agent,
+                        progress=slot.progress,
+                    )
+                )
+            continue
+
+        if heartbeat.active_agent_id is None:
+            continue
+        assignment = assignments_by_identity.get(
+            (
+                heartbeat.validator_hotkey,
+                "slot-0",
+                heartbeat.active_agent_id,
+            )
+        )
+        if assignment is None:
+            continue
+        ticket, agent = assignment
         progress: BenchmarkProgress | None = None
         if heartbeat.protocol_version >= 4:
             if not heartbeat.benchmark_progress_reported:
