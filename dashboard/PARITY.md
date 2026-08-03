@@ -152,3 +152,35 @@ Everything below diffs non-zero against the goldens and is deliberate.
   hid five with CSS; the SPA mounts the routed one. Visible output matches.
   One consequence worth knowing: the site footer lives inside the benchmark
   section, so it renders on that page only — as it displayed before.
+
+## Known gaps: the miner modal body
+
+The drilldown modal escaped both gates — page goldens never open it, and the
+old Python suites barely asserted it. An audit against every interaction-only
+render path in the monolith closed the validator modal (Capabilities, Stack
+identity, Component health, Assignment, evicted leases, the legacy
+single-benchmark fallback) and the miner modal's consensus block. These remain,
+ordered by user-visible impact, with the monolith line ranges to port from:
+
+| what | monolith | target |
+| --- | --- | --- |
+| "Benchmark run" stat group (KOTH emissions, revealed support, validation, registration, cases scored, ranking, median latency, benchmark version, harness model, token spend, model-use rows) | 5934–5955, 6020; `modelUseStats` 6083–6108 | `EntityPanel.tsx` `MinerSummary` (`evidence/model-use.ts` already exists) |
+| Per-category breakdown grid (~40 cells, each `title=` the category purpose) | 5959–5968, 6032 | `MinerSummary`; CSS already at `styles/widgets.css` |
+| Composite trend group (240x58 sparkline, axis bounds, run count, change row) | `trendBlock` 5763–5781, `sparkSvg` 5742–5761, 6022 | `MinerSummary`; only the 62x16 row sparkline was ported |
+| Benchmark integrity group (paraphrased cases, lexical-gap rewrites, capped tool cases, memory seeding waves) | 5971–5980, 6021 | `MinerSummary`; `IntegrityTelemetry` type already declared |
+| Quality factor detail rows (per-gate multiplier + observed + audit pairs, each label a tooltip carrying the gate's `explanation`) | `compositeCalculationBlock` 5878–5888 | `lib/scoring.ts` `compositeCalculationRows`; `quality_factors` is served but undeclared on `CompositeBreakdown` |
+| Per-question results for the miner tenant | `casesSection` 6369–6398, 6033 | `MinerSummary`; `evidence/Cases.tsx` exists, wired to the agent drawer only |
+| Submitted-source release card + download for the miner tenant | 3642–3704, 6028 | `MinerSummary`; `evidence/ArtifactRelease.tsx` exists |
+| "Copy review details" for the miner tenant | 6131–6157, 6027 | `MinerSummary`; `evidence/review-packet.ts` exists |
+| Dataset SHA-256 copy row | `shaRow` 6023–6025, 6034 | `MinerSummary`; `.sha-row` CSS has no emitter |
+| Overview group is thinner: no initial quorum median, calibration (Brier), transform robustness; the leaderboard-score row drops its retained-sample count | 5988–6016 | `MinerSummary` |
+| `COMPOSITE_CALC_NOTE` is the superseded copy | 5904 | `lib/scoring.ts` |
+| Case category labels/purposes are glossary-only; the monolith merges the glossary over a 41-entry inline table, so 18 recorded categories fall back to raw slugs and a generic tooltip (`preference` is the one with a real inline label) | `CATEGORY_LABEL` 6218–6262, `CATEGORY_PURPOSE` 6270–6320 | `evidence/Cases.tsx` — affects the agent drawer too |
+| Global search corpus omits `review_event` and `review_original_reason` | 6644 | `shell/GlobalSearch.tsx` |
+| Search field desync: pages poke `searchInput.value` directly, so the signal never updates — on a `?q=` deep link the Clear control and popover state are wrong | 6741, 10225–10226, 6591–6599 | `shell/GlobalSearch.tsx` needs a value prop |
+| Version-archive menu is not clamped to its scrolling ancestor, so on the overview split it can lose its left edge | `clampVersionArchiveMenu` 5504–5541, 5494 | `board/LeaderboardBlock.tsx` |
+
+Confirmed fully ported, for the record: the `[data-tooltip]` system, timeline
+tooltips, the search overlay's results/empty/keyboard paths, the modal shell
+chrome (focus trap, inert, Escape, full-page role swap, `#copy-status`), every
+disclosure widget, copy feedback, and the whole agent-submission drawer.
