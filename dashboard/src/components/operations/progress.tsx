@@ -36,8 +36,37 @@ export function benchmarkStageLabel(stage?: string | null): string {
  * operator to the wrong place. The validator is still heartbeating here; a
  * quiet validator shows up separately as offline or stale. */
 export function benchmarkProgressText(progress: BenchmarkProgress | null | undefined): string {
-  if (!progress || !progress.stage) return "Benchmark progress not reported";
+  if (progress?._telemetry_delayed) {
+    let lastReported =
+      progress.percent == null
+        ? benchmarkStageLabel(progress.stage)
+        : "last reported " + progress.percent + "%";
+    if (progress.completed_checks != null && progress.total_checks != null) {
+      lastReported +=
+        " · " + progress.completed_checks + " of " + progress.total_checks + " checks";
+    }
+    return "Progress update delayed · " + lastReported;
+  }
+  if (!progress || !progress.stage) {
+    // Ticket issuance and the validator's first signed slot heartbeat are
+    // separate writes. During the platform's one-minute assignment handoff
+    // grace this is an expected transition, not missing telemetry. Keep the
+    // stronger warning for a lease that remains silent past that window.
+    const started = progress?.started_at ? new Date(progress.started_at).getTime() : NaN;
+    if (Number.isFinite(started) && Date.now() - started < 60000) {
+      return "Starting benchmark · awaiting first progress";
+    }
+    return "Benchmark progress not reported";
+  }
   if (progress.stage === "failed_retrying") return "Failed · a new attempt will start shortly";
+  if (progress.stage === "waiting_for_relay") {
+    let waitingText = "Waiting for relay";
+    if (progress.percent != null) waitingText += " · benchmark " + progress.percent + "%";
+    if (progress.completed_checks != null && progress.total_checks != null) {
+      waitingText += " · " + progress.completed_checks + " of " + progress.total_checks + " checks";
+    }
+    return waitingText;
+  }
   if (progress.stalled) {
     const stalledFor = progress.started_at ? " after " + elapsedDuration(progress.started_at) : "";
     if (progress.completed_checks != null && progress.total_checks != null) {

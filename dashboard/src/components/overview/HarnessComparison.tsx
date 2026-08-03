@@ -8,6 +8,7 @@ import { For, createEffect, createMemo, createSignal, onCleanup, onMount } from 
 import type { JSX } from "solid-js";
 
 import { useEndpoint } from "../../data/useEndpoint";
+import { REFRESH_MS } from "../../lib/config";
 import type { TimelinePayload } from "../../types";
 import { Tip } from "../ui/Tooltip";
 import type { LeaderboardStore } from "../board/leaderboard-data";
@@ -24,7 +25,7 @@ import {
 
 export function HarnessComparison(props: { store: LeaderboardStore }): JSX.Element {
   const store = props.store;
-  const timeline = useEndpoint<TimelinePayload>("/public/bench/timeline");
+  const timeline = useEndpoint<TimelinePayload>("/public/bench/timeline", { pollMs: REFRESH_MS });
 
   // Last-good data survives a failed tick; only a failure with nothing to
   // show renders the explicit unavailable state (load() catch, 4728–4730).

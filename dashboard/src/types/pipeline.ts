@@ -65,11 +65,19 @@ export interface BenchmarkProgress {
   agent_id?: string | null;
   agent_name?: string | null;
   slot_id?: string | null;
+  /** Stamped client-side when a fast poll carries no telemetry for a slot the
+   * previous poll reported: the prior signed progress is preserved through a
+   * bounded grace and labeled as delayed rather than missing. */
+  _telemetry_delayed?: boolean;
+  _telemetry_delayed_at?: string | null;
 }
 
 /** One row of the operations activity feed (superset of a submission row). */
 export interface PipelineEntry extends ActivityEntry {
   last_scored_at?: string | null;
+  /** Frozen inherited-cohort rollout slot (weekend drift #623 region). */
+  queue_bench_version?: number | null;
+  rollout_position?: number | null;
   validator_queue_rank?: number | null;
   /** "exhausted" | "cooling_down" | others advance on their own. */
   retry_state?: string | null;

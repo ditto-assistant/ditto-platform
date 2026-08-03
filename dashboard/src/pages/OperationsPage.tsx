@@ -11,11 +11,16 @@ import { For, createEffect, createMemo, createSignal } from "solid-js";
 import type { JSX } from "solid-js";
 
 import { FleetLedger, FleetRow, RetiredFleetRow } from "../components/operations/FleetTable";
-import { PipelineBoard, RescreenNotice } from "../components/operations/PipelineBoard";
+import {
+  IntegrityReviewBranch,
+  PipelineBoard,
+  RescreenNotice,
+} from "../components/operations/PipelineBoard";
 import {
   fleetLedgerCounts,
   fleetWindowLabel,
   isInoperativeFleetEntry,
+  preserveTransientValidatorTelemetry,
   sortFleetEntries,
 } from "../components/operations/fleet";
 import type {
@@ -29,6 +34,7 @@ import type { PipelineEntryExt } from "../components/operations/pipeline";
 import { EmptyRow } from "../components/ui/States";
 import { useEndpoint } from "../data/useEndpoint";
 import type { ResourceState } from "../data/useEndpoint";
+import { OPS_REFRESH_MS, REFRESH_MS } from "../lib/config";
 import { relTime } from "../lib/format";
 import { entityRoute } from "../stores/routeStore";
 import type { FleetReport, OperationsPayload, ValidatorNamesPayload } from "../types/fleet";
@@ -68,15 +74,33 @@ interface FleetView {
 }
 
 export function OperationsPage(): JSX.Element {
-  const operations = useEndpoint<OperationsPayload>("/public/operations");
-  const validatorNames = useEndpoint<ValidatorNamesPayload>("/public/validator-names");
-  const screeners = useEndpoint<FleetReport>("/public/screeners");
+  const operations = useEndpoint<OperationsPayload>("/public/operations", {
+    pollMs: OPS_REFRESH_MS,
+  });
+  const validatorNames = useEndpoint<ValidatorNamesPayload>("/public/validator-names", {
+    pollMs: REFRESH_MS,
+  });
+  const screeners = useEndpoint<FleetReport>("/public/screeners", { pollMs: REFRESH_MS });
 
-  const ops = () => latest(operations);
-  const opsUnavailable = () => Boolean(operations.error());
+  // A refresh failure does not invalidate the last reconciled snapshot: every
+  // panel keeps rendering it while the next poll retries, and only the note
+  // changes. Only a cold start with no trustworthy data renders the
+  // unavailable placeholders (loadOperations catch, weekend drift 9816–9834).
+  const ops = createMemo<OperationsPayload | undefined>((prev) => latest(operations) ?? prev);
+  const refreshDelayed = () => Boolean(operations.error()) && Boolean(ops());
+  const opsUnavailable = () => Boolean(operations.error()) && !ops();
   const opsLoading = () => !ops() && !opsUnavailable();
 
   const [showScreeners, setShowScreeners] = createSignal(false);
+
+  // Applied once per payload, like the monolith's single mutation at load
+  // time: empty slots inherit their prior signed progress through the
+  // 20-second grace, stamped _telemetry_delayed.
+  const preservedValidators = createMemo(() => {
+    const report = ops()?.validators as FleetReportExt | undefined;
+    if (!report) return undefined;
+    return preserveTransientValidatorTelemetry(report, Date.now()) as FleetReportExt;
+  });
 
   // Display names / stake weights: rebuilt from scratch on every payload —
   // decoration resets on refetch, and a failed feed clears rather than
@@ -99,7 +123,7 @@ export function OperationsPage(): JSX.Element {
   // verdicts computed against it; the snapshot-level version is the fallback
   // (activeBenchVersion 8295–8298). Never a literal.
   const benchVersion = createMemo(() => {
-    const report = ops()?.validators as FleetReportExt | undefined;
+    const report = preservedValidators();
     return Number(report?.active_bench_version) || Number(ops()?.active_bench_version) || null;
   });
 
@@ -111,6 +135,10 @@ export function OperationsPage(): JSX.Element {
   // The one shared snapshot's provenance note (loadOperations 9448–9460).
   const snapshotNote = createMemo(() => {
     if (opsUnavailable()) return "Shared operations snapshot unavailable";
+    if (refreshDelayed()) {
+      const at = ops()?.generated_at;
+      return "Refresh delayed · showing last reconciled snapshot" + (at ? " · " + relTime(at) : "");
+    }
     const data = ops();
     if (!data) return "Loading one shared operations snapshot…";
     const visibleHistory =
@@ -125,9 +153,9 @@ export function OperationsPage(): JSX.Element {
     const kind = screenersShown ? ("screeners" as const) : ("validators" as const);
     const singular: FleetSingular = screenersShown ? "screener" : "validator";
     const Kind = screenersShown ? ("Screener" as const) : ("Validator" as const);
-    const report = (screenersShown ? latest(screeners) : ops()?.validators) as
-      | FleetReportExt
-      | undefined;
+    const report = screenersShown
+      ? (latest(screeners) as FleetReportExt | undefined)
+      : preservedValidators();
     const unavailable = screenersShown ? Boolean(screeners.error()) : opsUnavailable();
     const loading = !unavailable && !report;
     if (unavailable || loading) {
@@ -305,6 +333,10 @@ export function OperationsPage(): JSX.Element {
             <div class="atlas-label">
               <div>
                 <h2 class="atlas-title">Submission pipeline</h2>
+                <span class="atlas-note">
+                  Mechanical admission builds a verified image before validators. Source integrity
+                  review happens later only for qualifying or anomalous results.
+                </span>
                 <span class="atlas-note" id="operations-snapshot" aria-live="polite">
                   {snapshotNote()}
                 </span>
@@ -318,6 +350,12 @@ export function OperationsPage(): JSX.Element {
               loading={opsLoading()}
               screeners={latest(screeners) ?? null}
               activeVersion={benchVersion()}
+            />
+            <IntegrityReviewBranch
+              entries={pipelineEntries()}
+              statusCounts={statusCounts()}
+              unavailable={opsUnavailable()}
+              loading={opsLoading()}
             />
           </div>
           <FleetLedger counts={fleet().counts} />

@@ -6,6 +6,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   benchGateLabel,
+  preserveTransientValidatorTelemetry,
   cappedSlotIds,
   fleetLedgerCounts,
   fleetStatusFor,
@@ -20,7 +21,7 @@ import {
   validatorAssignmentView,
   validatorSlotIds,
 } from "./fleet";
-import type { FleetEntryExt } from "./fleet";
+import type { FleetEntryExt, ValidatorTelemetryCache } from "./fleet";
 
 describe("slots dispatch funds, not advertised capacity (#540)", () => {
   const entry: FleetEntryExt = {
@@ -260,5 +261,98 @@ describe("fleet work vocabulary", () => {
     expect(fleetWork("idle", "validator")).toEqual(["Idle", "good"]);
     expect(fleetWork(undefined, "screener")).toEqual(["Waiting for work", ""]);
     expect(fleetWork(undefined, "validator")).toEqual(["Unknown", ""]);
+  });
+});
+
+// ── Weekend drift: transient validator telemetry grace (monolith 3155–3164,
+// preserveTransientValidatorTelemetry 8458–8532; Python guard
+// test_transient_validator_telemetry_uses_a_bounded_grace) ──────────────────
+describe("transient validator telemetry uses a bounded grace", () => {
+  const T0 = 1_000_000;
+  const run = (progress: object, timeline: Array<{ at: number; slot: object | null }>) => {
+    // A fresh cache per scenario: the module default would leak state
+    // between tests exactly the way the monolith's page-lifetime cache is
+    // supposed to persist between polls.
+    const cache: ValidatorTelemetryCache = Object.create(null) as never;
+    let report: { validators: Array<Record<string, unknown>> } | null = null;
+    for (const step of timeline) {
+      report = {
+        validators: [
+          {
+            validator_hotkey: "hk-1",
+            active_benchmarks: step.slot === null ? [] : [step.slot],
+            assigned_benchmarks: [progress],
+          },
+        ],
+      };
+      preserveTransientValidatorTelemetry(report, T0 + step.at, cache);
+    }
+    return report as unknown as {
+      validators: Array<{
+        active_benchmarks: Array<Record<string, unknown>>;
+        _telemetry_grace?: boolean;
+      }>;
+    };
+  };
+  const signed = { agent_id: "agent-a", slot_id: "s1", stage: "running_benchmark", percent: 40 };
+  const empty = { agent_id: "agent-a", slot_id: "s1" };
+
+  it("preserves the last signed slot progress through a short gap", () => {
+    const report = run(signed, [
+      { at: 0, slot: signed },
+      { at: 8_000, slot: empty },
+    ]);
+    const [progress] = report.validators[0]!.active_benchmarks;
+    expect(progress!.percent).toBe(40);
+    expect(progress!._telemetry_delayed).toBe(true);
+    expect(report.validators[0]!._telemetry_grace).toBe(true);
+  });
+
+  it("turns red once the grace expires — persistent mismatch is not papered over", () => {
+    const report = run(signed, [
+      { at: 0, slot: signed },
+      { at: 25_000, slot: empty },
+    ]);
+    const [progress] = report.validators[0]!.active_benchmarks;
+    expect(progress!._telemetry_delayed).toBeUndefined();
+    expect(progress!.percent).toBeUndefined();
+    expect(report.validators[0]!._telemetry_grace).toBe(false);
+  });
+
+  it("never lends one agent's progress to a different assignment", () => {
+    const other = { agent_id: "agent-b", slot_id: "s1" };
+    const report = run(other, [
+      { at: 0, slot: signed },
+      { at: 5_000, slot: other },
+    ]);
+    const [progress] = report.validators[0]!.active_benchmarks;
+    expect(progress!._telemetry_delayed).toBeUndefined();
+    expect(progress!.agent_id).toBe("agent-b");
+  });
+
+  it("projects a still-assigned slot that vanished from active back into view", () => {
+    const report = run(signed, [
+      { at: 0, slot: signed },
+      { at: 6_000, slot: null },
+    ]);
+    const [progress] = report.validators[0]!.active_benchmarks;
+    expect(progress!.percent).toBe(40);
+    expect(progress!._telemetry_delayed).toBe(true);
+  });
+
+  it("evicts cache for validators absent from the report", () => {
+    const cache: ValidatorTelemetryCache = Object.create(null) as never;
+    preserveTransientValidatorTelemetry(
+      { validators: [{ validator_hotkey: "hk-1", active_benchmarks: [signed] }] },
+      T0,
+      cache,
+    );
+    expect(cache["hk-1"]).toBeDefined();
+    preserveTransientValidatorTelemetry(
+      { validators: [{ validator_hotkey: "hk-2", active_benchmarks: [] }] },
+      T0 + 1_000,
+      cache,
+    );
+    expect(cache["hk-1"]).toBeUndefined();
   });
 });

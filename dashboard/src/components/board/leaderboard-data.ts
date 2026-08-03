@@ -14,6 +14,7 @@ import { createMemo, createRoot } from "solid-js";
 import type { Accessor } from "solid-js";
 
 import { useEndpoint } from "../../data/useEndpoint";
+import { REFRESH_MS } from "../../lib/config";
 import type { ResourceState } from "../../data/useEndpoint";
 import { leaderboardBenchState } from "../../lib/bench-state";
 import { foldChainWeights, rankEntries, rolloutSettledView } from "../../lib/scoring";
@@ -101,9 +102,9 @@ function buildStore(): LeaderboardStore {
     (leaderboardVersionView() === "current"
       ? ""
       : "?bench_version=" + encodeURIComponent(leaderboardVersionView()));
-  const board = useEndpoint<LeaderboardPayload>(path);
-  const weights = useEndpoint<WeightsSnapshot>("/public/weights");
-  const rollout = useEndpoint<RolloutState>("/public/bench/rollout");
+  const board = useEndpoint<LeaderboardPayload>(path, { pollMs: REFRESH_MS });
+  const weights = useEndpoint<WeightsSnapshot>("/public/weights", { pollMs: REFRESH_MS });
+  const rollout = useEndpoint<RolloutState>("/public/bench/rollout", { pollMs: REFRESH_MS });
 
   const payload = createMemo<LeaderboardPayload | null>(() => safeData(board) ?? null);
   const unavailable = (): boolean => Boolean(board.error());

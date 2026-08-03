@@ -17,6 +17,9 @@ import {
 } from "./progress";
 import {
   activeScreenerFor,
+  integrityReviewReason,
+  integrityReviewView,
+  pipelineAgentVersionLabel,
   pipelineColumnViews,
   pipelineRescoreState,
   policyRescreenView,
@@ -118,12 +121,17 @@ function PipelineCard(props: {
     !queueGate();
   const rescore = () =>
     props.column === "evaluating" ? pipelineRescoreState(entry(), props.activeVersion) : null;
+  // Frozen inherited-cohort rollout position (weekend drift, 8276–8310).
+  const rolloutVersion = () => Number(entry().queue_bench_version) || null;
+  const rolloutPosition = () => Number(entry().rollout_position) || null;
   const meta = () => {
     if (
       props.column === "waiting_validator" ||
       props.column === "evaluating" ||
       entry().status === "below_score_floor"
     ) {
+      const version = rolloutVersion();
+      if (version) return "Bench v" + version + " · " + validationProgress(entry());
       const state = rescore();
       if (state) {
         return state.isQualification
@@ -173,37 +181,53 @@ function PipelineCard(props: {
       onClick={(ev) => cardClick(ev, String(entry().agent_id || ""))}
     >
       <span class="pipeline-item-heading">
-        <span class="pipeline-item-name">{agentName(entry().name)}</span>
-        <Show when={isUpNext()}>
-          <span
-            class="pipeline-next-badge"
-            title="Highest current priority; validator eligibility can vary"
-          >
-            Up next
-          </span>
-        </Show>
-        <Show when={queueGate()}>
-          {(gate) => (
-            <span class="pipeline-gate-badge" title={gate().title}>
-              {gate().label}
+        <span class="pipeline-item-identity">
+          <span class="pipeline-item-name">{agentName(entry().name)}</span>
+          <span class="pipeline-item-version">{pipelineAgentVersionLabel(entry().version)}</span>
+        </span>
+        <span class="pipeline-item-meta">{meta()}</span>
+      </span>
+      <Show when={isUpNext() || queueGate() || rolloutPosition() || rescore()?.isQualification}>
+        <span class="pipeline-item-badges">
+          <Show when={isUpNext()}>
+            <span
+              class="pipeline-next-badge"
+              title="Highest current priority; validator eligibility can vary"
+            >
+              Up next
             </span>
-          )}
-        </Show>
-        <Show when={rescore()?.isQualification}>
-          <span
-            class="pipeline-qualification-badge"
-            title="Existing score remains authoritative while this inherited cohort agent qualifies on the next benchmark"
-          >
-            Cohort → v{rescore()?.targetVersion}
-          </span>
-        </Show>
-      </span>
-      <span class="submission-version">{agentVersionLabel(entry().version)}</span>
-      <span class="pipeline-item-meta">
-        <span>{String(entry().agent_id || "").slice(0, 8)}</span>
-        <span>{meta()}</span>
-      </span>
-      <Show when={rescore()?.isQualification}>
+          </Show>
+          <Show when={queueGate()}>
+            {(gate) => (
+              <span class="pipeline-gate-badge" title={gate().title}>
+                {gate().label}
+              </span>
+            )}
+          </Show>
+          <Show when={rolloutPosition()}>
+            <span
+              class="pipeline-qualification-badge"
+              title="Frozen inherited benchmark rollout position"
+            >
+              Cohort #{rolloutPosition()} → v{rolloutVersion()}
+            </span>
+          </Show>
+          <Show when={!rolloutPosition() && rescore()?.isQualification}>
+            <span
+              class="pipeline-qualification-badge"
+              title="Existing score remains authoritative while this inherited cohort agent qualifies on the next benchmark"
+            >
+              Cohort → v{rescore()?.targetVersion}
+            </span>
+          </Show>
+        </span>
+      </Show>
+      <Show when={rolloutPosition()}>
+        <span class="pipeline-item-qualification-detail">
+          v{props.activeVersion} score stays live until v{rolloutVersion()} quorum
+        </span>
+      </Show>
+      <Show when={!rolloutPosition() && rescore()?.isQualification}>
         <span class="pipeline-item-qualification-detail">
           v{rescore()?.sourceVersion} score stays live until v{rescore()?.targetVersion} quorum
         </span>
@@ -353,5 +377,90 @@ export function PipelineBoard(props: PipelineBoardProps): JSX.Element {
         )}
       </For>
     </div>
+  );
+}
+
+/** The conditional post-scoring source-integrity branch (weekend drift
+ * #623/#635; markup 2833–2838, renderIntegrityReviewBranch 8330–8359). Only
+ * leaderboard qualifiers and robust anomaly holds enter it — the aside says
+ * so instead of implying every submission passes through review. */
+export function IntegrityReviewBranch(props: {
+  entries: PipelineEntryExt[];
+  statusCounts: Record<string, number>;
+  unavailable: boolean;
+  loading: boolean;
+}): JSX.Element {
+  const view = createMemo(() => integrityReviewView(props.entries, props.statusCounts));
+  return (
+    <aside class="pipeline-review-branch" aria-labelledby="pipeline-review-title">
+      <div>
+        <span class="pipeline-review-eyebrow">Conditional after scoring</span>
+        <strong class="pipeline-review-title" id="pipeline-review-title">
+          Source integrity review
+        </strong>
+      </div>
+      <span class="pipeline-review-count" id="pipeline-review-count">
+        {props.unavailable || props.loading ? "–" : String(view().count)}
+      </span>
+      <p class="pipeline-review-copy">
+        Only leaderboard qualifiers and robust anomaly holds enter this branch. Other admitted
+        submissions go directly through validator scoring.
+      </p>
+      <div class="pipeline-review-items" id="pipeline-review-items">
+        <Show
+          when={!props.unavailable}
+          fallback={<div class="pipeline-empty">Review state unavailable.</div>}
+        >
+          <Show when={!props.loading} fallback={<div class="pipeline-empty">Loading…</div>}>
+            <Show
+              when={view().shown.length > 0}
+              fallback={
+                <div class="pipeline-empty">No submissions are held for integrity review.</div>
+              }
+            >
+              <For each={view().shown}>
+                {(item) => (
+                  <a
+                    class="pipeline-item"
+                    href={entityHref("agent", String(item.entry.agent_id || ""))}
+                    data-entity-link="agent"
+                    data-pipeline-i={item.index}
+                    aria-label={
+                      "View " +
+                      agentName(item.entry.name) +
+                      ", " +
+                      agentVersionLabel(item.entry.version) +
+                      " integrity review details"
+                    }
+                    onClick={(ev) => cardClick(ev, String(item.entry.agent_id || ""))}
+                  >
+                    <span class="pipeline-item-heading">
+                      <span class="pipeline-item-identity">
+                        <span class="pipeline-item-name">{agentName(item.entry.name)}</span>
+                        <span class="pipeline-item-version">
+                          {pipelineAgentVersionLabel(item.entry.version)}
+                        </span>
+                      </span>
+                      <span class="pipeline-item-meta">
+                        {relTime(
+                          (item.entry as { review_opened_at?: string | null }).review_opened_at ||
+                            item.entry.submitted_at,
+                        )}
+                      </span>
+                    </span>
+                    <span class="pipeline-item-priority-detail">
+                      {integrityReviewReason(item.entry)}
+                    </span>
+                  </a>
+                )}
+              </For>
+              <Show when={view().moreCount > 0}>
+                <div class="pipeline-more">{view().moreCount} more in Activity</div>
+              </Show>
+            </Show>
+          </Show>
+        </Show>
+      </div>
+    </aside>
   );
 }

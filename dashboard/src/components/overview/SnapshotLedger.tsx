@@ -6,6 +6,7 @@ import { Show, createMemo } from "solid-js";
 import type { JSX } from "solid-js";
 
 import { useEndpoint } from "../../data/useEndpoint";
+import { REFRESH_MS } from "../../lib/config";
 import type { ResourceState } from "../../data/useEndpoint";
 import { fx, median, relTime } from "../../lib/format";
 import { displayComposite, isEligible, isFinalized } from "../../lib/scoring";
@@ -24,8 +25,8 @@ function latest<T>(resource: ResourceState<T>): T | undefined {
 
 export function SnapshotLedger(props: { store: LeaderboardStore }): JSX.Element {
   const store = props.store;
-  const health = useEndpoint<HealthPayload>("/public/health");
-  const operations = useEndpoint<OperationsPayload>("/public/operations");
+  const health = useEndpoint<HealthPayload>("/public/health", { pollMs: REFRESH_MS });
+  const operations = useEndpoint<OperationsPayload>("/public/operations", { pollMs: REFRESH_MS });
 
   const h = (): HealthPayload | undefined => latest(health);
 

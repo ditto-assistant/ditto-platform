@@ -16,6 +16,7 @@ import {
 import { changelogItems } from "../components/benchmark/docs";
 import { SiteFooter } from "../components/shell/Sidebar";
 import { useEndpoint } from "../data/useEndpoint";
+import { REFRESH_MS } from "../lib/config";
 import type { ResourceState } from "../data/useEndpoint";
 import { benchmarkDisplayVersion } from "../lib/bench-state";
 import { API_BASE } from "../lib/config";
@@ -39,8 +40,12 @@ export function BenchmarkPage(): JSX.Element {
   // by: the emissions fold from /public/leaderboard, the quorum threshold
   // from /public/bench/rollout, the frozen setup from /public/bench/config,
   // and the changelog/glossary from /public/bench/glossary.
-  const leaderboard = useEndpoint<LeaderboardPayload>("/public/leaderboard");
-  const rollout = useEndpoint<RolloutState>("/public/bench/rollout");
+  const leaderboard = useEndpoint<LeaderboardPayload>("/public/leaderboard", {
+    pollMs: REFRESH_MS,
+  });
+  const rollout = useEndpoint<RolloutState>("/public/bench/rollout", { pollMs: REFRESH_MS });
+  // bench/config is effectively static (max-age 300) and the glossary is
+  // fetched once, ever — neither polls (monolith loadGlossary 9513–9529).
   const benchConfig = useEndpoint<BenchConfigPayload>("/public/bench/config");
   const glossary = useEndpoint<GlossaryPayload>("/public/bench/glossary");
 

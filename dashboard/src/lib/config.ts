@@ -26,5 +26,5 @@ export const WANDB_URL: string =
 export const REFRESH_MS = 30_000;
 
 /** Fast-poll cadence for the shared operations snapshot while the viewer is
- * on the operations page. */
-export const OPS_REFRESH_MS = 8_000;
+ * on the operations page (8s → 5s in the weekend drift, monolith 10253). */
+export const OPS_REFRESH_MS = 5_000;

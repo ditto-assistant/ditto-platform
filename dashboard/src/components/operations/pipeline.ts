@@ -198,7 +198,7 @@ export const PIPELINE_COLUMNS: readonly PipelineColumnDef[] = [
     bodyId: "pipeline-wait-screen",
     countId: "pipeline-wait-screen-count",
     titleId: "pipeline-wait-screen-title",
-    title: "Waiting for screening",
+    title: "Waiting for admission",
     node: "1",
     empty: "No submissions waiting.",
   },
@@ -208,7 +208,7 @@ export const PIPELINE_COLUMNS: readonly PipelineColumnDef[] = [
     bodyId: "pipeline-screening",
     countId: "pipeline-screening-count",
     titleId: "pipeline-screening-title",
-    title: "Screening",
+    title: "Image build & admission",
     node: "2",
     empty: "No active screening job.",
   },
@@ -218,7 +218,7 @@ export const PIPELINE_COLUMNS: readonly PipelineColumnDef[] = [
     bodyId: "pipeline-wait-validator",
     countId: "pipeline-wait-validator-count",
     titleId: "pipeline-wait-validator-title",
-    title: "Waiting for scores",
+    title: "Waiting for validators",
     node: "3",
     empty: "No submissions waiting.",
   },
@@ -228,7 +228,7 @@ export const PIPELINE_COLUMNS: readonly PipelineColumnDef[] = [
     bodyId: "pipeline-evaluating",
     countId: "pipeline-evaluating-count",
     titleId: "pipeline-evaluating-title",
-    title: "Evaluating",
+    title: "Scoring",
     node: "4",
     empty: "No active evaluation.",
   },
@@ -238,7 +238,7 @@ export const PIPELINE_COLUMNS: readonly PipelineColumnDef[] = [
     bodyId: "pipeline-scored",
     countId: "pipeline-scored-count",
     titleId: "pipeline-scored-title",
-    title: "Recent scores",
+    title: "Scored & live",
     node: "5",
     empty: "No scores yet. Finalized agents will appear here.",
   },
@@ -325,4 +325,43 @@ export function pipelineColumnViews(
       active: indexed.length > 0,
     };
   });
+}
+
+/** Compact card version chip ("v1", "Legacy") — the aria-label keeps the long
+ * "Submission v1" form (pipelineAgentVersionLabel, drift #633). */
+export function pipelineAgentVersionLabel(version: number | string | null | undefined): string {
+  return version == null ? "Legacy" : "v" + version;
+}
+
+// ── Source integrity review branch (weekend drift: #623/#635) ───────────────
+
+export interface IntegrityReviewView {
+  /** Authoritative status_counts.under_review, falling back to the rows the
+   * activity window actually carries (renderIntegrityReviewBranch 8339–8342). */
+  count: number;
+  /** The rows shown on the board (first three). */
+  shown: IndexedEntry[];
+  /** How many more sit beyond the board's cap ("N more in Activity"). */
+  moreCount: number;
+}
+
+/** Reason line for a held submission; the fallback names the branch's two
+ * admission criteria rather than pretending to know which one fired. */
+export function integrityReviewReason(entry: PipelineEntryExt): string {
+  return entry.review_reason || entry.screening_reason || "Qualification or anomaly review";
+}
+
+export function integrityReviewView(
+  entries: PipelineEntryExt[],
+  statusCounts: Record<string, number>,
+): IntegrityReviewView {
+  const indexed: IndexedEntry[] = [];
+  entries.forEach((entry, index) => {
+    if (entry.status === "under_review") indexed.push({ entry, index });
+  });
+  return {
+    count: Number(statusCounts.under_review || indexed.length),
+    shown: indexed.slice(0, 3),
+    moreCount: Math.max(0, indexed.length - 3),
+  };
 }

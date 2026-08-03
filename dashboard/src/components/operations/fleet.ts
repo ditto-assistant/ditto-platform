@@ -6,6 +6,7 @@
 import { fleetStatus, offlineAwareFleetStatus } from "../EntityPanel";
 import { relDuration, relTimeUntil } from "../../lib/format";
 import type { FleetEntry, FleetReport } from "../../types/fleet";
+import type { BenchmarkProgress } from "../../types/pipeline";
 
 /** A slot whose lease an operator evicted while the validator's benchmark
  * container may still be executing (#537). */
@@ -390,4 +391,130 @@ export function anyBenchmarkStage(entry: FleetEntryExt): boolean {
     if (benchmarks[index] && benchmarks[index]?.stage) return true;
   }
   return !!(entry.active_benchmark && entry.active_benchmark.stage);
+}
+
+// ── Transient validator telemetry grace (weekend drift; monolith 3155–3164,
+// preserveTransientValidatorTelemetry 8458–8532) ────────────────────────────
+
+/** A validator heartbeat and the platform lease projection are separate
+ * writes: preserve the last signed per-slot progress through a few fast
+ * operations polls so a one-frame gap reads as delayed telemetry rather than
+ * a fleet-wide assignment failure. Persistent mismatches still turn red when
+ * this short grace expires. */
+export const VALIDATOR_TELEMETRY_GRACE_MS = 20000;
+
+interface SlotTelemetryPrior {
+  progress: BenchmarkProgress;
+  seenAt: number;
+}
+export type ValidatorTelemetryCache = Record<string, Record<string, SlotTelemetryPrior>>;
+
+const defaultTelemetryCache: ValidatorTelemetryCache = Object.create(null) as never;
+
+export function hasBenchmarkTelemetry(progress: BenchmarkProgress | null | undefined): boolean {
+  return Boolean(
+    progress && (progress.stage || progress.percent != null || progress.completed_checks != null),
+  );
+}
+
+function sameBenchmarkAssignment(
+  left: BenchmarkProgress | null | undefined,
+  right: BenchmarkProgress | null | undefined,
+): boolean {
+  return String(left?.agent_id || "") === String(right?.agent_id || "");
+}
+
+/** The slice of a fleet entry the grace logic reads and writes. */
+interface TelemetryCarrier {
+  validator_hotkey?: string | null;
+  active_benchmarks?: BenchmarkProgress[];
+  assigned_benchmarks?: BenchmarkProgress[];
+  _telemetry_grace?: boolean;
+}
+
+/** Mutates the report's validator entries the way the monolith did: empty
+ * slots whose prior signed progress is fresher than the grace window get that
+ * progress back, stamped `_telemetry_delayed`. The cache self-evicts slots
+ * whose assignment changed, aged out, or whose validator left the report. */
+export function preserveTransientValidatorTelemetry<
+  R extends { validators?: TelemetryCarrier[] } | null | undefined,
+>(report: R, nowMs: number, cache: ValidatorTelemetryCache = defaultTelemetryCache): R {
+  if (!report || !Array.isArray(report.validators)) return report;
+  const presentValidators: Record<string, boolean> = Object.create(null) as never;
+  report.validators.forEach((entry: TelemetryCarrier) => {
+    const hotkey = String(entry.validator_hotkey || "");
+    if (!hotkey) return;
+    presentValidators[hotkey] = true;
+    const slots = cache[hotkey] ?? (Object.create(null) as Record<string, SlotTelemetryPrior>);
+    cache[hotkey] = slots;
+    const active = Array.isArray(entry.active_benchmarks) ? entry.active_benchmarks : [];
+    const assignments = Array.isArray(entry.assigned_benchmarks) ? entry.assigned_benchmarks : [];
+    const expectedBySlot: Record<string, BenchmarkProgress> = Object.create(null) as never;
+    assignments.concat(active).forEach((progress) => {
+      if (progress) expectedBySlot[String(progress.slot_id || "slot-0")] = progress;
+    });
+    const normalized: BenchmarkProgress[] = [];
+    const renderedSlots: Record<string, boolean> = Object.create(null) as never;
+    let injected = false;
+
+    active.forEach((progress) => {
+      const slotId = String(progress.slot_id || "slot-0");
+      const prior = slots[slotId];
+      renderedSlots[slotId] = true;
+      if (hasBenchmarkTelemetry(progress)) {
+        slots[slotId] = { progress: { ...progress }, seenAt: nowMs };
+        normalized.push(progress);
+      } else if (
+        prior &&
+        sameBenchmarkAssignment(prior.progress, progress) &&
+        nowMs - prior.seenAt <= VALIDATOR_TELEMETRY_GRACE_MS
+      ) {
+        normalized.push({
+          ...prior.progress,
+          _telemetry_delayed: true,
+          _telemetry_delayed_at: new Date(prior.seenAt).toISOString(),
+        });
+        injected = true;
+      } else {
+        normalized.push(progress);
+      }
+    });
+
+    assignments.forEach((assignment) => {
+      const slotId = String(assignment.slot_id || "slot-0");
+      if (renderedSlots[slotId]) return;
+      const prior = slots[slotId];
+      if (
+        prior &&
+        sameBenchmarkAssignment(prior.progress, assignment) &&
+        nowMs - prior.seenAt <= VALIDATOR_TELEMETRY_GRACE_MS
+      ) {
+        normalized.push({
+          ...prior.progress,
+          _telemetry_delayed: true,
+          _telemetry_delayed_at: new Date(prior.seenAt).toISOString(),
+        });
+        renderedSlots[slotId] = true;
+        injected = true;
+      }
+    });
+
+    Object.keys(slots).forEach((slotId) => {
+      const prior = slots[slotId] as SlotTelemetryPrior;
+      const expected = expectedBySlot[slotId];
+      if (
+        !expected ||
+        !sameBenchmarkAssignment(prior.progress, expected) ||
+        nowMs - prior.seenAt > VALIDATOR_TELEMETRY_GRACE_MS
+      ) {
+        delete slots[slotId];
+      }
+    });
+    entry.active_benchmarks = normalized;
+    entry._telemetry_grace = injected;
+  });
+  Object.keys(cache).forEach((hotkey) => {
+    if (!presentValidators[hotkey]) delete cache[hotkey];
+  });
+  return report;
 }

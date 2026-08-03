@@ -22,7 +22,7 @@ import { GlobalSearch } from "./components/shell/GlobalSearch";
 import { Sidebar } from "./components/shell/Sidebar";
 import { UnavailableBanner } from "./components/ui/States";
 import { installTooltips } from "./components/ui/Tooltip";
-import { useEndpoint } from "./data/useEndpoint";
+import { refreshAllEndpoints, useEndpoint } from "./data/useEndpoint";
 import type { ResourceState } from "./data/useEndpoint";
 import { OPS_REFRESH_MS, REFRESH_MS } from "./lib/config";
 import { relTime } from "./lib/format";
@@ -117,6 +117,9 @@ export default function App(): JSX.Element {
   function refreshAll(): void {
     setManualRefresh(true);
     refreshTick(true);
+    // Data owned by pages and module-scope stores registers itself; the
+    // shell's refresh reaches all of it, like the monolith's single load().
+    refreshAllEndpoints();
   }
 
   createEffect(() => {

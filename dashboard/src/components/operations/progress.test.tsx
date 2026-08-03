@@ -167,3 +167,54 @@ describe("ElapsedTime", () => {
     expect(node.textContent).toBe("1h 1m 0s");
   });
 });
+
+// ── Weekend drift: delayed telemetry, assignment handoff, relay wait ────────
+// (monolith benchmarkProgressText 7028–7059; Python guard
+// test_transient_validator_telemetry_uses_a_bounded_grace's rendering half)
+describe("delayed telemetry and handoff grace (weekend drift)", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("labels preserved telemetry as delayed, carrying the last report", () => {
+    expect(
+      benchmarkProgressText({
+        stage: "running_benchmark",
+        percent: 47,
+        completed_checks: 132,
+        total_checks: 281,
+        _telemetry_delayed: true,
+      }),
+    ).toBe("Progress update delayed · last reported 47% · 132 of 281 checks");
+    expect(benchmarkProgressText({ stage: "preparing", _telemetry_delayed: true })).toBe(
+      "Progress update delayed · Preparing artifact",
+    );
+  });
+
+  it("treats a young no-stage lease as the assignment handoff, not missing telemetry", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-31T14:00:00Z"));
+    // Ticket issuance and the first signed heartbeat are separate writes: a
+    // lease under a minute old is an expected transition.
+    expect(benchmarkProgressText({ started_at: "2026-07-31T13:59:30Z" })).toBe(
+      "Starting benchmark · awaiting first progress",
+    );
+    // Past the one-minute window the stronger warning returns.
+    expect(benchmarkProgressText({ started_at: "2026-07-31T13:58:30Z" })).toBe(
+      "Benchmark progress not reported",
+    );
+    expect(benchmarkProgressText(null)).toBe("Benchmark progress not reported");
+  });
+
+  it("gives waiting_for_relay its own sentence with carried progress", () => {
+    expect(
+      benchmarkProgressText({
+        stage: "waiting_for_relay",
+        percent: 100,
+        completed_checks: 281,
+        total_checks: 281,
+      }),
+    ).toBe("Waiting for relay · benchmark 100% · 281 of 281 checks");
+    expect(benchmarkProgressText({ stage: "waiting_for_relay" })).toBe("Waiting for relay");
+  });
+});

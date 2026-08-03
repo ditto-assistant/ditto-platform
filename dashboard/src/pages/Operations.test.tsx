@@ -9,6 +9,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { syncFromLocation } from "../stores/routeStore";
+import { refreshAllEndpoints } from "../data/useEndpoint";
 import { installFixtureFetch, loadFixture } from "../test-fixtures";
 import type { OperationsPayload } from "../types/fleet";
 import { OperationsPage } from "./OperationsPage";
@@ -626,5 +627,95 @@ describe("pipeline board from the shared snapshot", () => {
   it("hides the rescreen notice when no policy rescreen is queued", async () => {
     await renderPage();
     expect((document.getElementById("rescreen-notice") as HTMLElement).hidden).toBe(true);
+  });
+});
+
+// ── Weekend drift: renamed lanes, the integrity-review branch, and the
+// last-reconciled-snapshot rule (Python guards
+// test_operations_refresh_keeps_last_successful_snapshot and the #623/#635
+// board reshape) ─────────────────────────────────────────────────────────────
+describe("weekend drift: board reshape and refresh resilience", () => {
+  it("renders the mechanical-admission lane names and the atlas explainer", async () => {
+    const { container } = render(() => <OperationsPage />);
+    await waitFor(() => {
+      expect(container.querySelector("#pipeline-wait-screen-title")?.textContent).toBe(
+        "Waiting for admission",
+      );
+    });
+    expect(container.querySelector("#pipeline-screening-title")?.textContent).toBe(
+      "Image build & admission",
+    );
+    expect(container.querySelector("#pipeline-wait-validator-title")?.textContent).toBe(
+      "Waiting for validators",
+    );
+    expect(container.querySelector("#pipeline-evaluating-title")?.textContent).toBe("Scoring");
+    expect(container.querySelector("#pipeline-scored-title")?.textContent).toBe("Scored & live");
+    expect(container.textContent).toContain(
+      "Mechanical admission builds a verified image before validators.",
+    );
+  });
+
+  it("shows the conditional integrity-review branch with the authoritative count", async () => {
+    const { container } = render(() => <OperationsPage />);
+    await waitFor(() => {
+      expect(container.querySelector("#pipeline-review-count")?.textContent).toBe("53");
+    });
+    const aside = container.querySelector(".pipeline-review-branch");
+    expect(aside?.querySelector(".pipeline-review-eyebrow")?.textContent).toBe(
+      "Conditional after scoring",
+    );
+    expect(aside?.querySelector("#pipeline-review-title")?.textContent).toBe(
+      "Source integrity review",
+    );
+    // Only qualifiers and anomaly holds enter — the copy says so, and the
+    // fixture window carries none, so the branch states that rather than
+    // implying review of everything.
+    expect(aside?.textContent).toContain("Only leaderboard qualifiers and robust anomaly holds");
+    expect(container.querySelector("#pipeline-review-items")?.textContent).toContain(
+      "No submissions are held for integrity review.",
+    );
+  });
+
+  it("keeps the last reconciled snapshot when a refresh fails", async () => {
+    const { container } = render(() => <OperationsPage />);
+    await waitFor(() => {
+      expect(text("operations-snapshot")).toContain("Pipeline and fleet reconciled");
+    });
+    const rowsBefore = container.querySelectorAll("#fleet-rows tr").length;
+    expect(rowsBefore).toBeGreaterThan(0);
+
+    // Every subsequent operations fetch fails; the board must NOT blank.
+    restoreFetch?.();
+    restoreFetch = null;
+    vi.spyOn(globalThis, "fetch").mockImplementation(() =>
+      Promise.reject(new Error("network down")),
+    );
+    refreshAllEndpoints();
+    await waitFor(() => {
+      expect(text("operations-snapshot")).toContain(
+        "Refresh delayed · showing last reconciled snapshot",
+      );
+    });
+    // A refresh failure does not invalidate the last reconciled snapshot:
+    // the fleet table and the board keep rendering it while polls retry.
+    expect(container.querySelectorAll("#fleet-rows tr").length).toBe(rowsBefore);
+    expect(container.querySelector("#pipeline-review-count")?.textContent).toBe("53");
+    expect(text("operations-snapshot")).toContain("2h ago");
+  });
+
+  it("cold-start failure still renders the unavailable placeholders", async () => {
+    restoreFetch?.();
+    restoreFetch = null;
+    vi.spyOn(globalThis, "fetch").mockImplementation(() =>
+      Promise.reject(new Error("network down")),
+    );
+    const { container } = render(() => <OperationsPage />);
+    await waitFor(() => {
+      expect(text("operations-snapshot")).toBe("Shared operations snapshot unavailable");
+    });
+    expect(container.querySelector("#pipeline-review-count")?.textContent).toBe("–");
+    expect(container.querySelector("#pipeline-review-items")?.textContent).toContain(
+      "Review state unavailable.",
+    );
   });
 });

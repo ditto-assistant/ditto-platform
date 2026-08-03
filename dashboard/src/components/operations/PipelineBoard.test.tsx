@@ -103,11 +103,11 @@ describe("the Up next badge (#458)", () => {
       ],
       { statusCounts: { waiting_validator: 3 } },
     );
+    // The compact card (#633) no longer prints the id slice; the anchor
+    // target is the stable identity.
     const ids = Array.from(
-      container.querySelectorAll(
-        "#pipeline-wait-validator .pipeline-item .pipeline-item-meta span:first-child",
-      ),
-      (el) => el.textContent,
+      container.querySelectorAll("#pipeline-wait-validator .pipeline-item"),
+      (el) => new URLSearchParams(el.getAttribute("href")?.split("?")[1]).get("agent"),
     );
     expect(ids).toEqual(["first", "second", "third"]);
   });
