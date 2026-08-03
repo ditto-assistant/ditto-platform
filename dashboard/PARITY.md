@@ -1,0 +1,104 @@
+# Parity: served-HTML assertions to vitest
+
+The pre-SPA dashboard was one `index.html`, and `ditto/tests/api_server/test_dashboard.py`
+asserted on the served markup, copy, and inline script — 52 tests, ~837
+assertions. That file was the only executable record of what the dashboard is
+supposed to show, so none of it was dropped in the port: the 11
+serving-contract tests stayed in Python (wandb injection, cache headers, 304s,
+`/assets/`, the disabled and missing-build fallbacks) and the 41 appearance
+tests moved here, translated by kind.
+
+| kind | becomes |
+| --- | --- |
+| markup (`class=`/`id=`/`data-*`) | jsdom render + DOM queries |
+| copy and rendered values | rendered-text queries |
+| inline-script source text | pure functions in `src/lib/` with behavior tests |
+| negative (`... not in body`) | DOM-absence checks, or `src/build-invariants.test.ts` when the guard is "this literal must never ship" |
+| CSS source text | assertions on the page stylesheet |
+| endpoint paths | `src/lib/api.test.ts` |
+
+Each ported test keeps the original docstring reasoning as a comment, because
+those docstrings say *which regression* the assertion exists for. Keep this
+table honest: if you move or retire one of these, edit the row.
+
+## Appearance tests
+
+| # | old test (`ditto/tests/api_server/test_dashboard.py`) | guards | now lives in |
+| --- | --- | --- | --- |
+| 1 | `test_includes_submission_pipeline` | No docstring; mega-spec of the merged Overview: family-ranked leaderboard, artifact release/download, chain observation, operations pipeline board, paged activity table + detail modal, accepted/confirmation scores, quarantine states, screening-dispute form. Inline comments guard two removals: the per-sample dot plot ("was a debugging view; the row now carries the seed-round count") and the rank-1 "Up next" badge ("Rank 1 alone must never earn the badge: a gated row can hold the head of the list while no validator is able to lease it"). No issue # cited. | src/pages/Overview.test.tsx (endpoint paths → src/lib/api.test.ts) |
+| 2 | `test_includes_off_network_harness_memory_comparison` | No docstring; comments guard that the memory timeline now leads the overview (no longer at the bottom of the benchmark page), that the harness filter and per-harness hardcoded evidence links were dropped, and that the kicker above the title was removed. Hardcoded third-party evidence (run IDs, means, models, seed) is pinned verbatim. No issue # cited. | src/pages/Overview.test.tsx (endpoint path → src/lib/api.test.ts) |
+| 3 | `test_overview_shows_the_full_board_without_a_disclosure` | "Standings are never hidden behind a click" — ditto-platform#383 collapsed the nine-column table behind a `<details>`; that stays banned. Overview is a two-pane layout with a compact board; the full column set lives on a dedicated Leaderboard page ("compactness through a second surface, not through disclosure"). | src/pages/Overview.test.tsx + src/pages/Leaderboard.test.tsx (ABSENT greps → src/build-invariants.test.ts) |
+| 4 | `test_leaderboard_carries_a_filter_over_name_uid_and_hotkey` | "The one capability worth keeping from #383's rail" — in-place table filter (vs. the shell's global search which jumps to a single record); must reset paging and live on the board toolbar, not a sidebar. | src/pages/Leaderboard.test.tsx |
+| 5 | `test_memory_timeline_plots_the_field_and_crowns_the_champion` | No docstring; comments pin: field comes from the existing per-version leaderboard; settled contracts are immutable so only the newest board refetches; champion plate is the point of the chart and its label lives in a reserved gutter; contracts are equal bands not wall-clock; measured viewBox for phone type; reveal animation must enhance an already-visible default. | src/pages/Overview.test.tsx (endpoint path → src/lib/api.test.ts) |
+| 6 | `test_memory_timeline_names_the_gaps_instead_of_implying_data` | "A contract can outrun both the reference runs and its own rollout. Neither may be papered over" — a reference line that just stops reads as a baseline collapsing to zero, and an open-rollout band drawn like a settled one implies an immovable rank. Both states are derived from data (harness records + `/public/bench/rollout`) so later contracts inherit the treatment. No issue # cited. | src/pages/Overview.test.tsx |
+| 7 | `test_memory_timeline_window_is_not_pinned_to_a_bench_version` | No docstring; comment: bands are whatever the timeline endpoint returns, windowed by count — "No version literal decides what is drawn." Guards against re-hardcoding bench versions into the chart. | src/build-invariants.test.ts (version-literal negative greps; window logic → src/pages/Overview.test.tsx) |
+| 8 | `test_api_failures_do_not_render_sample_data` | No docstring; guards that API failure renders explicit unavailable states, never demo/sample data. No issue # cited. | src/pages/Overview.test.tsx (`SAMPLE` negative greps → src/build-invariants.test.ts) |
+| 9 | `test_includes_public_miner_facing_ath_review_queue` | No docstring; specs the public `#/reviews` page: ATH-review explainer copy, live list with cached-snapshot fallback, fan-out pagination over the public activity endpoint — and that nothing admin/auth leaks onto the public page. No issue # cited. | src/pages/Reviews.test.tsx (endpoint path → src/lib/api.test.ts) |
+| 10 | `test_includes_server_backed_submission_quick_filters` | No docstring; specs server-side quick filters on the submissions table (status buttons build the query server-side; paging resets; every status has a label class), plus the below-score-floor and operator-review explanations. No issue # cited. | src/pages/Submissions.test.tsx |
+| 11 | `test_score_floor_message_attributes_the_number_it_quotes` | "The low-priority explanation has to be falsifiable from public data." Old copy said "below the current fifth-place score of 0.886" — uncheckable because the floor was 5th-highest `composite` while the rank column ordered by `official_composite`, so displayed rank 5 was routinely a different agent/number; this disagreement generated a support report. Both surfaces now cut with the one canonical ordering (`ditto.score_order`) on `official_composite`; copy must say so and name the floor holder. No issue # cited. | src/pages/Submissions.test.tsx |
+| 12 | `test_submission_filters_and_page_restore_and_sanitize_the_url` | No docstring. Guards activity filter/page state living in the hash query, one-time normalization of legacy real-query filters, page-number validation, popstate restore, and URL sanitization. | src/pages/Submissions.test.tsx |
+| 13 | `test_submission_filters_are_mobile_and_keyboard_accessible` | No docstring. Guards 44px touch targets, aria-pressed state, and focus outline on activity filter buttons. | src/pages/Submissions.test.tsx |
+| 14 | `test_explains_policy_rescreen_from_public_activity_state` | No docstring. Guards the notice explaining policy-version rescreens (screening backlog is intentional, not data loss), derived from public activity state. | src/pages/Submissions.test.tsx |
+| 15 | `test_includes_accessible_fleet_status` | No docstring. Guards the fleet health table (headings, screener toggle, offline/retired split) and the removal of privacy-leaking / hardcoded-threshold copy. | src/pages/Operations.test.tsx (endpoint paths → src/lib/api.test.ts) |
+| 16 | `test_inoperative_fleet_nodes_fold_into_the_collapsible` | Inline comments: validator last-reports are never pruned, so dead hosts must fold into a collapsible (one offline rule for both fleets); offline window read from snapshot, never restated in copy; folded validators keep badge/drill-down/deep link; closed summary names every fold reason (a ledger count with no visible row is how a broken validator went invisible before). | src/pages/Operations.test.tsx |
+| 17 | `test_a_validator_that_cannot_serve_the_scored_bench_is_gated` | Inline comments: obsolete-build validators fold away ("Healthy · Idle" beside the working fleet was a fiction) but a CURRENT validator with a broken scorer stays visible — hiding it would repeat #511; badge precedence Obsolete build > Scorer down > bench gate; bench version comes from the snapshot, never a literal. | src/pages/Operations.test.tsx |
+| 18 | `test_operations_panels_share_one_snapshot_and_show_skew` | No docstring. Guards that all operations panels consume exactly one `/public/operations` fetch (no per-panel refetches), that the bench badge never max()-promotes versions, and that platform/heartbeat assignment skew is surfaced. | src/pages/Operations.test.tsx (single-fetch + banned endpoints → src/lib/api.test.ts) |
+| 19 | `test_benchmark_authority_state_never_promotes_rollout_target` | No docstring. Extracts `benchmarkAuthorityState` from the page and executes it under node: an in-flight rollout target (desired v7) must never be reported as active — only `activated` stops `rolling`; missing desired falls back to active. | src/lib/bench-state.test.ts |
+| 20 | `test_leaderboard_state_separates_active_desired_and_history` | No docstring. Extracts `leaderboardBenchState` and executes it under node: the leaderboard's selected version must stay independent of active/desired (historical view selects 5 while active=6, desired=7), and the rollout target must never overwrite the current bench. | src/lib/bench-state.test.ts (ABSENT grep → src/build-invariants.test.ts) |
+| 21 | `test_validator_progress_keeps_superseded_failures_as_history` | Docstring: `validator_tickets` is one mutable row per (agent, version, validator); a reissue preserves `failure_reason`/`failed_at` as audit trail, and the drawer used to let that preserved failure win outright — three scored validators rendered as "Scoring run failed · deferred" stamped with superseded failure times, with three accepted scores above them unexplained. Extracts helpers + `renderValidationAttempt` and executes under node. | src/pages/Submissions.test.tsx |
+| 22 | `test_includes_accessible_benchmark_progress` | No docstring. Guards live benchmark/screening progress rendering: stage labels, version chips, rescore state, `<progress>` accessibility, reduced-motion/forced-colors/mobile media queries, and per-second elapsed timers. | src/pages/Operations.test.tsx |
+| 23 | `test_includes_public_terminal_screening_review_cards` | No docstring. Guards the public terminal-screening rejection card: findings, source locations, policy observations, digest-verified privacy framing. | src/pages/Submissions.test.tsx |
+| 24 | `test_includes_copy_controls_for_operational_identifiers` | No docstring. Guards clipboard copy buttons for hotkeys/IDs/SHA-256 with live-region status, keyboard activation, and execCommand fallback with manual-copy failure copy. | src/components/shell/CopyButton.test.tsx |
+| 25 | `test_includes_miner_facing_review_details_copy` | No docstring. Guards the one-click "review packet" text block miners paste when asking for a review (agent id, name/version, hotkey, status, artifact SHA, canonical URL), present in exactly two places. | src/pages/Submissions.test.tsx |
+| 26 | `test_validator_names_remain_optional_untrusted_decoration` | No docstring. Guards that validator display names/stake weights are optional decoration from a separate feed (reset on refetch, escaped, hotkey stays the anchor identity), fleet sorted by stake then hotkey, and unavailability flagged rather than fatal. | src/pages/Operations.test.tsx |
+| 27 | `test_includes_system_and_time_aware_theme_switcher` | No docstring. Guards the four-mode theme switcher (system/light/dark/time) with localStorage persistence, prefers-color-scheme tracking, time-phase (dawn) logic, and sidebar grid layout. | src/components/shell/ThemeSwitcher.test.tsx |
+| 28 | `test_sidebar_shell_routes_every_section` | Inline comment: dashboard is a sidebar shell with hash-routed pages; theme switcher lives in the sidebar; leaderboard has a dedicated page alongside its compact home in the overview. | src/components/shell/Sidebar.test.tsx |
+| 29 | `test_advertises_public_source_repositories` | No docstring. Guards the open-source repo links (platform twice, subnet, screener) with accessible labels. | src/components/shell/Sidebar.test.tsx |
+| 30 | `test_dashboard_entities_use_query_popovers_and_pages` | Inline comments: entity params live in the hash query (real query carries config knobs only); drilldowns are overlays over the current page; `ENTITY_PAGES` is only the cold-link fallback; legacy real-query and path-style entity links are recognized and normalized. | src/lib/entity-links.test.ts (endpoint path → src/lib/api.test.ts) |
+| 31 | `test_mobile_sidebar_stays_below_modal` | No docstring. Guards z-index layering: modal (50) above backdrop (40) above sticky sidebar (30) on mobile. | src/components/shell/Sidebar.test.tsx |
+| 32 | `test_includes_accessible_global_search` | No docstring. Guards the combobox/listbox global search with keyboard shortcuts (/, cmd-k, arrows, escape) navigating to pages via pushState. | src/components/shell/GlobalSearch.test.tsx |
+| 33 | `test_benchmark_badge_communicates_rollout_transition` | No docstring. Guards the DittoBench badge naming the rollout transition instead of a bare "latest" claim. | src/components/shell/BenchBadge.test.tsx (ABSENT grep → src/build-invariants.test.ts) |
+| 34 | `test_leaderboard_omits_tie_labels` | No docstring. Guards that the removed tie chip never returns. | src/build-invariants.test.ts |
+| 35 | `TestDashboardScoringTransparency.test_no_hardcoded_fold_constants` | Class docstring: consensus parameters (incumbent margin, champion share, tail size, authority threshold, bench version) are API-served and must never be markup literals — a literal is a claim that silently stops being true, and miners read it as the rule they are judged by. | src/build-invariants.test.ts |
+| 36 | `TestDashboardScoringTransparency.test_renders_the_dethrone_floor_and_rollout_state` | Class docstring (as #35); guards the "score to beat" as its own element computed from API-served margin (not an inlined formula), published as a floor not a guarantee, plus the rollout/authority strip with API-read threshold. | src/lib/scoring.test.ts (floor math; banned formula → src/build-invariants.test.ts; strip markup → src/pages/Leaderboard.test.tsx; endpoint → src/lib/api.test.ts) |
+| 37 | `TestDashboardScoringTransparency.test_explainer_covers_scoring_emissions_and_koth` | Class docstring (as #35); guards the four `<details>` explainers covering scoring, emissions, king-of-the-hill, and version transitions, with active/rollout versions filled from JS variables. | src/pages/Benchmark.test.tsx (formula copy also mirrored in src/lib/scoring.test.ts) |
+| 38 | `TestDashboardScoringTransparency.test_composite_detail_separates_quality_and_token_adjustments` | Class docstring (as #35); guards the composite-calculation breakdown separating quality gates from the bounded token-efficiency adjustment. | src/lib/scoring.test.ts |
+| 39 | `TestDashboardScoringTransparency.test_benchmark_version_is_never_a_literal` | Class docstring (as #35); static markup carries only a placeholder — the frozen-setup tag and version copy are filled from the API. | src/pages/Benchmark.test.tsx |
+| 40 | `TestDashboardScoringTransparency.test_no_reference_baseline_stat` | Docstring: the stock-harness reference baseline is deliberately unpublished — v7 calibration is sharply bimodal (15 of 20 seeds score conversational_sanity exactly 0.000, composite 0.185-0.221; 5 clear the gate at 0.344-0.450; no mass at the mean 0.248, sd 0.087), so any single number describes a run that does not exist; guards against the stat reappearing as a bare composite. | src/build-invariants.test.ts |
+| 41 | `TestDashboardScoringTransparency.test_neighbouring_comparison_features_survive` | Docstring: removing the baseline must not take out its neighbours — the off-network third-party harness comparison and the token-efficiency budget are separate measurements that merely live beside the removed card. | src/pages/Benchmark.test.tsx |
+
+## Notes on the translation
+
+- **Formula guards became unit tests.** The old suite asserted on script text —
+  `"var floor = champComposite + effectiveMargin" in body`, and the negative
+  `"champComposite * (1 + margin)" not in body`. Those formulas now live in
+  `src/lib/scoring.ts` and `src/lib/bench-state.ts`, and the tests assert the
+  math: an additive dethrone margin, band decay, quorum coercions, the
+  chain-weight fold. `build-invariants.test.ts` still bans the multiplicative
+  shape from the shipped bundle, so both halves of the original guard survive.
+- **"Never ships" guards run against `dist/`.** The hardcoded fold constants
+  (`2% protection margin`, `receives 90% of the miner pool`, and the rest), the
+  banned formula shape, literal bench versions in explainer copy, and the
+  retired reference-baseline stat are asserted absent from a real build rather
+  than from source — which is the property the original greps actually had.
+- **Goldens, during the port only.** The monolith was rendered in jsdom against
+  `fixtures/` with a frozen clock, and each ported page was diffed against that
+  DOM until it matched. The goldens were a porting gate, not a permanent CI
+  artifact; `fixtures/` is what remains.
+
+### Accepted differences from the monolith DOM
+
+Everything below diffs non-zero against the goldens and is deliberate.
+
+- **Whitespace between block elements.** JSX emits none; the monolith template
+  strings did. Text content is identical.
+- **Attribute order within a tag.** Solid emits static attributes before
+  reactive ones.
+- **`data-sig` on `#leaderboard-version-pills`.** Bookkeeping for the
+  monolith innerHTML rebuild, which fine-grained reactivity replaces.
+- **`aria-describedby` tooltip numbering.** Per-element description spans
+  instead of one document-wide rescan; same mechanism, same text.
+- **Section mounting.** The monolith kept all six page sections in the DOM and
+  hid five with CSS; the SPA mounts the routed one. Visible output matches.
+  One consequence worth knowing: the site footer lives inside the benchmark
+  section, so it renders on that page only — as it displayed before.
