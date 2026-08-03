@@ -38,6 +38,7 @@ from ditto.db.queries.confirmation_scores import (
     ConfirmationSeedScore,
     append_confirmation_scores,
 )
+from ditto.db.queries.score_ranking import official_composites
 from ditto.db.queries.scores import list_eligible_ledger, upsert_score
 from ditto.db.queries.tickets import get_score_priority_floor_rows
 from ditto.score_order import rank_submissions, score_order_key
@@ -59,6 +60,15 @@ class _Row:
     first_seen: datetime
     composite: float
     eligible: bool = True
+
+
+@dataclass(frozen=True)
+class _FinalRow:
+    agent_id: UUID
+    miner_hotkey: str
+    first_seen: datetime
+    composite: float
+    bench_version: int = 7
 
 
 def _uuid(nibble: str) -> UUID:
@@ -121,6 +131,20 @@ class TestComparator:
             _BASE,
             str(row.agent_id),
         )
+
+    def test_efficiency_bonus_folds_after_continual_mean(self) -> None:
+        row = _FinalRow(_uuid("3"), "5" + "a" * 47, _BASE, 0.8)
+
+        scores = official_composites(
+            [row],
+            quorum={row.agent_id: [0.7, 0.8, 0.9]},
+            completed_waves={row.agent_id: {10: 0.6, 20: 0.9}},
+            continual_mean_active=True,
+            efficiency_bonuses={row.agent_id: 0.1},
+            efficiency_fold_active=True,
+        )
+
+        assert scores[row.agent_id] == pytest.approx(0.78 * 1.1)
 
 
 async def _seed(

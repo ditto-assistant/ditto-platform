@@ -19,6 +19,7 @@ import {
   chainWeightLabel,
   cohortMedian,
   compositeCalculationRows,
+  compositeCalculationHeading,
   compositeEquationText,
   continualSampleCount,
   continualWaves,
@@ -566,6 +567,29 @@ describe("composite equations (row 38: quality and token adjustments stay separa
     );
   });
 
+  it("shows the post-continual efficiency fold as separate ranking provenance", () => {
+    const rows = compositeCalculationRows({
+      tool_mean: 0.8,
+      memory_mean: 0.6,
+      bench_version: 7,
+      aggregate_method: "continual_mean",
+      composite: 0.7,
+      official_composite: 0.756,
+      pre_efficiency_composite: 0.72,
+      efficiency_bonus: 0.05,
+      composite_breakdown: { ...breakdown, final_composite: 0.7 },
+    });
+    const byKey = Object.fromEntries((rows ?? []).map((row) => [row.k, row.v]));
+    expect(byKey["Initial quorum signed composite"]).toBe("0.700");
+    expect(byKey["Continual aggregate"]).toBe("0.720");
+    expect(byKey["Relative token-efficiency bonus"]).toBe("+5.0% · frozen cohort award");
+    expect(byKey["Folded ranking score"]).toBe("0.756 · used for rank, KOTH, and emissions");
+    expect(byKey["Token efficiency"]).toBeUndefined();
+    expect(compositeCalculationHeading({ pre_efficiency_composite: 0.72 })).toBe(
+      "Score provenance and ranking fold",
+    );
+  });
+
   it("says 'not applied or unavailable' when the token multiplier is absent", () => {
     const rows = compositeCalculationRows({
       tool_mean: 0.7,
@@ -584,9 +608,7 @@ describe("composite equations (row 38: quality and token adjustments stay separa
 
   it("carries the block heading and the bounded-penalty note verbatim", () => {
     expect(COMPOSITE_CALC_HEADING).toBe("Composite calculation");
-    expect(COMPOSITE_CALC_NOTE).toContain(
-      "Token efficiency is separate and can never remove more than 10%",
-    );
+    expect(COMPOSITE_CALC_NOTE).toContain("Bench v7+ relative-efficiency awards are upside");
   });
 
   it("maxTokenPenaltyPct defaults to 10% only when the API omits the bound", () => {

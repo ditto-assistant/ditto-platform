@@ -248,6 +248,44 @@ class TestLeaderboardBonusExposure:
             str(agents["heavy"]),
         ]
 
+    async def test_fold_ranks_on_continual_score_times_bonus(
+        self, session_maker: async_sessionmaker[AsyncSession]
+    ) -> None:
+        await _activate_bench_version(session_maker, 7)
+        expensive_leader = await _seed_finalized(
+            session_maker,
+            miner=_MINERS[0],
+            composite=0.80,
+            total_tokens=400_000,
+        )
+        efficient_challenger = await _seed_finalized(
+            session_maker,
+            miner=_MINERS[1],
+            composite=0.79,
+            total_tokens=50_000,
+        )
+        await _seed_finalized(
+            session_maker,
+            miner=_MINERS[2],
+            composite=0.60,
+            total_tokens=200_000,
+        )
+        fold_on = EfficiencyBonusConfig(enabled=True, fold_enabled=True, min_cohort=3)
+        app = _make_app(session_maker, efficiency=fold_on)
+
+        async with _client(app) as client:
+            response = await client.get("/api/v1/public/leaderboard")
+
+        assert response.status_code == 200
+        payload = response.json()
+        leader = payload["entries"][0]
+        assert leader["agent_id"] == str(efficient_challenger)
+        assert leader["pre_efficiency_composite"] == pytest.approx(0.79)
+        assert leader["efficiency_bonus"] == pytest.approx(0.05)
+        assert leader["official_composite"] == pytest.approx(0.79 * 1.05)
+        assert leader["effective_composite"] == pytest.approx(0.79 * 1.05)
+        assert _entry(payload, expensive_leader)["rank"] == 2
+
     async def test_bonuses_and_reference_are_frozen_within_an_epoch(
         self, session_maker: async_sessionmaker[AsyncSession]
     ) -> None:

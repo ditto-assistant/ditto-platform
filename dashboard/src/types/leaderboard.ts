@@ -101,6 +101,14 @@ export interface LeaderboardEntry {
   agent_name?: string | null;
   agent_version?: number | null;
   composite: number;
+  /** Score after continual aggregation and any active efficiency fold. */
+  official_composite?: number | null;
+  /** Score after continual aggregation but before relative efficiency. */
+  pre_efficiency_composite?: number | null;
+  /** Frozen Bench v7+ upside fraction, when the fold is active. */
+  efficiency_bonus?: number | null;
+  /** Final folded score; equal to official_composite while the fold is active. */
+  effective_composite?: number | null;
   /** Settled active-version median shown mid-rollout (loose != null check). */
   settled_composite?: number | null;
   composite_stderr?: number | null;

@@ -36,8 +36,8 @@ import {
 import { entityHref } from "../lib/router";
 import type { EntityKind, EntityRoute } from "../lib/router";
 import {
-  COMPOSITE_CALC_HEADING,
   COMPOSITE_CALC_NOTE,
+  compositeCalculationHeading,
   compositeCalculationRows,
   displayComposite,
   isEligible,
@@ -729,7 +729,7 @@ function MinerSummary(props: { entry: RankedEntry; settled: boolean; total: numb
         <Show when={calcRows()}>
           {(rows) => (
             <div class="stat-group">
-              <div class="stat-head">{COMPOSITE_CALC_HEADING}</div>
+              <div class="stat-head">{compositeCalculationHeading(e())}</div>
               {rows().map((row) => (
                 <Stat k={row.k} v={row.v} />
               ))}

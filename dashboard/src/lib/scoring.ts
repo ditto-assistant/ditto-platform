@@ -667,7 +667,16 @@ export const COMPOSITE_CALC_HEADING = "Composite calculation";
 export const COMPOSITE_CALC_NOTE =
   "The benchmark-quality multiplier combines scorer-owned behavioural and integrity gates " +
   "before token efficiency. It is shown as one audited factor so the platform cannot drift " +
-  "from the benchmark scorer. Token efficiency is separate and can never remove more than 10%.";
+  "from the benchmark scorer. Older benches retain their bounded token penalty; Bench v7+ " +
+  "relative-efficiency awards are upside and apply only after continual aggregation.";
+
+export function compositeCalculationHeading(e: {
+  pre_efficiency_composite?: number | null;
+}): string {
+  return e.pre_efficiency_composite != null
+    ? "Score provenance and ranking fold"
+    : COMPOSITE_CALC_HEADING;
+}
 
 /**
  * The drill-down "Composite calculation" rows (5817–5840), separating the
@@ -683,6 +692,12 @@ export const COMPOSITE_CALC_NOTE =
 export function compositeCalculationRows(e: {
   tool_mean: number;
   memory_mean: number;
+  bench_version?: number | null;
+  aggregate_method?: string | null;
+  pre_efficiency_composite?: number | null;
+  efficiency_bonus?: number | null;
+  official_composite?: number | null;
+  composite?: number;
   composite_breakdown?: CompositeBreakdown | null;
   token_efficiency?: TokenEfficiency | null;
 }): StatRow[] | null {
@@ -705,7 +720,11 @@ export function compositeCalculationRows(e: {
     },
     { k: "Pre-token composite", v: fx(b.pre_token_composite) },
   ];
-  if (b.token_efficiency_multiplier == null) {
+  const hasRankingFold = e.pre_efficiency_composite != null;
+  if (hasRankingFold && Number(e.bench_version) >= 7) {
+    // Bench v7+ does not reuse the legacy signed token penalty. Its separate
+    // relative-efficiency award is shown below, after continual aggregation.
+  } else if (b.token_efficiency_multiplier == null) {
     rows.push({ k: "Token efficiency", v: "not applied or unavailable" });
   } else {
     const penalty = Math.max(0, Number(b.token_penalty) || 0);
@@ -721,7 +740,38 @@ export function compositeCalculationRows(e: {
         "%)",
     });
   }
-  rows.push({ k: "Final composite", v: fx(b.final_composite) });
+  rows.push({
+    k: hasRankingFold
+      ? e.aggregate_method === "continual_mean"
+        ? "Initial quorum signed composite"
+        : "Signed composite"
+      : "Final composite",
+    v: fx(b.final_composite),
+  });
+  if (e.pre_efficiency_composite != null) {
+    rows.push({
+      k:
+        e.aggregate_method === "continual_mean" ? "Continual aggregate" : "Score before efficiency",
+      v: fx(e.pre_efficiency_composite),
+    });
+    if (e.efficiency_bonus != null) {
+      rows.push({
+        k: "Relative token-efficiency bonus",
+        v: "+" + (Number(e.efficiency_bonus) * 100).toFixed(1) + "% · frozen cohort award",
+      });
+      rows.push({
+        k: "Folded ranking score",
+        v:
+          fx(e.official_composite ?? e.composite ?? e.pre_efficiency_composite) +
+          " · used for rank, KOTH, and emissions",
+      });
+    } else {
+      rows.push({
+        k: "Current ranking score",
+        v: fx(e.official_composite ?? e.composite ?? e.pre_efficiency_composite),
+      });
+    }
+  }
   const te = e.token_efficiency;
   if (te && te.observed_total_tokens != null) {
     const budget =

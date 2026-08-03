@@ -35,7 +35,6 @@ from ditto.api_models import ConfirmationScoreRecord, LedgerEntry, LedgerRespons
 from ditto.api_models.upload import _SS58_PATTERN
 from ditto.api_models.validator import LedgerScoreProof
 from ditto.api_server.continual_retest_settings import aggregate_is_active
-from ditto.api_server.efficiency import effective_composite
 from ditto.api_server.endpoints.validator import (
     ChainDep,
     SessionDep,
@@ -45,9 +44,13 @@ from ditto.api_server.endpoints.validator import (
 )
 from ditto.db.models import Score
 from ditto.db.queries.benchmark_rollout import active_bench_version
-from ditto.db.queries.confirmation_scores import confirmation_history_by_agent
+from ditto.db.queries.confirmation_scores import (
+    confirmation_composites_by_seed,
+    confirmation_history_by_agent,
+)
 from ditto.db.queries.efficiency import get_bonus_rows
 from ditto.db.queries.heartbeats import live_validator_fleet_supports_protocol
+from ditto.db.queries.score_ranking import official_composites
 from ditto.db.queries.scores import (
     list_eligible_ledger,
     quorum_composites,
@@ -298,6 +301,11 @@ async def scores(
             agent_ids=[r.agent_id for r in rows],
             bench_version=canonical_version,
         )
+        confirmation_by_seed = await confirmation_composites_by_seed(
+            session,
+            agent_ids=[r.agent_id for r in rows],
+            bench_version=canonical_version,
+        )
         proof_rows = await quorum_score_rows(
             session,
             [r.agent_id for r in rows],
@@ -334,6 +342,16 @@ async def scores(
             )
         else:
             bonus_rows = {}
+        ranking_scores = official_composites(
+            rows,
+            quorum=quorum,
+            completed_waves=confirmation_by_seed,
+            continual_mean_active=continual_mean_active,
+            efficiency_bonuses={
+                agent_id: row.bonus for agent_id, row in bonus_rows.items()
+            },
+            efficiency_fold_active=bool(bonus_rows),
+        )
     except SQLAlchemyError as e:
         return _serve_last_known(request, x_validator_hotkey, e)
 
@@ -381,9 +399,7 @@ async def scores(
                 bonus_rows[r.agent_id].bonus if r.agent_id in bonus_rows else None
             ),
             effective_composite=(
-                effective_composite(r.composite, bonus_rows[r.agent_id].bonus)
-                if r.agent_id in bonus_rows
-                else None
+                ranking_scores[r.agent_id] if r.agent_id in bonus_rows else None
             ),
             status=r.status,
         )

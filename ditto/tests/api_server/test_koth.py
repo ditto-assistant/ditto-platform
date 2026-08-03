@@ -36,6 +36,7 @@ def _entry(
     bench_version: int = 1,
     quorum: tuple[float, ...] | None = None,
     waves: tuple[float, ...] | None = None,
+    efficiency_bonus: float | None = None,
 ) -> KothEntry:
     return KothEntry(
         miner_hotkey="5" + str(marker) * 47,
@@ -49,6 +50,7 @@ def _entry(
         completed_wave_composites=waves,
         confirmation_composites=confirmations,
         confirmation_seeds=seeds,
+        efficiency_bonus=efficiency_bonus,
     )
 
 
@@ -68,6 +70,19 @@ def test_partial_or_missing_wave_keeps_canonical_median() -> None:
     entry = _entry(1, 0.8, minutes=0, quorum=(0.7, 0.8, 0.9))
 
     assert effective_composite(entry) == 0.8
+
+
+def test_efficiency_bonus_multiplies_the_continual_score() -> None:
+    entry = _entry(
+        1,
+        0.8,
+        minutes=0,
+        quorum=(0.7, 0.8, 0.9),
+        waves=(0.5, 1.0),
+        efficiency_bonus=0.1,
+    )
+
+    assert effective_composite(entry) == pytest.approx(0.78 * 1.1)
 
 
 @pytest.mark.parametrize("bench_version", [6, 7, 8])
@@ -202,6 +217,29 @@ def test_confirmation_median_and_paired_seed_band_match_validator_fold() -> None
     assert decision.challenger_lead == pytest.approx(0.004)
     assert decision.margin_lead == pytest.approx(0.007)
     assert decision.dethrones is False
+
+
+def test_efficiency_bonus_applies_inside_paired_seed_comparison() -> None:
+    incumbent = _entry(
+        2,
+        0.80,
+        minutes=0,
+        confirmations=(0.80, 0.80, 0.80),
+        seeds=(10, 20, 30),
+    )
+    challenger = _entry(
+        1,
+        0.78,
+        minutes=1,
+        confirmations=(0.78, 0.78, 0.78),
+        seeds=(10, 20, 30),
+        efficiency_bonus=0.1,
+    )
+
+    projection = project_koth([challenger, incumbent])
+
+    assert projection is not None
+    assert projection.champion == challenger
 
 
 def test_empty_or_non_positive_pool_has_no_projection() -> None:
