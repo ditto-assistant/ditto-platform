@@ -178,11 +178,11 @@ async def list_submission_family_members(
 ) -> dict[str, list[SubmissionFamilyMemberRow]]:
     """Return every finalized ranked generation grouped by emission owner.
 
-    The leaderboard intentionally publishes one representative per payment-time
-    coldkey. This companion read keeps the other scored generations visible
-    without assigning them fake ranks or extra emission positions. It rebuilds
-    each agent's canonical quorum median from the same score rows used by the
-    ledger and applies the same full-run and positive-score gates.
+    The leaderboard intentionally publishes one representative per canonical
+    owner root. Payment-time coldkeys and active signed owner attestations are
+    both edges in that root, so this companion read must use the same grouping
+    as rank suppression. Otherwise an attested sibling disappears completely:
+    it receives no rank but is also absent from the representative's family.
     """
     rows = (
         await session.execute(
@@ -212,7 +212,7 @@ async def list_submission_family_members(
     for row in rows:
         by_agent[row.agent_id].append(row)
 
-    families: dict[str, list[SubmissionFamilyMemberRow]] = defaultdict(list)
+    loaded_members: list[SubmissionFamilyMemberRow] = []
     for agent_id, score_rows in by_agent.items():
         if len({row.validator_hotkey for row in score_rows}) < SCORING_QUORUM:
             continue
@@ -221,7 +221,7 @@ async def list_submission_family_members(
             miner_hotkey=first.miner_hotkey,
             miner_coldkey=first.miner_coldkey,
         )
-        families[owner].append(
+        loaded_members.append(
             SubmissionFamilyMemberRow(
                 owner=owner,
                 agent_id=agent_id,
@@ -230,6 +230,24 @@ async def list_submission_family_members(
                 miner_hotkey=first.miner_hotkey,
                 canonical_composite=float(median(row.composite for row in score_rows)),
                 submitted_at=first.created_at,
+            )
+        )
+
+    roots = await attested_emission_owner_roots(
+        session,
+        [(member.miner_hotkey, member.owner) for member in loaded_members],
+    )
+    families: dict[str, list[SubmissionFamilyMemberRow]] = defaultdict(list)
+    for root, member in zip(roots, loaded_members, strict=True):
+        families[root].append(
+            SubmissionFamilyMemberRow(
+                owner=root,
+                agent_id=member.agent_id,
+                agent_name=member.agent_name,
+                agent_version=member.agent_version,
+                miner_hotkey=member.miner_hotkey,
+                canonical_composite=member.canonical_composite,
+                submitted_at=member.submitted_at,
             )
         )
 
@@ -448,14 +466,37 @@ async def attested_emission_owner_roots(
     for hotkey, raw_owner in identities:
         union(f"hotkey:{hotkey}", raw_owner)
 
-    links = await session.execute(
-        select(OwnerAttestation.hotkey_lo, OwnerAttestation.hotkey_hi).where(
-            OwnerAttestation.netuid == expected_netuid(),
-            OwnerAttestation.revoked_at.is_(None),
-        )
+    links = list(
+        (
+            await session.execute(
+                select(OwnerAttestation.hotkey_lo, OwnerAttestation.hotkey_hi).where(
+                    OwnerAttestation.netuid == expected_netuid(),
+                    OwnerAttestation.revoked_at.is_(None),
+                )
+            )
+        ).tuples()
     )
     for hotkey_lo, hotkey_hi in links:
         union(f"hotkey:{hotkey_lo}", f"hotkey:{hotkey_hi}")
+
+    # A canonical root must not depend on which member of an attested family a
+    # caller happened to load. Include the payment-owner edge for every linked
+    # hotkey, even when that hotkey's submission was already suppressed from
+    # the caller's ranked row set. Without this closure, a one-row leaderboard
+    # and a two-row family read chose different roots for the same component.
+    linked_hotkeys = {hotkey for pair in links for hotkey in pair}
+    if linked_hotkeys:
+        payment_owners = await session.execute(
+            select(
+                EvaluationPayment.miner_hotkey,
+                EvaluationPayment.miner_coldkey,
+            ).where(
+                EvaluationPayment.miner_hotkey.in_(linked_hotkeys),
+                EvaluationPayment.miner_coldkey.is_not(None),
+            )
+        )
+        for hotkey, coldkey in payment_owners:
+            union(f"hotkey:{hotkey}", f"coldkey:{coldkey}")
 
     return [find(f"hotkey:{hotkey}") for hotkey, _raw_owner in identities]
 

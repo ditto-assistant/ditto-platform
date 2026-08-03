@@ -458,3 +458,34 @@ async def test_generating_dataset_is_ordered_before_running(
     assert _stored(row).stage == "running_benchmark"
     assert _stored(row).completed == 7
     assert row.seen_at == base + timedelta(seconds=10)
+
+
+async def test_relay_wait_can_resume_running_without_regression(
+    session: AsyncSession,
+) -> None:
+    agent_id = await _seed_agent(session)
+    base = datetime(2026, 7, 25, 12, 0, tzinfo=UTC)
+    await _upsert(
+        session,
+        agent_id,
+        _progress("running_benchmark", completed=7, total=281, run_token="a" * 16),
+        reported_at=base,
+    )
+    waiting, accepted = await _upsert(
+        session,
+        agent_id,
+        _progress("waiting_for_relay", completed=7, total=281, run_token="a" * 16),
+        reported_at=base + timedelta(seconds=10),
+    )
+    assert accepted
+    assert _stored(waiting).stage == "waiting_for_relay"
+
+    resumed, accepted = await _upsert(
+        session,
+        agent_id,
+        _progress("running_benchmark", completed=8, total=281, run_token="a" * 16),
+        reported_at=base + timedelta(seconds=20),
+    )
+    assert accepted
+    assert _stored(resumed).stage == "running_benchmark"
+    assert _stored(resumed).completed == 8

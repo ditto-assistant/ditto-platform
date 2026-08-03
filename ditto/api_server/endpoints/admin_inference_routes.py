@@ -18,6 +18,7 @@ from ditto.api_models.admin_inference_routes import (
     InferenceRoutingAuditView,
     InferenceRoutingPolicyView,
     ProviderTelemetryView,
+    RelayRecoveryTelemetryView,
 )
 from ditto.api_server.dependencies import get_session
 from ditto.api_server.endpoints.admin_quarantine import require_admin
@@ -32,6 +33,7 @@ from ditto.db.models import (
     InferenceRequest,
     InferenceRoutingAudit,
     InferenceRoutingPolicy,
+    ValidatorTicket,
 )
 
 router = APIRouter(prefix="/admin/inference-routes", tags=["admin"])
@@ -148,12 +150,59 @@ async def list_inference_routes(
                     func.sum(InferenceRequest.upstream_attempts).label(
                         "upstream_attempt_count"
                     ),
+                    func.sum(InferenceRequest.openrouter_attempts).label(
+                        "openrouter_attempt_count"
+                    ),
+                    func.sum(
+                        case(
+                            (
+                                (InferenceRequest.status == "completed")
+                                & (InferenceRequest.fallback_phase > 0),
+                                1,
+                            ),
+                            else_=0,
+                        )
+                    ).label("recovered_after_fallback_count"),
+                    func.sum(
+                        case(
+                            (
+                                (InferenceRequest.status == "failed")
+                                & InferenceRequest.terminal_error_code.is_not(None),
+                                1,
+                            ),
+                            else_=0,
+                        )
+                    ).label("terminal_failure_count"),
                     func.sum(InferenceRequest.prompt_tokens).label("prompt_tokens"),
                     func.sum(InferenceRequest.completion_tokens).label(
                         "completion_tokens"
                     ),
                     func.sum(InferenceRequest.cost_microusd).label("cost_microusd"),
                     func.avg(InferenceRequest.latency_ms).label("average_latency_ms"),
+                    (
+                        func.sum(
+                            case(
+                                (
+                                    InferenceRequest.status == "completed",
+                                    InferenceRequest.completion_tokens,
+                                ),
+                                else_=0,
+                            )
+                        )
+                        * 1000.0
+                        / func.nullif(
+                            func.sum(
+                                case(
+                                    (
+                                        InferenceRequest.status == "completed",
+                                        InferenceRequest.latency_ms,
+                                    ),
+                                    else_=0,
+                                )
+                            ),
+                            0,
+                        )
+                    ).label("observed_output_tps"),
                 )
                 .where(
                     InferenceRequest.request_kind == "chat",
@@ -163,6 +212,34 @@ async def list_inference_routes(
             )
         ).all()
     )
+    relay_recovery = (
+        await session.execute(
+            select(
+                func.sum(
+                    case(
+                        (
+                            (ValidatorTicket.failure_reason == "infrastructure")
+                            & ValidatorTicket.failure_detail.like(
+                                "model_relay_unavailable%"
+                            ),
+                            1,
+                        ),
+                        else_=0,
+                    )
+                ).label("benchmark_relay_abort_ticket_count"),
+                func.sum(
+                    case(
+                        (
+                            ValidatorTicket.failure_detail
+                            == "model_relay_unavailable:provider_recovery_exhausted",
+                            1,
+                        ),
+                        else_=0,
+                    )
+                ).label("broker_recovery_exhausted_ticket_count"),
+            )
+        )
+    ).one()
     inference_config = request.app.state.config.inference_proxy
     routing_mode = inference_config.routing_mode
     aggregate_model = benchmark_model(7)
@@ -173,9 +250,10 @@ async def list_inference_routes(
                 model=aggregate_model,
                 provider=AGGREGATE_PROVIDER,
                 profile_revision=aggregate_profile_revision(aggregate_model),
-                provider_sort="operator_order",
-                provider_order=["CoreWeave", "DeepInfra", "Groq"],
-                ignored_providers=["Amazon Bedrock"],
+                provider_sort="throughput",
+                provider_order=[],
+                reliability_provider_order=["DeepInfra", "Groq"],
+                ignored_providers=["CoreWeave"],
                 allow_fallbacks=True,
             )
             if routing_mode == "aggregate_throughput"
@@ -249,13 +327,25 @@ async def list_inference_routes(
                 inflight_count=row.inflight_count,
                 timeout_count=row.timeout_count,
                 upstream_attempt_count=row.upstream_attempt_count,
+                openrouter_attempt_count=row.openrouter_attempt_count,
+                recovered_after_fallback_count=row.recovered_after_fallback_count,
+                terminal_failure_count=row.terminal_failure_count,
                 prompt_tokens=row.prompt_tokens,
                 completion_tokens=row.completion_tokens,
                 cost_microusd=row.cost_microusd,
                 average_latency_ms=row.average_latency_ms,
+                observed_output_tps=row.observed_output_tps,
             )
             for row in provider_telemetry
         ],
+        relay_recovery_telemetry=RelayRecoveryTelemetryView(
+            benchmark_relay_abort_ticket_count=(
+                relay_recovery.benchmark_relay_abort_ticket_count or 0
+            ),
+            broker_recovery_exhausted_ticket_count=(
+                relay_recovery.broker_recovery_exhausted_ticket_count or 0
+            ),
+        ),
     )
 
 

@@ -42,6 +42,7 @@ from ditto.api_models.stack_health import (
     ValidatorStackHealth,
 )
 from ditto.api_models.ticket_status import TicketPurpose, TicketStatus
+from ditto.api_server.attestation import expected_netuid
 from ditto.api_server.bench import CURRENT_BENCH_VERSION
 from ditto.api_server.crn import champion_anchored_seeds
 from ditto.api_server.datapipeline import DataPipelineError
@@ -76,6 +77,7 @@ from ditto.db.models import (
     BenchmarkRolloutAudit,
     BenchmarkRolloutMember,
     EvaluationPayment,
+    OwnerAttestation,
     Score,
     ScreeningAttempt,
     ScreeningQuarantine,
@@ -2613,6 +2615,73 @@ class TestPublicLeaderboard:
             await client.get(f"/api/v1/public/agent/{hidden_generation}/pipeline")
         ).json()
         assert pipeline["submission_family"] == family
+
+    async def test_attested_owner_family_keeps_linked_coldkeys_visible(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        representative_hotkey = "5" + "V" * 47
+        hidden_hotkey = "5" + "W" * 47
+        representative = await _seed_k3(
+            session_maker,
+            miner=representative_hotkey,
+            composites=[0.95, 0.96, 0.97],
+            created_at=datetime(2026, 6, 8, 12, 0, tzinfo=UTC),
+        )
+        hidden = await _seed_k3(
+            session_maker,
+            miner=hidden_hotkey,
+            composites=[0.90, 0.91, 0.92],
+            created_at=datetime(2026, 6, 8, 13, 0, tzinfo=UTC),
+        )
+        await _seed_payment(
+            session_maker,
+            agent_id=representative,
+            miner_hotkey=representative_hotkey,
+            miner_coldkey="test-coldkey-a",
+            index=43,
+        )
+        await _seed_payment(
+            session_maker,
+            agent_id=hidden,
+            miner_hotkey=hidden_hotkey,
+            miner_coldkey="test-coldkey-b",
+            index=44,
+        )
+        async with session_maker() as session, session.begin():
+            session.add(
+                OwnerAttestation(
+                    netuid=expected_netuid(),
+                    hotkey_lo=representative_hotkey,
+                    hotkey_hi=hidden_hotkey,
+                    nonce=uuid4(),
+                    issued_at=datetime.now(UTC),
+                    lo_key_kind="hotkey",
+                    lo_signer=representative_hotkey,
+                    lo_signature="a" * 128,
+                    hi_key_kind="hotkey",
+                    hi_signer=hidden_hotkey,
+                    hi_signature="b" * 128,
+                )
+            )
+        await _activate_era(session_maker)
+        _install_db(app, session_maker)
+
+        board = (await client.get("/api/v1/public/leaderboard")).json()
+
+        assert board["count"] == 1
+        family = board["entries"][0]["submission_family"]
+        assert family["member_count"] == 2
+        assert [member["agent_id"] for member in family["members"]] == [
+            representative,
+            hidden,
+        ]
+        hidden_pipeline = (
+            await client.get(f"/api/v1/public/agent/{hidden}/pipeline")
+        ).json()
+        assert hidden_pipeline["submission_family"] == family
 
     async def test_open_rollout_exposes_settled_and_rollout_state_per_entry(
         self,

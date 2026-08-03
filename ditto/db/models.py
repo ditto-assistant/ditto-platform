@@ -2699,6 +2699,13 @@ class InferenceRequest(Base):
     upstream_attempts: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default=text("0")
     )
+    openrouter_attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    fallback_phase: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    terminal_error_code: Mapped[str | None] = mapped_column(Text, nullable=True)
     timed_out: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     started_at: Mapped[datetime] = mapped_column(
@@ -2727,6 +2734,14 @@ class InferenceRequest(Base):
         CheckConstraint("generation > 0", name="inference_requests_generation"),
         CheckConstraint(
             "upstream_attempts >= 0", name="inference_requests_upstream_attempts"
+        ),
+        CheckConstraint(
+            "openrouter_attempts >= 0",
+            name="inference_requests_openrouter_attempts",
+        ),
+        CheckConstraint(
+            "fallback_phase BETWEEN 0 AND 1",
+            name="inference_requests_fallback_phase",
         ),
         Index("inference_requests_started_idx", "started_at"),
     )

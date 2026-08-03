@@ -1366,6 +1366,8 @@ class TestDashboard:
         assert "Date.now() - started < 60000" in body
         assert "var OPS_REFRESH_MS = 5000" in body
         assert "failed_retrying" in body
+        assert "waiting_for_relay" in body
+        assert "Waiting for relay" in body
         assert "Scoring and finalizing" in body
         assert "Signing and submitting result" in body
         assert "prefers-reduced-motion" in body

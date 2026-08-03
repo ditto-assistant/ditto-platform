@@ -29,6 +29,7 @@ class AggregateRouteView(BaseModel):
     profile_revision: str
     provider_sort: str
     provider_order: list[str]
+    reliability_provider_order: list[str]
     ignored_providers: list[str]
     allow_fallbacks: bool
 
@@ -111,10 +112,23 @@ class ProviderTelemetryView(BaseModel):
     inflight_count: int = Field(ge=0)
     timeout_count: int = Field(ge=0)
     upstream_attempt_count: int = Field(ge=0)
+    openrouter_attempt_count: int = Field(ge=0)
+    recovered_after_fallback_count: int = Field(ge=0)
+    terminal_failure_count: int = Field(ge=0)
     prompt_tokens: int = Field(ge=0)
     completion_tokens: int = Field(ge=0)
     cost_microusd: int = Field(ge=0)
     average_latency_ms: float | None
+    observed_output_tps: float | None
+
+
+class RelayRecoveryTelemetryView(BaseModel):
+    """Ticket-level abort evidence retained by the benchmark control plane."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    benchmark_relay_abort_ticket_count: int = Field(ge=0)
+    broker_recovery_exhausted_ticket_count: int = Field(ge=0)
 
 
 class AdminInferenceRoutes(BaseModel):
@@ -128,3 +142,4 @@ class AdminInferenceRoutes(BaseModel):
     routes: list[InferenceRouteView]
     audits: list[InferenceRoutingAuditView]
     provider_telemetry: list[ProviderTelemetryView]
+    relay_recovery_telemetry: RelayRecoveryTelemetryView
