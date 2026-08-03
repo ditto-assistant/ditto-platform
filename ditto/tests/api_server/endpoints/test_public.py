@@ -5845,6 +5845,111 @@ class TestPublicActivity:
         assert rejected["retry_state"] is None
         assert rejected["retry_after"] is None
 
+    async def test_secondary_multislot_work_is_reported_as_scoring(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """Every active capacity slot drives the submission lifecycle label."""
+        primary_id = UUID(
+            await _seed_agent(
+                session_maker,
+                miner=_MINER_A,
+                status=AgentStatus.EVALUATING,
+                name="primary-slot-agent",
+                screening_policy_version=SCREENING_POLICY_VERSION,
+            )
+        )
+        secondary_id = UUID(
+            await _seed_agent(
+                session_maker,
+                miner=_MINER_B,
+                status=AgentStatus.EVALUATING,
+                name="sm118",
+                screening_policy_version=SCREENING_POLICY_VERSION,
+            )
+        )
+        now = datetime.now(UTC)
+        deadline = now + timedelta(minutes=30)
+
+        def progress(completed: int) -> dict:
+            return {
+                "stage": "running_benchmark",
+                "completed": completed,
+                "total": 351,
+                "ticket_deadline": deadline.isoformat(),
+            }
+
+        async with session_maker() as session, session.begin():
+            session.add(
+                ValidatorHeartbeat(
+                    validator_hotkey=_VALIDATOR_C,
+                    software_version="0.43.13",
+                    protocol_version=18,
+                    code_digest="ab" * 32,
+                    state="running_benchmark",
+                    active_agent_id=primary_id,
+                    benchmark_progress=progress(210),
+                    benchmark_progress_reported=True,
+                    benchmark_capacity={
+                        "configured_slots": 2,
+                        "healthy_slots": ["slot-0", "slot-1"],
+                        "admission": "accepting",
+                        "active": [
+                            {
+                                "slot_id": "slot-0",
+                                "agent_id": str(primary_id),
+                                "bench_version": _ERA,
+                                "progress": progress(210),
+                            },
+                            {
+                                "slot_id": "slot-1",
+                                "agent_id": str(secondary_id),
+                                "bench_version": _ERA,
+                                "progress": progress(197),
+                            },
+                        ],
+                    },
+                    reported_at=now,
+                    seen_at=now,
+                    signature="cd" * 64,
+                )
+            )
+            for slot_id, agent_id in (
+                ("slot-0", primary_id),
+                ("slot-1", secondary_id),
+            ):
+                session.add(
+                    ValidatorTicket(
+                        agent_id=agent_id,
+                        validator_hotkey=_VALIDATOR_C,
+                        slot_id=slot_id,
+                        bench_version=_ERA,
+                        status=TicketStatus.ISSUED,
+                        issued_at=now - timedelta(seconds=1),
+                        deadline=deadline,
+                    )
+                )
+        _install_db(app, session_maker)
+
+        activity = (await client.get("/api/v1/public/activity")).json()
+        activity_by_id = {entry["agent_id"]: entry for entry in activity["entries"]}
+        secondary = activity_by_id[str(secondary_id)]
+        assert secondary["status"] == "evaluating"
+        assert secondary["validator_queue_rank"] is None
+        assert [work["slot_id"] for work in secondary["active_benchmarks"]] == [
+            "slot-1"
+        ]
+        assert secondary["active_benchmarks"][0]["completed_checks"] == 197
+
+        operations = (await client.get("/api/v1/public/operations")).json()
+        operations_by_id = {
+            entry["agent_id"]: entry for entry in operations["activity"]["entries"]
+        }
+        assert operations_by_id[str(secondary_id)]["status"] == "evaluating"
+        assert operations["activity"]["status_counts"]["evaluating"] == 2
+
     async def test_progress_is_multi_validator_allowlisted_and_recursively_redacted(
         self,
         app: FastAPI,
