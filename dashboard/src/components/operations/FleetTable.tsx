@@ -230,7 +230,9 @@ export function AssignmentDetail(props: { entry: FleetEntryExt }): JSX.Element {
                   <Show when={index() > 0}>
                     <br />
                   </Show>
-                  <b>{line.heading}</b>{" "}
+                  <Show when={line.heading}>
+                    <b>{line.heading}</b>{" "}
+                  </Show>
                   <Show when={line.agent} fallback={line.fallback}>
                     {(agent) => <EntityButton kind="agent" id={agent().id} label={agent().label} />}
                   </Show>

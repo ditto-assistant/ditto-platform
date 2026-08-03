@@ -29,6 +29,9 @@ export interface FleetEntryExt extends FleetEntry {
   scorer_liveness?: string | null;
   allowed_slots?: number | null;
   orphaned_slots?: OrphanedSlot[] | null;
+  /** Set by preserveTransientValidatorTelemetry when a slot's prior signed
+   * progress was carried through the grace window. */
+  _telemetry_grace?: boolean;
 }
 
 export interface SlotPolicy {
@@ -315,8 +318,9 @@ export interface AssignmentAgentRef {
 }
 
 export interface AssignmentDetailLine {
-  /** "Platform" / "Heartbeat" / "Platform assignment" — rendered bold. */
-  heading: string;
+  /** "Platform" / "Heartbeat" / "Platform assignment" — rendered bold.
+   * Absent on the grace line, which is one plain sentence. */
+  heading?: string;
   agent: AssignmentAgentRef | null;
   /** Copy when no agent id is on that side. */
   fallback: string;
@@ -347,6 +351,20 @@ export function validatorAssignmentView(entry: FleetEntryExt): AssignmentView | 
           String(entry.assigned_agent_id).slice(0, 8),
       }
     : null;
+  if (entry.assignment_state === "assignment_mismatch" && entry._telemetry_grace) {
+    return {
+      label: "Telemetry delayed",
+      tone: "warn",
+      lines: [
+        {
+          agent: null,
+          fallback:
+            "Waiting for the next signed slot update; the last reported progress is retained briefly.",
+          suffix: "",
+        },
+      ],
+    };
+  }
   if (entry.assignment_state === "assignment_mismatch") {
     const reported: AssignmentAgentRef | null = entry.reported_agent_id
       ? {

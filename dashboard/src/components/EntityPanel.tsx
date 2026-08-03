@@ -79,6 +79,9 @@ interface FleetStatusFields {
   bench_serviceability?: string | null;
   scorer_liveness?: string | null;
   allowed_slots?: number | null;
+  /** Set by preserveTransientValidatorTelemetry when a slot's signed progress
+   * was carried through the grace window (see fleet.ts). */
+  _telemetry_grace?: boolean;
 }
 type ValidatorEntry = FleetEntry & FleetStatusFields;
 
@@ -94,6 +97,12 @@ export function fleetStatus(entry: ValidatorEntry): [string, string] {
   if (entry.scorer_liveness === "not_serving") return ["Scorer down", "bad"];
   if (entry.bench_serviceability === "scorer_unverified") return ["Bench unsupported", "bad"];
   if (entry.health === "critical") return ["Critical", "bad"];
+  // A one-poll telemetry gap inside the grace window is a delayed update, not
+  // a fleet-wide assignment failure — the whole point of preserving the prior
+  // signed progress. Persistent mismatch still reads red below.
+  if (entry.assignment_state === "assignment_mismatch" && entry._telemetry_grace) {
+    return ["Telemetry delayed", "warn"];
+  }
   if (entry.assignment_state === "assignment_mismatch") return ["Mismatch", "bad"];
   if (entry.assignment_state === "heartbeat_stale") return ["Heartbeat stale", "warn"];
   if (entry.availability === "stale") return ["Stale", "warn"];

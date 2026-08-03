@@ -29,8 +29,10 @@ import {
   cappedSlotIds,
   fundedSlotCount,
   slotOrdinal,
+  validatorAssignmentView,
   validatorSlotIds,
 } from "./fleet";
+import { fleetStatus } from "../EntityPanel";
 import type { FleetEntryExt } from "./fleet";
 
 /** The Python suite's `_benchmark` fixture: one slot's live run. */
@@ -539,5 +541,43 @@ describe("validator detail modal", () => {
     expect(
       Array.from(stats.querySelectorAll(".benchmark-agent"), (node) => node.getAttribute("title")),
     ).toEqual(["agent-slot-1", "agent-slot-2"]);
+  });
+});
+
+// ── The grace window has to be visible to do its job ────────────────────────
+// preserveTransientValidatorTelemetry stamps `_telemetry_grace`, but nothing
+// read it: a one-poll gap rendered as a red fleet-wide "Mismatch", which is
+// the exact reading the grace window exists to prevent (monolith fleetStatus
+// 8663–8665, renderValidatorAssignment 8710–8714).
+describe("a telemetry gap inside the grace window is not a mismatch", () => {
+  const mismatched = {
+    validator_hotkey: "hk-grace",
+    assignment_state: "assignment_mismatch",
+    availability: "online",
+    health: "healthy",
+  };
+
+  it("reads as delayed telemetry while the grace holds, red once it lapses", () => {
+    expect(fleetStatus({ ...mismatched, _telemetry_grace: true })).toEqual([
+      "Telemetry delayed",
+      "warn",
+    ]);
+    expect(fleetStatus(mismatched)).toEqual(["Mismatch", "bad"]);
+  });
+
+  it("explains the wait instead of naming both sides of a skew", () => {
+    const view = validatorAssignmentView({ ...mismatched, _telemetry_grace: true });
+    expect(view?.label).toBe("Telemetry delayed");
+    expect(view?.tone).toBe("warn");
+    expect(view?.lines).toHaveLength(1);
+    expect(view?.lines[0]?.heading).toBeUndefined();
+    expect(view?.lines[0]?.fallback).toBe(
+      "Waiting for the next signed slot update; the last reported progress is retained briefly.",
+    );
+    // Without the grace flag the skew is named on both sides, as before.
+    expect(validatorAssignmentView(mismatched)?.lines.map((l) => l.heading)).toEqual([
+      "Platform",
+      "Heartbeat",
+    ]);
   });
 });
