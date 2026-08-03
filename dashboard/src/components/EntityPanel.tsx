@@ -9,6 +9,7 @@
 // Screener routes never open the modal: the monolith highlights the fleet
 // row on the operations page instead (resolveEntityRoute 9303–9399), which
 // is that page's job.
+import { createQuery } from "@tanstack/solid-query";
 import {
   For,
   Match,
@@ -22,6 +23,7 @@ import {
 } from "solid-js";
 import type { JSX } from "solid-js";
 
+import { publicQueryKeys, queryClient } from "../data/queryClient";
 import { getJSON } from "../lib/api";
 import { entityActions } from "../lib/entity-links";
 import {
@@ -58,7 +60,7 @@ import type { LeaderboardEntry } from "../types/leaderboard";
 import type { AgentSummaryPayload, BenchmarkProgress } from "../types/pipeline";
 import { activityStage } from "./pipeline/status";
 import { AgentEvidence } from "./evidence/AgentEvidence";
-import type { AgentEvidenceEntry } from "./evidence/AgentEvidence";
+import type { AgentEvidenceEntry, PipelineDetailPayload } from "./evidence/AgentEvidence";
 import { Consensus } from "./evidence/Consensus";
 // Pure fleet logic the validator body reads: the numeric slot order the
 // per-slot rows sort on, plus the stack-identity/component-health vocabulary.
@@ -238,10 +240,48 @@ export function EntityPanel(props: EntityPanelProps): JSX.Element {
 
   let modalEl: HTMLElement | undefined;
   let lastFocused: Element | null = null;
-  let resolvingKey = "";
 
   const isOpen = () => view() !== null;
   const settled = () => (props.settledView ? props.settledView() : false);
+
+  const agentId = (): string => {
+    const route = entityRoute();
+    return route?.kind === "agent" ? route.id : "";
+  };
+  // Summary and evidence start together when the route selects an agent. The
+  // smaller summary usually wins and paints the shell first; Solid Query keeps
+  // the larger record in its own cache row, deduplicates remounts, aborts a
+  // stale route, and lets the evidence sections settle independently.
+  const agentSummary = createQuery<AgentSummaryPayload>(
+    () => {
+      const id = agentId();
+      return {
+        queryKey: publicQueryKeys.agentSummary(id),
+        queryFn: ({ signal }) =>
+          getJSON<AgentSummaryPayload>(
+            "/public/agent/" + encodeURIComponent(id) + "/summary",
+            signal,
+          ),
+        enabled: Boolean(id),
+      };
+    },
+    () => queryClient,
+  );
+  const agentPipeline = createQuery<PipelineDetailPayload>(
+    () => {
+      const id = agentId();
+      return {
+        queryKey: publicQueryKeys.agentPipeline(id),
+        queryFn: ({ signal }) =>
+          getJSON<PipelineDetailPayload>(
+            "/public/agent/" + encodeURIComponent(id) + "/pipeline",
+            signal,
+          ),
+        enabled: Boolean(id),
+      };
+    },
+    () => queryClient,
+  );
 
   // A cold agent link resolves through /public/agent/{id}/summary (#648): one
   // addressed submission, not the first page of the global activity feed
@@ -254,8 +294,20 @@ export function EntityPanel(props: EntityPanelProps): JSX.Element {
     const key = route.key;
     const current = untrack(view);
     if (current && current.key === key && current.tenant === "agent") return;
-    if (resolvingKey === key) return;
-    resolvingKey = key;
+    if (agentSummary.isError) {
+      setView({
+        tenant: "agent-state",
+        key,
+        id: route.id,
+        message: "Submission details are temporarily unavailable. Try refreshing in a moment.",
+        state: "error",
+      });
+      return;
+    }
+    if (!agentSummary.isPending && agentSummary.data) {
+      setView({ tenant: "agent", key, entry: agentSummary.data });
+      return;
+    }
     setView({
       tenant: "agent-state",
       key,
@@ -263,27 +315,6 @@ export function EntityPanel(props: EntityPanelProps): JSX.Element {
       message: "Loading submission details…",
       state: "loading",
     });
-    getJSON<AgentSummaryPayload>("/public/agent/" + encodeURIComponent(route.id) + "/summary")
-      .then((entry) => {
-        const now = entityRoute();
-        if (!now || now.key !== key) return;
-        setView({ tenant: "agent", key, entry });
-      })
-      .catch(() => {
-        const now = entityRoute();
-        if (now && now.key === key) {
-          setView({
-            tenant: "agent-state",
-            key,
-            id: route.id,
-            message: "Submission details are temporarily unavailable. Try refreshing in a moment.",
-            state: "error",
-          });
-        }
-      })
-      .finally(() => {
-        if (resolvingKey === key) resolvingKey = "";
-      });
   }
 
   createEffect(() => {
@@ -629,6 +660,11 @@ export function EntityPanel(props: EntityPanelProps): JSX.Element {
                   entry={v().entry}
                   entries={props.entries}
                   settledView={props.settledView}
+                  pipeline={() => (agentPipeline.isPending ? undefined : agentPipeline.data)}
+                  pipelineLoading={() => agentPipeline.isPending}
+                  pipelineFetching={() => agentPipeline.isFetching}
+                  pipelineError={() => agentPipeline.error}
+                  retryPipeline={() => void agentPipeline.refetch()}
                 />
               )}
             </Match>

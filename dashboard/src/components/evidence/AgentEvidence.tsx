@@ -8,23 +8,11 @@
 // cards, model-use verdicts (#527), the review packet, artifact download
 // (#278), and the dispute form.
 //
-// #648: the summary paints from the activity/summary entry alone, and the
-// deep history sits behind a disclosure that fetches
-// /public/agent/{id}/pipeline on its FIRST open — never on mount. A direct
-// link is a question about one submission's standing, and the full evidence
-// record is several joins the reader has not asked for yet.
-import {
-  For,
-  Match,
-  Show,
-  Switch,
-  createEffect,
-  createMemo,
-  createResource,
-  createSignal,
-} from "solid-js";
-import type { JSX } from "solid-js";
+import { createQuery } from "@tanstack/solid-query";
+import { For, Show, createMemo } from "solid-js";
+import type { Accessor, JSX } from "solid-js";
 
+import { publicQueryKeys, queryClient } from "../../data/queryClient";
 import { getJSON } from "../../lib/api";
 import {
   agentName,
@@ -136,6 +124,12 @@ export interface AgentEvidenceProps {
   entries?: () => RankedEntry[];
   /** Mid-rollout settled view, for the family representative's composite. */
   settledView?: () => boolean;
+  /** The full record is queried in parallel with the summary by EntityPanel. */
+  pipeline?: Accessor<PipelineDetailPayload | undefined>;
+  pipelineLoading?: Accessor<boolean>;
+  pipelineFetching?: Accessor<boolean>;
+  pipelineError?: Accessor<unknown>;
+  retryPipeline?: () => void;
 }
 
 function StatRow(props: { k: string; v: string }): JSX.Element {
@@ -723,41 +717,45 @@ function ValidationAttemptRow(props: { attempt: ValidationAttempt }): JSX.Elemen
 
 // ── The drawer body ──────────────────────────────────────────────────────────
 //
-// The history skeleton that used to hold the ledger section ids while the
-// eager pipeline fetch was in flight is gone with #648: unopened, the
-// disclosure states what opening it will do, and the sections arrive with the
-// record they describe.
-
 export function AgentEvidence(props: AgentEvidenceProps): JSX.Element {
   const entries = () => (props.entries ? props.entries() : []);
   const settled = () => (props.settledView ? props.settledView() : false);
   const agentId = () => String(props.entry.agent_id || "");
-
-  // The history request counter is the deferral: at 0 the resource has no
-  // source, so createResource never calls the fetcher and nothing is requested
-  // on mount. The first open sets it to 1; a reopen after a failure bumps it
-  // again, which is what makes "close and reopen to retry" true rather than
-  // just advertised. Fenced by createResource's own race handling (the
-  // monolith's pipelineToken): a slow fetch for one agent never lands in
-  // another's view.
-  const [historyRequest, setHistoryRequest] = createSignal(0);
-  const [historyOpen, setHistoryOpen] = createSignal(false);
-  const [pipeline, { refetch }] = createResource(
-    () => (historyRequest() > 0 ? { id: agentId(), attempt: historyRequest() } : false),
-    (key: { id: string; attempt: number }) =>
-      getJSON<PipelineDetailPayload>("/public/agent/" + encodeURIComponent(key.id) + "/pipeline"),
+  // EntityPanel supplies the query it started alongside the summary. Keep a
+  // self-owned fallback for isolated embeds and component tests; its identical
+  // key still shares the same Solid Query cache and never duplicates a read.
+  const fallbackPipeline = createQuery<PipelineDetailPayload>(
+    () => {
+      const id = agentId();
+      return {
+        queryKey: publicQueryKeys.agentPipeline(id),
+        queryFn: ({ signal }) =>
+          getJSON<PipelineDetailPayload>(
+            "/public/agent/" + encodeURIComponent(id) + "/pipeline",
+            signal,
+          ),
+        enabled: Boolean(id) && !props.pipeline,
+      };
+    },
+    () => queryClient,
   );
-  // Re-pointing the drawer at another submission (an entity link inside the
-  // card) closes the disclosure and forgets the request, so the next agent's
-  // history is loaded when its reader asks for it, not inherited.
-  createEffect((previous: string | undefined) => {
-    const id = agentId();
-    if (previous !== undefined && previous !== id) {
-      setHistoryOpen(false);
-      setHistoryRequest(0);
-    }
-    return id;
-  });
+  const pipelineData = (): PipelineDetailPayload | undefined =>
+    props.pipeline
+      ? props.pipeline()
+      : fallbackPipeline.isPending
+        ? undefined
+        : fallbackPipeline.data;
+  const pipelineLoading = (): boolean =>
+    props.pipelineLoading ? props.pipelineLoading() : fallbackPipeline.isPending;
+  const pipelineFetching = (): boolean =>
+    props.pipelineFetching ? props.pipelineFetching() : fallbackPipeline.isFetching;
+  const pipelineError = (): unknown =>
+    props.pipelineError ? props.pipelineError() : fallbackPipeline.error;
+  const retryPipeline = (): void => {
+    if (props.retryPipeline) props.retryPipeline();
+    else void fallbackPipeline.refetch();
+  };
+
   // Transcript templates + category names; both effectively static payloads.
   const benchConfig = useEndpoint<BenchConfigPayload>("/public/bench/config");
   const glossary = useEndpoint<GlossaryPayload>("/public/bench/glossary");
@@ -777,9 +775,8 @@ export function AgentEvidence(props: AgentEvidenceProps): JSX.Element {
   };
 
   const loadedPipeline = (): PipelineDetailPayload | null => {
-    if (pipeline.error) return null;
-    const value = pipeline.latest;
-    return value && !pipeline.loading ? value : null;
+    if (pipelineError()) return null;
+    return pipelineData() || null;
   };
 
   // #622/#636 (openActivityEntry 7986–7995): the current review reason leads
@@ -871,17 +868,6 @@ export function AgentEvidence(props: AgentEvidenceProps): JSX.Element {
     const detail = loadedPipeline();
     return detail ? benchmarkCohorts(detail) : [];
   });
-
-  // The fetch fires here and nowhere else: on the first open, and again on a
-  // reopen after a failure. Toggling closed is not a request, and a loaded
-  // record is never re-requested (the monolith's dataset.loading / .loaded
-  // pair, bindPipelineHistory 8012–8039).
-  function onHistoryToggle(event: Event): void {
-    const details = event.currentTarget as HTMLDetailsElement;
-    setHistoryOpen(details.open);
-    if (!details.open || loadedPipeline() || pipeline.loading) return;
-    setHistoryRequest((attempt) => attempt + 1);
-  }
 
   return (
     <>
@@ -987,40 +973,55 @@ export function AgentEvidence(props: AgentEvidenceProps): JSX.Element {
           release={loadedPipeline()?.artifact_release || props.entry.artifact_release}
           agentId={agentId()}
         />
+        <Show when={!loadedPipeline() && pipelineLoading()}>
+          <section class="pipeline-section-loading" aria-busy="true" aria-live="polite">
+            <span class="pipeline-loading-kicker">Source availability</span>
+            <span class="pipeline-loading-line" />
+          </section>
+        </Show>
       </div>
-      <details
-        class="pipeline-history-disclosure"
+      <section
+        class="pipeline-history-region"
         data-agent-history=""
-        open={historyOpen()}
-        onToggle={onHistoryToggle}
+        aria-labelledby="pipeline-history-title"
       >
-        <summary>Screening, scores, and validator history</summary>
+        <div class="pipeline-history-heading">
+          <h4 id="pipeline-history-title">Screening, scores, and validator history</h4>
+          <Show when={pipelineFetching() && loadedPipeline()}>
+            <span class="pipeline-refreshing">Refreshing</span>
+          </Show>
+        </div>
         <div
-          class="pipeline-history-disclosure-body"
+          class="pipeline-history-body"
           data-agent-history-body=""
-          aria-busy={pipeline.loading ? "true" : undefined}
+          aria-busy={pipelineFetching() && !loadedPipeline() ? "true" : undefined}
         >
           <Show
             when={loadedPipeline()}
             fallback={
-              <Switch
+              <Show
+                when={pipelineError()}
                 fallback={
-                  <p class="pipeline-detail-state">Open to load the full evidence record.</p>
+                  <div class="pipeline-history-skeleton" role="status">
+                    <span>Loading evidence record…</span>
+                    <div class="pipeline-skeleton-section" />
+                    <div class="pipeline-skeleton-section short" />
+                    <div class="pipeline-skeleton-section" />
+                  </div>
                 }
               >
-                <Match when={pipeline.loading}>
-                  <p class="pipeline-detail-state loading" role="status">
-                    Loading the full evidence record…
-                  </p>
-                </Match>
-                <Match when={pipeline.error}>
-                  {/* Naming the retry is the whole affordance: the toggle
-                      handler re-requests on the next open. */}
-                  <p class="pipeline-detail-state error" role="status">
-                    Full history is temporarily unavailable. Close and reopen this section to retry.
-                  </p>
-                </Match>
-              </Switch>
+                <div class="pipeline-history-error" role="alert">
+                  <p>Detailed history is temporarily unavailable.</p>
+                  <button
+                    type="button"
+                    class="btn"
+                    disabled={pipelineFetching()}
+                    onClick={retryPipeline}
+                  >
+                    {pipelineFetching() ? "Retrying…" : "Retry details"}
+                  </button>
+                </div>
+              </Show>
             }
           >
             {(detail) => (
@@ -1029,7 +1030,7 @@ export function AgentEvidence(props: AgentEvidenceProps): JSX.Element {
                   agentId={agentId()}
                   status={detail().status}
                   dispute={detail().dispute}
-                  onSubmitted={() => void refetch()}
+                  onSubmitted={retryPipeline}
                 />
                 <section class="pipeline-section" aria-labelledby="pipeline-screening-history">
                   <div class="pipeline-section-heading">
@@ -1103,7 +1104,7 @@ export function AgentEvidence(props: AgentEvidenceProps): JSX.Element {
             )}
           </Show>
         </div>
-      </details>
+      </section>
     </>
   );
 }

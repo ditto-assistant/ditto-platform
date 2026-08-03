@@ -5,9 +5,21 @@ import { API_BASE } from "./config";
 
 const TIMEOUT_MS = 8000;
 
-/** GET API_BASE+path as JSON. Non-2xx rejects with `Error("HTTP <status>")`. */
-export async function getJSON<T>(path: string): Promise<T> {
+export class HTTPError extends Error {
+  constructor(public readonly status: number) {
+    super("HTTP " + status);
+    this.name = "HTTPError";
+  }
+}
+
+/** GET API_BASE+path as JSON. Non-2xx rejects with `Error("HTTP <status>")`.
+ * A caller signal (Solid Query supplies one per query) cancels obsolete route
+ * reads; the local controller still enforces the dashboard-wide deadline. */
+export async function getJSON<T>(path: string, signal?: AbortSignal): Promise<T> {
   const ctrl = new AbortController();
+  const abortFromCaller = (): void => ctrl.abort(signal?.reason);
+  if (signal?.aborted) abortFromCaller();
+  else signal?.addEventListener("abort", abortFromCaller, { once: true });
   const to = setTimeout(() => {
     ctrl.abort();
   }, TIMEOUT_MS);
@@ -21,8 +33,9 @@ export async function getJSON<T>(path: string): Promise<T> {
     // Cleared on both fulfillment and rejection; the timer only guards the
     // fetch itself, not the body parse.
     clearTimeout(to);
+    signal?.removeEventListener("abort", abortFromCaller);
   }
-  if (!response.ok) throw new Error("HTTP " + response.status);
+  if (!response.ok) throw new HTTPError(response.status);
   return (await response.json()) as T;
 }
 

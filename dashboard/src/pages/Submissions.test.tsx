@@ -16,6 +16,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { RescreenNotice } from "../components/operations/PipelineBoard";
+import { queryClient } from "../data/queryClient";
 import { AgentEvidence } from "../components/evidence/AgentEvidence";
 import {
   ScreeningDispute,
@@ -45,6 +46,7 @@ let restoreFetch: (() => void) | null = null;
 let fetchSpy: ReturnType<typeof vi.spyOn> | null = null;
 
 beforeEach(() => {
+  queryClient.removeQueries({ queryKey: ["public", "agent"] });
   vi.useFakeTimers({ toFake: ["Date"] });
   vi.setSystemTime(new Date("2026-07-31T14:00:00Z"));
   history.replaceState(null, "", "/#/submissions");
@@ -685,19 +687,13 @@ describe("screening dispute form", () => {
   });
 });
 
-// ── Deferred agent history behind a disclosure (row 30's #648 slice) ─────────
-// "A direct link is a question about one submission's standing." The drawer
-// paints from the activity/summary entry alone and requests
-// /public/agent/{id}/pipeline on the FIRST open of the history disclosure —
-// never on mount, never twice, and again on a reopen after a failure.
-describe("deferred agent history (#648)", () => {
+// ── Async agent evidence (row 30's #648 follow-up) ──────────────────────────
+// The targeted summary remains the first-paint answer, while the full evidence
+// record starts automatically and fills its own region. No user gesture owns a
+// network request; keyed Solid Query state deduplicates remounts and exposes an
+// explicit retry when the independent detail request fails.
+describe("async agent evidence", () => {
   const summary = loadFixture<AgentSummaryPayload>("agent-top-summary");
-
-  function disclosure(): HTMLDetailsElement {
-    const el = document.querySelector("[data-agent-history]");
-    if (!el) throw new Error("missing history disclosure");
-    return el as HTMLDetailsElement;
-  }
 
   function body(): HTMLElement {
     return document.querySelector("[data-agent-history-body]") as HTMLElement;
@@ -707,80 +703,72 @@ describe("deferred agent history (#648)", () => {
     return fetchedPaths().filter((path) => path.includes("/pipeline"));
   }
 
-  function toggle(): void {
-    fireEvent.click(disclosure().querySelector("summary") as HTMLElement);
+  function pipelineResponse(overrides?: Record<string, unknown>): Response {
+    return new Response(
+      JSON.stringify({
+        ...loadFixture<Record<string, unknown>>("agent-top-pipeline"),
+        ...overrides,
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    );
   }
 
-  it("renders the summary and leaves the evidence record unrequested", async () => {
+  it("paints the summary while the evidence record loads automatically", async () => {
+    let resolvePipeline: ((response: Response) => void) | undefined;
+    stubPipelineFetch(
+      () =>
+        new Promise<Response>((resolve) => {
+          resolvePipeline = resolve;
+        }),
+    );
     render(() => <AgentEvidence entry={summary} />);
     await waitFor(() => expect(document.getElementById("pipeline-current-title")).toBeTruthy());
-    expect(disclosure().querySelector("summary")?.textContent).toBe(
-      "Screening, scores, and validator history",
-    );
-    expect(disclosure().open).toBe(false);
-    expect(body().textContent).toBe("Open to load the full evidence record.");
-    expect(body().querySelector("p")?.className).toBe("pipeline-detail-state");
-    // Nothing about the deep record is fetched, and none of its sections exist.
-    expect(pipelineRequests()).toEqual([]);
-    for (const id of [
-      "pipeline-screening-history",
-      "pipeline-accepted-scores",
-      "pipeline-confirmation-scores",
-      "pipeline-validator-history",
-    ]) {
-      expect(document.getElementById(id), id).toBeNull();
-    }
-    // The affordance names the cost of the click, in CSS, both ways.
-    expect(SUBMISSIONS_CSS).toContain('content: "Load details"');
-    expect(SUBMISSIONS_CSS).toContain('content: "Hide details"');
-    expect(SUBMISSIONS_CSS).toContain('.pipeline-history-disclosure-body[aria-busy="true"]');
+    expect(document.getElementById("pipeline-meta-title")).toBeTruthy();
+    expect(pipelineRequests()).toHaveLength(1);
+    expect(body()).toHaveAttribute("aria-busy", "true");
+    expect(body().textContent).toContain("Loading evidence record…");
+    expect(document.querySelector(".pipeline-history-skeleton")).toBeTruthy();
+    expect(document.querySelector(".pipeline-section-loading")).toBeTruthy();
+    expect(document.querySelector("[data-agent-history]")?.tagName).toBe("SECTION");
+    expect(document.body.textContent).not.toContain("Load details");
+
+    resolvePipeline?.(pipelineResponse());
+    await waitFor(() => expect(document.getElementById("pipeline-validator-history")).toBeTruthy());
+    expect(body()).not.toHaveAttribute("aria-busy");
   });
 
-  it("fetches the record on the first open only, and keeps it across a reopen", async () => {
+  it("deduplicates the keyed record across an unmount and remount", async () => {
     render(() => <AgentEvidence entry={summary} />);
-    await waitFor(() => expect(document.getElementById("pipeline-current-title")).toBeTruthy());
-    toggle();
-    // While in flight the body says so and is marked busy for AT.
-    await waitFor(() => expect(body()).toHaveAttribute("aria-busy", "true"));
-    expect(body().textContent).toBe("Loading the full evidence record…");
-    expect(body().querySelector("p")).toHaveAttribute("role", "status");
     await waitFor(() => expect(document.getElementById("pipeline-validator-history")).toBeTruthy());
     expect(pipelineRequests()).toHaveLength(1);
     expect(pipelineRequests()[0]).toContain("/public/agent/" + FIXTURE_TOP_AGENT_ID + "/pipeline");
-    expect(body()).not.toHaveAttribute("aria-busy");
-    // The record stays open once loaded, and closing/reopening never refetches.
-    expect(disclosure().open).toBe(true);
-    toggle();
-    await waitFor(() => expect(disclosure().open).toBe(false));
-    toggle();
-    await waitFor(() => expect(disclosure().open).toBe(true));
+
+    cleanup();
+    render(() => <AgentEvidence entry={summary} />);
+    await waitFor(() => expect(document.getElementById("pipeline-validator-history")).toBeTruthy());
     expect(document.getElementById("pipeline-accepted-scores")).toBeTruthy();
     expect(pipelineRequests()).toHaveLength(1);
   });
 
-  it("names the retry after a failure, and honours it on close and reopen", async () => {
-    // The summary is served from the fixtures; only the deep record fails.
-    stubPipelineFetch(() => Promise.reject(new Error("down")));
+  it("isolates a detail failure and retries from the section", async () => {
+    let attempts = 0;
+    stubPipelineFetch(() => {
+      attempts += 1;
+      return attempts < 3 ? Promise.reject(new Error("down")) : Promise.resolve(pipelineResponse());
+    });
     render(() => <AgentEvidence entry={summary} />);
     await waitFor(() => expect(document.getElementById("pipeline-current-title")).toBeTruthy());
-    toggle();
     await waitFor(() =>
-      expect(body().textContent).toBe(
-        "Full history is temporarily unavailable. Close and reopen this section to retry.",
-      ),
+      expect(body().textContent).toContain("Detailed history is temporarily unavailable."),
     );
-    expect(body().querySelector("p")?.className).toBe("pipeline-detail-state error");
     expect(body()).not.toHaveAttribute("aria-busy");
-    expect(pipelineRequests()).toHaveLength(1);
-    // Closing is not a request; reopening is the advertised retry.
-    toggle();
-    await waitFor(() => expect(disclosure().open).toBe(false));
-    expect(pipelineRequests()).toHaveLength(1);
-    toggle();
-    await waitFor(() => expect(pipelineRequests()).toHaveLength(2));
+    expect(pipelineRequests()).toHaveLength(2); // initial read + one transient retry
+    fireEvent.click(body().querySelector("button") as HTMLButtonElement);
+    await waitFor(() => expect(document.getElementById("pipeline-validator-history")).toBeTruthy());
+    expect(pipelineRequests()).toHaveLength(3);
   });
 
-  it("carries the median and the runs in flight while the record is closed", async () => {
+  it("keeps summary facts visible while the independent record is pending", async () => {
     const running = {
       ...summary,
       score_count: 1,
@@ -796,7 +784,14 @@ describe("deferred agent history (#648)", () => {
         },
       ],
     } satisfies AgentSummaryPayload;
-    render(() => <AgentEvidence entry={running} />);
+    const pendingProps = {
+      pipeline: () => undefined,
+      pipelineLoading: () => true,
+      pipelineFetching: () => true,
+      pipelineError: () => null,
+      retryPipeline: () => undefined,
+    };
+    render(() => <AgentEvidence entry={running} {...pendingProps} />);
     await waitFor(() => expect(document.getElementById("pipeline-current-title")).toBeTruthy());
     const facts = document.querySelector(".pipeline-key-facts") as HTMLElement;
     // Below quorum the median is labelled for what it is.
@@ -806,8 +801,7 @@ describe("deferred agent history (#648)", () => {
     expect(document.querySelector(".pipeline-current .benchmark-progress")).toBeTruthy();
     cleanup();
 
-    // At quorum the same row is the canonical number.
-    render(() => <AgentEvidence entry={summary} />);
+    render(() => <AgentEvidence entry={summary} {...pendingProps} />);
     await waitFor(() => expect(document.getElementById("pipeline-current-title")).toBeTruthy());
     const atQuorum = document.querySelector(".pipeline-key-facts") as HTMLElement;
     expect(atQuorum.textContent).toContain("Canonical median");
@@ -817,24 +811,21 @@ describe("deferred agent history (#648)", () => {
   it("prefers the loaded record's artifact release, falling back to the entry's", async () => {
     // #648 put artifact_release on the pipeline payload; the entry's copy is
     // what paints until the record lands, and the record wins once it has.
-    const pipeline = loadFixture<Record<string, unknown>>("agent-top-pipeline");
-    stubPipelineFetch(() =>
-      Promise.resolve(
-        new Response(
-          JSON.stringify({
-            ...pipeline,
-            artifact_release: { status: "available", embargo_hours: 48 },
-          }),
-          { status: 200, headers: { "content-type": "application/json" } },
-        ),
-      ),
+    let resolvePipeline: ((response: Response) => void) | undefined;
+    stubPipelineFetch(
+      () =>
+        new Promise<Response>((resolve) => {
+          resolvePipeline = resolve;
+        }),
     );
     render(() => (
       <AgentEvidence entry={{ ...summary, artifact_release: { status: "awaiting_quorum" } }} />
     ));
     await waitFor(() => expect(document.getElementById("pipeline-current-title")).toBeTruthy());
     expect(document.querySelector(".artifact-release-card")?.textContent).toContain("Awaiting 3/3");
-    toggle();
+    resolvePipeline?.(
+      pipelineResponse({ artifact_release: { status: "available", embargo_hours: 48 } }),
+    );
     await waitFor(() =>
       expect(document.querySelector(".artifact-release-card")?.textContent).toContain(
         "Source public",

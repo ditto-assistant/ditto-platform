@@ -9,11 +9,12 @@
 // markup — and the hotkey stays the anchor identity; and row 30's #648 slice:
 // a cold agent link resolves through /public/agent/{id}/summary (never the
 // activity feed), the loading state shows for overlay routes too, and the deep
-// history stays unrequested behind its disclosure.
+// history starts concurrently without blocking the summary paint.
 import { cleanup, render, waitFor } from "@solidjs/testing-library";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { rankEntries } from "../lib/scoring";
+import { queryClient } from "../data/queryClient";
 import { syncFromLocation } from "../stores/routeStore";
 import { FIXTURE_TOP_AGENT_ID, installFixtureFetch, loadFixture } from "../test-fixtures";
 import type { OperationsPayload } from "../types/fleet";
@@ -29,6 +30,7 @@ const validatorHotkey = String(operations.validators.validators?.[0]?.validator_
 let restoreFetch: (() => void) | null = null;
 
 beforeEach(() => {
+  queryClient.removeQueries({ queryKey: ["public", "agent"] });
   history.replaceState(null, "", "/#/overview");
   syncFromLocation();
   restoreFetch = installFixtureFetch();
@@ -170,8 +172,7 @@ describe("EntityPanel agent tenant", () => {
     );
     // #648: one addressed submission, never the global feed narrowed to it.
     expect(paths().some((path) => path.includes("/public/activity"))).toBe(false);
-    // The summary paints immediately; the deep history is behind a disclosure
-    // and its endpoint has not been touched.
+    // The summary paints independently while the deep history query settles.
     expect(document.querySelector("[data-agent-evidence]")).toHaveAttribute(
       "data-agent-evidence",
       FIXTURE_TOP_AGENT_ID,
@@ -180,11 +181,14 @@ describe("EntityPanel agent tenant", () => {
       expect(document.getElementById(id), id).toBeTruthy();
     }
     expect(document.querySelector("[data-agent-history]")).toBeTruthy();
-    expect(document.querySelector("[data-agent-history-body]")?.textContent).toBe(
-      "Open to load the full evidence record.",
-    );
-    expect(paths().some((path) => path.includes("/pipeline"))).toBe(false);
-    expect(document.getElementById("pipeline-validator-history")).toBeNull();
+    await waitFor(() => expect(document.getElementById("pipeline-validator-history")).toBeTruthy());
+    expect(
+      paths().filter((path) =>
+        path.endsWith("/public/agent/" + FIXTURE_TOP_AGENT_ID + "/pipeline"),
+      ),
+    ).toHaveLength(1);
+    expect(document.querySelector("[data-agent-history]")?.tagName).toBe("SECTION");
+    expect(document.body.textContent).not.toContain("Load details");
     spy.mockRestore();
   });
 

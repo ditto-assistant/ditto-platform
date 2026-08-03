@@ -132,6 +132,15 @@ describe("no board disclosure (row 3)", () => {
   });
 });
 
+// Agent evidence is data, not an optional action. The summary and history may
+// settle at different times, but neither request is gated on a click.
+describe("no manual agent-detail gate", () => {
+  it("ships no load-details affordance", () => {
+    expect(distText).not.toContain("Load details");
+    expect(srcText).not.toContain("pipeline-history-disclosure");
+  });
+});
+
 // ── Row 20 half: the rollout target never overwrites the current bench ──────
 describe("bench authority (row 20)", () => {
   it("never assigns the desired version over the current bench", () => {

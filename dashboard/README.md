@@ -1,6 +1,8 @@
 # Ditto SN118 public dashboard
 
-The public "front door" for Subnet 118: a Vite + SolidJS + TypeScript SPA. No
+The public "front door" for Subnet 118: a Vite + SolidJS + TypeScript SPA. Its
+agent drilldown uses TanStack Solid Query for keyed request caching,
+cancellation, and retries. No
 external requests at runtime, **no secrets** — it reads the platform's public
 API and links out to wandb for the per-epoch deep dive. This is Surface 3 in
 [`docs/public-telemetry.md`](../docs/public-telemetry.md).
@@ -45,6 +47,9 @@ API and links out to wandb for the per-epoch deep dive. This is Surface 3 in
   includes its post-commit seed and a
   version-pinned `dittobench-datagen` reproduction command, without exposing
   ticket signatures or associating the number with a validator identity.
+  Agent links start a targeted summary and the larger evidence record in
+  parallel. The summary paints first; source state, scores, screening, and
+  validator history fill in asynchronously without a manual load control.
 - **Validator fleet** — signed worker availability, coarse system health, and
   the public active agent with the same stage/progress shown in the pipeline.
   Old clients render as progress not reported; expired or stale work disappears.
