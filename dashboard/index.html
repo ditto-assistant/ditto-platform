@@ -996,6 +996,27 @@
       .score-headline-item { flex: 1 1 132px; min-width: 0; }
     }
     .pipeline-history { display: grid; gap: var(--detail-space-xl); padding-top: var(--detail-space-xl); }
+    .pipeline-history-disclosure {
+      margin-top: var(--detail-space-xl);
+      border-top: 1px solid color-mix(in oklab, var(--border) 72%, transparent);
+    }
+    .pipeline-history-disclosure > summary {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: var(--detail-space-md);
+      padding: var(--detail-space-lg) 0;
+      color: var(--text);
+      font-size: 13px;
+      font-weight: 750;
+      cursor: pointer;
+      list-style: none;
+    }
+    .pipeline-history-disclosure > summary::-webkit-details-marker { display: none; }
+    .pipeline-history-disclosure > summary::after { content: "Load details"; color: var(--text-faint); font: 650 10.5px/1.3 var(--mono); text-transform: uppercase; }
+    .pipeline-history-disclosure[open] > summary::after { content: "Hide details"; }
+    .pipeline-history-disclosure > summary:hover { color: var(--accent); }
+    .pipeline-history-disclosure-body[aria-busy="true"] { color: var(--text-faint); }
     .pipeline-section-heading { display: flex; align-items: baseline; justify-content: space-between; gap: var(--detail-space-lg); margin-bottom: var(--detail-space-sm); }
     .pipeline-section-count { color: var(--text-faint); font-size: 11.5px; font-variant-numeric: tabular-nums; }
     .pipeline-detail-state { margin: 0; padding: var(--detail-space-md) 0; color: var(--text-dim); font-size: 12.5px; line-height: 1.5; }
@@ -6425,7 +6446,13 @@
       lastFocused = null;
       activeEntityKey = "";
       resolvingEntityKey = "";
+      pipelineToken = null;
       entityReturnUrl = "";
+      if (!bootComplete) {
+        setTimeout(function () {
+          if (!readEntityRoute()) load(false);
+        }, 0);
+      }
     }
 
     // ── Events (delegated) ───────────────────────────────────
@@ -7928,6 +7955,15 @@
       if (retests.running) retestFact.push(retests.running + " running");
       if (retests.assigned) retestFact.push(retests.assigned + " assigned");
       if (retests.expired) retestFact.push(retests.expired + " expired");
+      var activeProgress = !pipeline && Array.isArray(e.active_benchmarks)
+        ? e.active_benchmarks.map(function (progress) {
+            return renderBenchmarkProgress(progress, false);
+          }).join("")
+        : "";
+      var summaryScore = !pipeline && e.score_composite != null
+        ? '<div><dt>' + (scoreCount >= quorum ? 'Canonical median' : 'Preliminary median') +
+          '</dt><dd>' + fx(e.score_composite) + '</dd></div>'
+        : "";
       return '<div class="pipeline-detail">' +
         renderScoreHeadline(pipeline) +
         renderFamilyStanding(pipeline) +
@@ -7935,8 +7971,10 @@
           '<section class="pipeline-current" aria-labelledby="pipeline-current-title">' +
             '<h4 id="pipeline-current-title">Current progress</h4>' +
             '<p class="pipeline-current-message">' + esc(validationDetail(current)) + '</p>' +
+            activeProgress +
             '<dl class="pipeline-key-facts">' +
               '<div><dt>' + esc(validationLabel) + '</dt><dd>' + esc(scoreCount) + ' of ' + esc(quorum) + '</dd></div>' +
+              summaryScore +
               (retestFact.length ? '<div><dt>Continual retests</dt><dd>' + esc(retestFact.join(" · ")) + '</dd></div>' : "") +
               renderPreliminaryFact(currentCohort, quorum) +
               '<div><dt>Submitted</dt><dd>' + esc(new Date(e.submitted_at).toLocaleString()) + '</dd></div>' +
@@ -7952,9 +7990,52 @@
             '</dl>' + reviewPacketButton(e) +
           '</section>' +
         '</div>' +
-        renderArtifactRelease(e.artifact_release, e.agent_id) +
+        renderArtifactRelease(
+          (pipeline && pipeline.artifact_release) || e.artifact_release,
+          e.agent_id
+        ) +
         (stateMessage ? '<p class="pipeline-detail-state ' + esc(stateClass || "") + '">' + esc(stateMessage) + '</p>' : '') +
       '</div>';
+    }
+
+    function renderPipelineHistoryDisclosure(e, pipeline, expanded) {
+      var loaded = Boolean(pipeline);
+      return '<details class="pipeline-history-disclosure" data-agent-history' + (loaded && expanded !== false ? ' open' : '') + '>' +
+        '<summary>Screening, scores, and validator history</summary>' +
+        '<div class="pipeline-history-disclosure-body" data-agent-history-body>' +
+          (loaded
+            ? renderPipelineDetail(e, pipeline)
+            : '<p class="pipeline-detail-state">Open to load the full evidence record.</p>') +
+        '</div></details>';
+    }
+
+    function bindPipelineHistory(e, evidence) {
+      var disclosure = document.querySelector("[data-agent-history]");
+      if (!disclosure || disclosure.dataset.loaded === "true") return;
+      disclosure.addEventListener("toggle", function () {
+        if (!disclosure.open || disclosure.dataset.loading === "true" || disclosure.dataset.loaded === "true") return;
+        var body = disclosure.querySelector("[data-agent-history-body]");
+        disclosure.dataset.loading = "true";
+        body.setAttribute("aria-busy", "true");
+        body.innerHTML = '<p class="pipeline-detail-state loading" role="status">Loading the full evidence record…</p>';
+        pipelineToken = e.agent_id;
+        getJSON("/public/agent/" + encodeURIComponent(e.agent_id) + "/pipeline")
+          .then(function (pipeline) {
+            if (pipelineToken !== e.agent_id) return;
+            var expanded = disclosure.open;
+            document.getElementById("d-stats").innerHTML =
+              renderPipelineSummary(e, pipeline, evidence) +
+              renderPipelineHistoryDisclosure(e, pipeline, expanded);
+            bindScreeningDispute(e);
+            refreshElapsedFlag();
+          })
+          .catch(function () {
+            if (pipelineToken !== e.agent_id) return;
+            disclosure.dataset.loading = "false";
+            body.removeAttribute("aria-busy");
+            body.innerHTML = '<p class="pipeline-detail-state error" role="status">Full history is temporarily unavailable. Close and reopen this section to retry.</p>';
+          });
+      });
     }
 
     function showAgentRouteState(entity, message, stateClass) {
@@ -8004,31 +8085,11 @@
       document.querySelector("#modal .dk-label").textContent = "Miner";
       document.getElementById("d-hotkey").innerHTML = entityAnchor("miner", e.miner_hotkey, e.miner_hotkey);
       document.getElementById("d-hotkey-copy").setAttribute("data-key", e.miner_hotkey || "");
-      document.getElementById("d-stats").innerHTML = renderPipelineSummary(
-        e, null, evidence, "Loading screening and validation history…", "loading"
-      );
+      document.getElementById("d-stats").innerHTML =
+        renderPipelineSummary(e, null, evidence) + renderPipelineHistoryDisclosure(e, null);
       showModal();
-      pipelineToken = e.agent_id;
-      getJSON("/public/agent/" + encodeURIComponent(e.agent_id) + "/pipeline")
-        .then(function (pipeline) {
-          if (pipelineToken !== e.agent_id) return;
-          document.getElementById("d-stats").innerHTML =
-            renderPipelineSummary(e, pipeline, evidence) + renderPipelineDetail(e, pipeline);
-          bindScreeningDispute(e);
-          // The detail can inject .benchmark-progress-time nodes (a third
-          // emitter besides the pipeline board and the fleet table); refresh
-          // the flag so the 1s updater keeps them ticking.
-          refreshElapsedFlag();
-        })
-        .catch(function () {
-          if (pipelineToken !== e.agent_id) return;
-          var el = document.getElementById("d-stats");
-          var state = el.querySelector(".pipeline-detail-state");
-          if (state) {
-            state.className = "pipeline-detail-state error";
-            state.textContent = "Detailed history is temporarily unavailable.";
-          }
-        });
+      pipelineToken = null;
+      bindPipelineHistory(e, evidence);
     }
 
     function openActivityModal(i) {
@@ -9689,19 +9750,14 @@
         if (activeEntityKey === entity.key && document.getElementById("modal").classList.contains("open")) return;
         if (resolvingEntityKey === entity.key) return;
         resolvingEntityKey = entity.key;
-        if (entity.full) showAgentRouteState(entity, "Loading submission details…", "loading");
-        getJSON("/public/activity?page=1&limit=1&q=" + encodeURIComponent(entity.id))
-          .then(function (data) {
+        showAgentRouteState(entity, "Loading submission details…", "loading");
+        getJSON("/public/agent/" + encodeURIComponent(entity.id) + "/summary")
+          .then(function (entry) {
             if (!readEntityRoute() || readEntityRoute().key !== entity.key) return;
-            var entry = (data.entries || []).find(function (item) { return String(item.agent_id) === entity.id; });
-            if (entry) {
-              openActivityEntry(entry, true);
-            } else if (entity.full) {
-              showAgentRouteState(entity, "This submission could not be found.", "error");
-            }
+            openActivityEntry(entry, true);
           })
           .catch(function () {
-            if (entity.full && readEntityRoute() && readEntityRoute().key === entity.key) {
+            if (readEntityRoute() && readEntityRoute().key === entity.key) {
               showAgentRouteState(entity, "Submission details are temporarily unavailable. Try refreshing in a moment.", "error");
             }
           })
@@ -10031,6 +10087,11 @@
       // timestamps) even where the data is byte-identical.
       if (manual) { setStatus("", "Refreshing…"); forceRender(); }
       var entity = readEntityRoute();
+      // An agent deep link is an entity-first surface. Pause the global board,
+      // fleet, search-corpus, and timeline reads while its card is open; they
+      // are unrelated to the answer the reader is waiting for. Closing the
+      // card hydrates the dashboard once.
+      if (entity && entity.kind === "agents") return;
       var page = activePageName();
       // The first load seeds every section so the global-search corpus (miners
       // from the leaderboard + submissions from operations) is complete; later
@@ -10253,7 +10314,8 @@
     var OPS_REFRESH_MS = 5000;
     setInterval(function () {
       if (document.hidden) return;
-      if (currentPageName() === "operations") loadOperations();
+      var entity = readEntityRoute();
+      if (currentPageName() === "operations" && !(entity && entity.kind === "agents")) loadOperations();
     }, OPS_REFRESH_MS);
     document.addEventListener("visibilitychange", function () {
       if (!document.hidden && refreshStale) {

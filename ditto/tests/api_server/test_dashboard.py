@@ -161,6 +161,7 @@ class TestDashboard:
             "/api/v1/public/weights",
             "/api/v1/public/activity",
             "/api/v1/public/operations",
+            "/api/v1/public/agent/{agent_id}/summary",
             "/api/v1/public/validators",
             "/api/v1/public/screeners",
         ],
@@ -1561,11 +1562,24 @@ class TestDashboard:
         assert 'data-entity-kind="' in body
         assert 'history.pushState({ entity: true }, "", href)' in body
         assert 'window.addEventListener("popstate"' in body
-        assert "if (entity.full) showAgentRouteState(" in body
+        assert (
+            'showAgentRouteState(entity, "Loading submission details…", "loading")'
+            in body
+        )
         assert '"Loading submission details…", "loading"' in body
-        assert '"This submission could not be found.", "error"' in body
         assert '"Submission details are temporarily unavailable.' in body
-        assert 'getJSON("/public/activity?page=1&limit=1&q="' in body
+        assert (
+            'getJSON("/public/agent/" + encodeURIComponent(entity.id) + "/summary")'
+            in body
+        )
+        assert 'getJSON("/public/activity?page=1&limit=1&q="' not in body
+        assert "data-agent-history" in body
+        assert "Open to load the full evidence record." in body
+        assert (
+            'getJSON("/public/agent/" + encodeURIComponent(e.agent_id) + "/pipeline")'
+            in body
+        )
+        assert 'if (entity && entity.kind === "agents") return;' in body
         assert 'target.setAttribute("aria-current", "true")' in body
 
     async def test_mobile_sidebar_stays_below_modal(self) -> None:

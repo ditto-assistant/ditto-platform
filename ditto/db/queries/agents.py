@@ -301,6 +301,7 @@ class PublicActivityRow:
     highest_composite: float | None
     last_scored_at: datetime | None
     screening_attempt: ScreeningAttempt | None
+    score_composite: float | None = None
     miner_coldkey: str | None = None
     """Payment-time owner identity, ``None`` for rows that predate payments.
 
@@ -308,6 +309,101 @@ class PublicActivityRow:
     owner the validator ticket allocator partitions on
     (:func:`ditto.db.queries.scores.emission_owner_key`) instead of by hotkey.
     Moderation-only, never exposed on the wire."""
+
+
+async def get_public_activity_by_id(
+    session: AsyncSession,
+    *,
+    agent_id: UUID,
+    bench_version: int,
+) -> PublicActivityRow | None:
+    """Return the compact public projection inputs for one exact submission.
+
+    The paginated activity endpoint derives filters after loading the whole
+    activity population because its public statuses depend on shared queue
+    state. Agent deep links do not need that population: their hot path needs
+    identity, current score progress, and an active screening attempt only.
+    Keep the agent predicate inside the score aggregate so opening one card does
+    not group every score row in the ledger.
+    """
+    score_counts = (
+        select(
+            Score.agent_id,
+            func.count(Score.validator_hotkey).label("score_count"),
+            func.avg(Score.composite).label("provisional_composite"),
+            func.percentile_cont(0.5)
+            .within_group(Score.composite)
+            .label("score_composite"),
+            func.max(Score.composite).label("highest_composite"),
+            func.max(Score.updated_at).label("last_scored_at"),
+        )
+        .where(
+            Score.agent_id == agent_id,
+            Score.bench_version == bench_version,
+        )
+        .group_by(Score.agent_id)
+        .subquery()
+    )
+    first_composite = (
+        select(Score.composite)
+        .where(
+            Score.agent_id == agent_id,
+            Score.bench_version == bench_version,
+        )
+        .order_by(Score.created_at.asc(), Score.validator_hotkey.asc())
+        .limit(1)
+        .scalar_subquery()
+    )
+    result = await session.execute(
+        select(
+            Agent,
+            func.coalesce(score_counts.c.score_count, 0),
+            score_counts.c.provisional_composite,
+            score_counts.c.score_composite,
+            first_composite,
+            score_counts.c.highest_composite,
+            score_counts.c.last_scored_at,
+            ScreeningAttempt,
+        )
+        .outerjoin(score_counts, score_counts.c.agent_id == Agent.agent_id)
+        .outerjoin(
+            ScreeningAttempt,
+            (ScreeningAttempt.agent_id == Agent.agent_id)
+            & (ScreeningAttempt.status == "running"),
+        )
+        .where(Agent.agent_id == agent_id)
+    )
+    values = result.first()
+    if values is None:
+        return None
+    (
+        agent,
+        score_count,
+        provisional_composite,
+        score_composite,
+        first_composite_value,
+        highest_composite,
+        last_scored_at,
+        screening_attempt,
+    ) = values
+    return PublicActivityRow(
+        agent=agent,
+        score_count=int(score_count),
+        provisional_composite=(
+            float(provisional_composite) if provisional_composite is not None else None
+        ),
+        first_composite=(
+            float(first_composite_value) if first_composite_value is not None else None
+        ),
+        highest_composite=(
+            float(highest_composite) if highest_composite is not None else None
+        ),
+        last_scored_at=last_scored_at,
+        screening_attempt=screening_attempt,
+        score_composite=(
+            float(score_composite) if score_composite is not None else None
+        ),
+    )
 
 
 async def list_public_activity(
