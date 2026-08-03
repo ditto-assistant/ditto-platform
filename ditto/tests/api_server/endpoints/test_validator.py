@@ -4116,6 +4116,68 @@ class TestRequestJob:
         # Refused on the era, before the priority question is even asked.
         outstanding.assert_not_awaited()
 
+    async def test_source_backfill_honors_relaxed_open_rollout_policy(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An explicit interleave policy also opens source-version backfill.
+
+        Carryover and source backfill are the two previous-generation lanes.
+        Requiring the full cohort unconditionally here made the shared
+        ``require_cohort_complete=False`` operator setting effective for only
+        the adopted lane, leaving legitimate source work idle through the
+        entire rollout.
+        """
+        now = datetime.now(UTC)
+        rollout = MagicMock(
+            rollout_id=uuid4(),
+            from_version=_BENCH_VERSION,
+            desired_version=_BENCH_VERSION + 1,
+            cohort_size=15,
+        )
+        session = AsyncMock()
+        session.get_bind = MagicMock(
+            return_value=MagicMock(dialect=MagicMock(name="sqlite"))
+        )
+        # No live source lease and no active source backfill consume the one-slot
+        # floor. The compatible heartbeat list may be empty in this focused
+        # helper test; capacity=1 is the intentional minimum.
+        session.scalar = AsyncMock(side_effect=(None, 0))
+        session.scalars = AsyncMock(
+            return_value=MagicMock(all=MagicMock(return_value=[]))
+        )
+        issued = MagicMock()
+        issue = AsyncMock(return_value=issued)
+        complete = AsyncMock(return_value=False)
+        monkeypatch.setattr(
+            "ditto.api_server.endpoints.validator.heartbeat_supports_version",
+            MagicMock(return_value=True),
+        )
+        monkeypatch.setattr(
+            "ditto.api_server.endpoints.validator.rollout_cohort_complete", complete
+        )
+        monkeypatch.setattr("ditto.api_server.endpoints.validator.issue_ticket", issue)
+
+        ticket = await _issue_source_backfill_ticket(
+            session,
+            rollout=rollout,
+            heartbeat=MagicMock(),
+            validator_hotkey="validator-a",
+            now=now,
+            active_version=_BENCH_VERSION,
+            artifact_mode="screened_only",
+            validator_running_benchmark=False,
+            slot_id="slot-1",
+            carryover_settings=PrevGenCarryoverSettings(
+                enabled=True,
+                require_cohort_complete=False,
+                require_desired_era_drained=False,
+            ),
+        )
+
+        assert ticket is issued
+        complete.assert_not_awaited()
+        issue.assert_awaited_once()
+
     async def test_no_operator_setting_can_reopen_the_retired_era_backfill(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

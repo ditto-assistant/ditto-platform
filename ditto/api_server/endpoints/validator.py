@@ -1103,8 +1103,9 @@ async def _issue_source_backfill_ticket(
     """Use otherwise-idle capacity after the desired era has nothing to give.
 
     Previous-generation work answers to the same operator policy as the adopted
-    carryover below (``queue_policy.prev_gen_carryover``): it issues only into a
-    genuinely empty desired-era queue.
+    carryover below (``queue_policy.prev_gen_carryover``): by default it waits
+    for the cohort and a genuinely empty desired-era queue, while an operator
+    can explicitly relax either gate for bounded interleaving.
 
     ``active_version`` is the era the fleet is actually scoring. While a rollout
     is open it equals ``rollout.from_version``, and this lane does what it was
@@ -1143,7 +1144,7 @@ async def _issue_source_backfill_ticket(
         heartbeat, now=now, version=rollout.from_version
     ):
         return None
-    if not await rollout_cohort_complete(
+    if carryover_settings.require_cohort_complete and not await rollout_cohort_complete(
         session, rollout=rollout, cohort_size=rollout.cohort_size
     ):
         return None
