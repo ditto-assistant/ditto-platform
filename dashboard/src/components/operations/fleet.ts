@@ -1,0 +1,393 @@
+// Pure fleet logic (monolith 8185–8527 + updateFleetLedger 8845–8884). The
+// status ladder itself (fleetStatus / offlineAwareFleetStatus) is shared with
+// the validator modal and lives in components/EntityPanel; the wrappers here
+// only substitute the snapshot-read bench-gate label the shared copy cannot
+// know ("No bench v7" instead of the no-version "Bench unsupported").
+import { fleetStatus, offlineAwareFleetStatus } from "../EntityPanel";
+import { relDuration, relTimeUntil } from "../../lib/format";
+import type { FleetEntry, FleetReport } from "../../types/fleet";
+
+/** A slot whose lease an operator evicted while the validator's benchmark
+ * container may still be executing (#537). */
+export interface OrphanedSlot {
+  slot_id?: string | null;
+  /** "still_running" is the validator's own signed claim; anything else is
+   * honest ignorance (heartbeat protocol < 16 omits quiet slots). */
+  state?: string | null;
+  orphaned_for_seconds?: number | null;
+  agent_id?: string | null;
+  agent_name?: string | null;
+  original_deadline?: string | null;
+  protocol_version?: number | string | null;
+  reason?: string | null;
+}
+
+/** Fleet fields beyond the shared wire type. */
+export interface FleetEntryExt extends FleetEntry {
+  bench_serviceability?: string | null;
+  scorer_liveness?: string | null;
+  allowed_slots?: number | null;
+  orphaned_slots?: OrphanedSlot[] | null;
+}
+
+export interface SlotPolicy {
+  max_concurrent_slots?: number | null;
+  disk_percent_ceiling?: number | null;
+}
+
+/** Snapshot fields beyond the shared FleetReport. */
+export interface FleetReportExt extends FleetReport {
+  active_bench_version?: number | null;
+  stale_window_seconds?: number | null;
+  slot_policy?: SlotPolicy | null;
+}
+
+export type FleetSingular = "validator" | "screener";
+
+/** Stake-weighted validator order (8190–8205): stake desc, weightless last,
+ * hotkey as the deterministic tiebreak. Screeners keep feed order. */
+export function sortFleetEntries(
+  entries: FleetEntryExt[],
+  singular: FleetSingular,
+  stakes: Record<string, number>,
+): FleetEntryExt[] {
+  if (singular !== "validator") return entries;
+  return entries.slice().sort((left, right) => {
+    const leftHotkey = String(left.validator_hotkey || "");
+    const rightHotkey = String(right.validator_hotkey || "");
+    const leftStake = stakes[leftHotkey];
+    const rightStake = stakes[rightHotkey];
+    const leftHasStake = Number.isFinite(leftStake);
+    const rightHasStake = Number.isFinite(rightStake);
+    if (leftHasStake && rightHasStake && leftStake !== rightStake) {
+      return (rightStake as number) - (leftStake as number);
+    }
+    if (leftHasStake !== rightHasStake) return leftHasStake ? -1 : 1;
+    if (leftHotkey < rightHotkey) return -1;
+    if (leftHotkey > rightHotkey) return 1;
+    return 0;
+  });
+}
+
+/** Worker-state chip (8207–8219). */
+export function fleetWork(state: string | null | undefined, role: FleetSingular): [string, string] {
+  const states: Record<string, [string, string]> = {
+    polling: ["Polling", "progress"],
+    running_benchmark: ["Running benchmark", "progress"],
+    updating_weights: ["Updating weights", "progress"],
+    screening: ["Screening", "progress"],
+    idle: ["Idle", "good"],
+    paused: ["Paused", "warn"],
+    error: ["Error", "bad"],
+  };
+  const fallback: [string, string] =
+    role === "screener" ? ["Waiting for work", ""] : ["Unknown", ""];
+  return (state != null && states[state]) || fallback;
+}
+
+/** The bench gate names the version from the snapshot, never a literal
+ * (8300–8303). */
+export function benchGateLabel(version: number | null): string {
+  return version ? "No bench v" + version : "Bench unsupported";
+}
+
+/** Shared fleetStatus with the versioned bench-gate label substituted for
+ * the shared module's no-version fallback. Precedence is untouched:
+ * Obsolete build > Scorer down > bench gate (8305–8328). */
+export function fleetStatusFor(
+  entry: FleetEntryExt,
+  benchVersion: number | null,
+): [string, string] {
+  const status = fleetStatus(entry);
+  if (status[0] === "Bench unsupported") return [benchGateLabel(benchVersion), "bad"];
+  return status;
+}
+
+/** offlineAwareFleetStatus with the same bench-gate substitution: a badge on
+ * an already-offline node only restates that it is gone unless it names a
+ * real fault (8334–8338). */
+export function offlineAwareFleetStatusFor(
+  entry: FleetEntryExt,
+  benchVersion: number | null,
+): [string, string] {
+  const status = offlineAwareFleetStatus(entry);
+  if (status[0] === "Bench unsupported") return [benchGateLabel(benchVersion), "bad"];
+  return status;
+}
+
+export const FLEET_LEDGER_KEYS = [
+  "healthy",
+  "critical",
+  "warning",
+  "stale",
+  "offline",
+  "paused",
+  "unknown",
+] as const;
+
+export type FleetLedgerKey = (typeof FLEET_LEDGER_KEYS)[number];
+
+/** Ledger buckets (updateFleetLedger 8845–8859). Critical is counted before
+ * availability: a validator whose scorer is not serving is broken whether or
+ * not it is also quiet, and burying it under "stale" is how it stayed
+ * invisible. */
+export function fleetLedgerCounts(entries: FleetEntryExt[]): Record<FleetLedgerKey, number> {
+  const counts: Record<FleetLedgerKey, number> = {
+    healthy: 0,
+    critical: 0,
+    warning: 0,
+    stale: 0,
+    offline: 0,
+    paused: 0,
+    unknown: 0,
+  };
+  entries.forEach((entry) => {
+    if (entry.health === "critical") counts.critical++;
+    else if (entry.assignment_state === "assignment_mismatch") counts.warning++;
+    else if (entry.availability === "stale") counts.stale++;
+    else if (entry.availability === "offline") counts.offline++;
+    else if (entry.availability === "paused") counts.paused++;
+    else if (entry.health === "warning") counts.warning++;
+    else if (entry.health === "healthy") counts.healthy++;
+    else counts.unknown++;
+  });
+  return counts;
+}
+
+/** "Offline" is a window, not a constant: read it from the snapshot the rows
+ * were classified with rather than restating 15 minutes in copy (8873–8880). */
+export function fleetWindowLabel(seconds: unknown): string {
+  const total = Number(seconds);
+  if (!Number.isFinite(total) || total <= 0) return "the offline window";
+  if (total < 3600) return Math.max(1, Math.round(total / 60)) + "m";
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.round((total % 3600) / 60);
+  return hours + "h" + (minutes ? " " + minutes + "m" : "");
+}
+
+/** Two ways to be inoperative, and both fold away (8882–8884): no heartbeat
+ * inside the offline window, or software that cannot describe the benchmark
+ * being scored. A CURRENT validator whose scorer broke is deliberately NOT
+ * folded — that is a live incident and belongs in the open table. */
+export function isInoperativeFleetEntry(entry: FleetEntryExt): boolean {
+  return entry.availability === "offline" || entry.bench_serviceability === "software_obsolete";
+}
+
+/** Every slot a validator could show work on, ordered by ordinal
+ * (8395–8416). The union matters: an orphaned slot reaches none of the other
+ * lists, and omitting it is what let a host still executing a benchmark
+ * render as a full row of idle slots. */
+export function validatorSlotIds(entry: FleetEntryExt): string[] {
+  const seen: Record<string, boolean> = {};
+  const configured = Math.max(1, Number(entry.configured_slots) || 1);
+  for (let index = 0; index < configured; index += 1) seen["slot-" + index] = true;
+  (entry.healthy_slots || []).forEach((slotId) => {
+    if (slotId) seen[slotId] = true;
+  });
+  [entry.active_benchmarks || [], entry.assigned_benchmarks || []].forEach((list) => {
+    list.forEach((benchmark) => {
+      if (benchmark && benchmark.slot_id) seen[benchmark.slot_id] = true;
+    });
+  });
+  (entry.orphaned_slots || []).forEach((orphan) => {
+    if (orphan && orphan.slot_id) seen[orphan.slot_id] = true;
+  });
+  return Object.keys(seen).sort((a, b) => slotOrdinal(a) - slotOrdinal(b));
+}
+
+export function slotOrdinal(slotId: string): number {
+  const parsed = parseInt(String(slotId).replace(/^slot-/, ""), 10);
+  return isNaN(parsed) ? Number.MAX_SAFE_INTEGER : parsed;
+}
+
+export interface OrphanedSlotViewModel {
+  label: string;
+  detail: string;
+  agentId: string;
+  agentLabel: string;
+}
+
+/** The two orphan states are deliberately never collapsed: "still running"
+ * is the validator's own signed claim, "state unknown" is the honest answer
+ * for a heartbeat protocol that omits a claimed-but-quiet slot (8433–8453). */
+export function orphanedSlotView(orphan: OrphanedSlot): OrphanedSlotViewModel {
+  const age = relDuration(orphan.orphaned_for_seconds);
+  const agent = (orphan.agent_name || "Agent") + " · " + String(orphan.agent_id || "").slice(0, 8);
+  const selfTerminates = orphan.original_deadline
+    ? " Expected to self-terminate by its original deadline (" +
+      relTimeUntil(orphan.original_deadline) +
+      ")."
+    : "";
+  const detail =
+    orphan.state === "still_running"
+      ? "The validator still reports this slot occupied by " +
+        agent +
+        ", " +
+        age +
+        " after the platform evicted the lease. The run cannot produce a score — its result " +
+        "will be refused with a 409." +
+        selfTerminates +
+        " This slot is not free."
+      : "The lease was evicted " +
+        age +
+        " ago and the platform cannot tell whether the container is still running. " +
+        "Heartbeat protocol " +
+        String(orphan.protocol_version || "unknown") +
+        " omits a claimed-but-quiet slot, so silence here is not evidence the slot is free (" +
+        orphan.reason +
+        ")." +
+        selfTerminates +
+        " Do not count this slot as headroom.";
+  const label =
+    orphan.state === "still_running"
+      ? "Evicted · still running · " + age
+      : "Evicted · state unknown · " + age;
+  return { label, detail, agentId: String(orphan.agent_id || ""), agentLabel: agent };
+}
+
+/**
+ * Slots the operator cap will not hand a ticket to, keyed by slot id (#540,
+ * 8468–8493). A validator advertises its own capacity; `allowed_slots` is
+ * how much of it the platform funds. The cap counts concurrent LEASES, not
+ * slot ordinals: running slots are charged first and the leftover idle ones
+ * are marked from the highest ordinal down. Live work is never marked, and
+ * an unhealthy slot is left alone — it is not the cap keeping work off it.
+ */
+export function cappedSlotIds(entry: FleetEntryExt): Record<string, boolean> {
+  const allowed = Number(entry.allowed_slots);
+  // A payload without the field predates it; saying nothing beats guessing.
+  if (!isFinite(allowed)) return {};
+  const busy: Record<string, boolean> = {};
+  [entry.active_benchmarks || [], entry.assigned_benchmarks || []].forEach((list) => {
+    list.forEach((benchmark) => {
+      if (benchmark && benchmark.slot_id) busy[benchmark.slot_id] = true;
+    });
+  });
+  const healthy: Record<string, boolean> = {};
+  (entry.healthy_slots || []).forEach((slotId) => {
+    if (slotId) healthy[slotId] = true;
+  });
+  let budget = Math.max(0, allowed - Object.keys(busy).length);
+  const capped: Record<string, boolean> = {};
+  validatorSlotIds(entry).forEach((slotId) => {
+    if (busy[slotId] || !healthy[slotId]) return;
+    if (budget > 0) {
+      budget -= 1;
+      return;
+    }
+    capped[slotId] = true;
+  });
+  return capped;
+}
+
+/** Slots that can take work right now: the operator cap and the validator's
+ * own health, whichever binds first (8498–8502). */
+export function fundedSlotCount(entry: FleetEntryExt): number {
+  const healthy = (entry.healthy_slots || []).length;
+  const allowed = Number(entry.allowed_slots);
+  return isFinite(allowed) ? Math.min(allowed, healthy) : healthy;
+}
+
+/** Why the numerator is what it is, spelled out for the tooltip (8505–8517). */
+export function slotCapacityTitle(entry: FleetEntryExt, slotPolicy: SlotPolicy | null): string {
+  const parts = [
+    String(entry.configured_slots || 1) + " advertised",
+    String((entry.healthy_slots || []).length) + " healthy",
+  ];
+  if (isFinite(Number(entry.allowed_slots))) {
+    parts.push(String(entry.allowed_slots) + " funded by the operator cap");
+  }
+  if (slotPolicy && isFinite(Number(slotPolicy.max_concurrent_slots))) {
+    parts.push("fleet cap " + String(slotPolicy.max_concurrent_slots) + " per validator");
+  }
+  return parts.join(" · ");
+}
+
+export interface AssignmentAgentRef {
+  id: string;
+  label: string;
+}
+
+export interface AssignmentDetailLine {
+  /** "Platform" / "Heartbeat" / "Platform assignment" — rendered bold. */
+  heading: string;
+  agent: AssignmentAgentRef | null;
+  /** Copy when no agent id is on that side. */
+  fallback: string;
+  suffix: string;
+}
+
+export interface AssignmentView {
+  label: string;
+  tone: string;
+  lines: AssignmentDetailLine[];
+}
+
+/**
+ * Platform/heartbeat assignment skew (renderValidatorAssignment 8363–8389).
+ * A mismatch names BOTH sides — Platform (what the platform assigned) and
+ * Heartbeat (what the validator reports running) — so the skew is readable
+ * rather than flattened to a bare warning; "assigning" is a normal hand-off;
+ * a stale heartbeat names the platform's side only, because the validator's
+ * side is exactly what went quiet. Null when the assignment is reconciled.
+ */
+export function validatorAssignmentView(entry: FleetEntryExt): AssignmentView | null {
+  const assigned: AssignmentAgentRef | null = entry.assigned_agent_id
+    ? {
+        id: String(entry.assigned_agent_id),
+        label:
+          (entry.assigned_agent_name || "Agent") +
+          " · " +
+          String(entry.assigned_agent_id).slice(0, 8),
+      }
+    : null;
+  if (entry.assignment_state === "assignment_mismatch") {
+    const reported: AssignmentAgentRef | null = entry.reported_agent_id
+      ? {
+          id: String(entry.reported_agent_id),
+          label: "Agent · " + String(entry.reported_agent_id).slice(0, 8),
+        }
+      : null;
+    return {
+      label: "Assignment mismatch",
+      tone: "bad",
+      lines: [
+        { heading: "Platform", agent: assigned, fallback: "No active assignment", suffix: "" },
+        { heading: "Heartbeat", agent: reported, fallback: "No active agent", suffix: "" },
+      ],
+    };
+  }
+  if (entry.assignment_state === "assigning") {
+    return {
+      label: "Assigning",
+      tone: "progress",
+      lines: [
+        {
+          heading: "Platform assignment",
+          agent: assigned,
+          fallback: "Agent",
+          suffix: " · handing off",
+        },
+      ],
+    };
+  }
+  if (entry.assignment_state === "heartbeat_stale") {
+    return {
+      label: "Heartbeat stale",
+      tone: "warn",
+      lines: [{ heading: "Platform assignment", agent: assigned, fallback: "Unknown", suffix: "" }],
+    };
+  }
+  return null;
+}
+
+/** True when ANY slot is reporting a stage, not just the lowest one — keying
+ * off a single slot hid live progress whenever slot zero was idle
+ * (8521–8527). */
+export function anyBenchmarkStage(entry: FleetEntryExt): boolean {
+  const benchmarks = entry.active_benchmarks || [];
+  for (let index = 0; index < benchmarks.length; index += 1) {
+    if (benchmarks[index] && benchmarks[index]?.stage) return true;
+  }
+  return !!(entry.active_benchmark && entry.active_benchmark.stage);
+}
