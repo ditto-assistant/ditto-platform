@@ -11,34 +11,15 @@ import type { JSX } from "solid-js";
 import { agentLabel, agentVersionLabel, fx, relTime, shortKey } from "../../lib/format";
 import { dashboardHref } from "../../lib/router";
 import { pushEntityRoute, syncFromLocation } from "../../stores/routeStore";
+import { activityStage } from "../pipeline/status";
 import type { LeaderboardEntry } from "../../types/leaderboard";
 import type { PipelineEntry } from "../../types/pipeline";
 
 /** Ranked board entry (rank assigned client-side, null when unranked). */
 type RankedEntry = LeaderboardEntry & { rank?: number | null };
 
-// Display labels for the submission stage vocabulary (activityStage
-// 6770–6788). The submissions page owns the full vocabulary (tones, filter
-// semantics); search only needs the label half for the result detail line.
-const STAGE_LABELS: Record<string, string> = {
-  uploaded: "Waiting for screening",
-  waiting_screening: "Waiting for screening",
-  screening: "Screening",
-  screening_passed: "Screening passed",
-  screening_failed: "Screening interrupted",
-  waiting_validator: "Waiting for scores",
-  evaluating: "Evaluating",
-  below_score_floor: "Low-priority completion",
-  not_queued: "Historical · not queued",
-  retired: "Retired · earlier benchmark",
-  scored: "Scored",
-  live: "Live",
-  under_review: "Operator review",
-  rejected: "Rejected",
-};
-
 function stageLabel(status: string | undefined): string {
-  return (status !== undefined && STAGE_LABELS[status]) || "Pending";
+  return activityStage(status)[0];
 }
 
 function searchText(value: unknown): string {

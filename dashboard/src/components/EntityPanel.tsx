@@ -4,8 +4,8 @@
 //   miner   — leaderboard run summary (openModal 5845–5978, summarized);
 //   validator — signed heartbeat report (renderValidatorDetail 8687–8814,
 //               summarized; the operations port supplies the deep body);
-//   agent   — the submission drawer; this file renders the section skeleton
-//             (AgentEvidenceSlot) that the submissions/reviews port fills.
+//   agent   — the submission drawer; the deep-evidence body is the
+//             submissions/reviews port's AgentEvidence component.
 // Screener routes never open the modal: the monolith highlights the fleet
 // row on the operations page instead (resolveEntityRoute 9303–9399), which
 // is that page's job.
@@ -40,6 +40,8 @@ import { closeEntityRoute, currentPage, entityRoute, syncFromLocation } from "..
 import type { FleetEntry, OperationsPayload } from "../types/fleet";
 import type { LeaderboardEntry } from "../types/leaderboard";
 import type { ActivityEntry, ActivityPayload } from "../types/pipeline";
+import { activityStage } from "./pipeline/status";
+import { AgentEvidence } from "./evidence/AgentEvidence";
 import { CopyButton } from "./shell/CopyButton";
 import { EntityButton } from "./ui/EntityButton";
 import { StatusChip } from "./ui/StatusChip";
@@ -108,101 +110,8 @@ function FleetTime(props: { iso: string | null | undefined }): JSX.Element {
   );
 }
 
-// ── Agent tenant: the deep-evidence container the submissions port fills ────
-
-/**
- * Placeholder body for the agent drawer: the pipeline-summary /
- * pipeline-history section skeleton with the ledger ids
- * (pipeline-current-title, pipeline-meta-title, pipeline-screening-history,
- * pipeline-accepted-scores, pipeline-confirmation-scores,
- * pipeline-validator-history). The submissions/reviews port replaces each
- * section's state paragraph with the real evidence renderers.
- */
-export function AgentEvidenceSlot(props: { entry: ActivityEntry }): JSX.Element {
-  return (
-    <div class="pipeline-detail" data-agent-evidence={props.entry.agent_id}>
-      <div class="pipeline-summary">
-        <section class="pipeline-current" aria-labelledby="pipeline-current-title">
-          <h4 id="pipeline-current-title">Current progress</h4>
-          <p class="pipeline-detail-state loading" role="status">
-            Loading screening and validation history…
-          </p>
-        </section>
-        <section class="pipeline-meta" aria-labelledby="pipeline-meta-title">
-          <h4 id="pipeline-meta-title">Submission details</h4>
-          <dl class="pipeline-meta-list">
-            <div>
-              <dt>Agent</dt>
-              <dd>{agentName(props.entry.name)}</dd>
-            </div>
-            <div>
-              <dt>Submission</dt>
-              <dd>{agentVersionLabel(props.entry.version)}</dd>
-            </div>
-            <div>
-              <dt>Agent ID</dt>
-              <dd>
-                <span class="copyable">
-                  <code>
-                    <EntityButton
-                      kind="agent"
-                      id={props.entry.agent_id}
-                      label={String(props.entry.agent_id || "")}
-                    />
-                  </code>
-                  <CopyButton value={props.entry.agent_id} label="agent ID" />
-                </span>
-              </dd>
-            </div>
-          </dl>
-        </section>
-      </div>
-      <div class="pipeline-history">
-        <section class="pipeline-section" aria-labelledby="pipeline-screening-history">
-          <div class="pipeline-section-heading">
-            <h4 id="pipeline-screening-history">Screener result</h4>
-          </div>
-          <div class="attempt-list" />
-        </section>
-        <section class="pipeline-section" aria-labelledby="pipeline-accepted-scores">
-          <div class="pipeline-section-heading">
-            <h4 id="pipeline-accepted-scores">Accepted validator scores</h4>
-          </div>
-        </section>
-        <section class="pipeline-section" aria-labelledby="pipeline-confirmation-scores">
-          <div class="pipeline-section-heading">
-            <h4 id="pipeline-confirmation-scores">Continual top-five retests</h4>
-          </div>
-        </section>
-        <section class="pipeline-section" aria-labelledby="pipeline-validator-history">
-          <div class="pipeline-section-heading">
-            <h4 id="pipeline-validator-history">Validator progress</h4>
-          </div>
-          <div class="benchmark-cohort-list" />
-        </section>
-      </div>
-    </div>
-  );
-}
-
 // Stage labels for the agent tenant's header chip (the submissions port owns
 // the full vocabulary; the shell needs the [label, tone] pair only).
-const AGENT_STAGE: Record<string, [string, string]> = {
-  uploaded: ["Waiting for screening", "progress"],
-  waiting_screening: ["Waiting for screening", "progress"],
-  screening: ["Screening", "progress"],
-  screening_passed: ["Screening passed", "good"],
-  screening_failed: ["Screening interrupted", "warn"],
-  waiting_validator: ["Waiting for scores", "progress"],
-  evaluating: ["Evaluating", "progress"],
-  below_score_floor: ["Low-priority completion", "warn"],
-  not_queued: ["Historical · not queued", ""],
-  retired: ["Retired · earlier benchmark", ""],
-  scored: ["Scored", "good"],
-  live: ["Live", "good"],
-  under_review: ["Operator review", "warn"],
-  rejected: ["Rejected", "bad"],
-};
 
 // ── The panel itself ─────────────────────────────────────────────────────────
 
@@ -468,7 +377,7 @@ export function EntityPanel(props: EntityPanelProps): JSX.Element {
     }
     if (current.tenant === "agent") {
       const e = current.entry;
-      const stage = (e.status !== undefined && AGENT_STAGE[e.status]) || ["Pending", ""];
+      const stage = activityStage(e.status);
       return {
         title: agentName(e.name),
         chip: {
@@ -630,7 +539,15 @@ export function EntityPanel(props: EntityPanelProps): JSX.Element {
             <Match when={validatorView()}>
               {(v) => <ValidatorSummary entry={v().entry} activeBench={props.currentBench()} />}
             </Match>
-            <Match when={agentView()}>{(v) => <AgentEvidenceSlot entry={v().entry} />}</Match>
+            <Match when={agentView()}>
+              {(v) => (
+                <AgentEvidence
+                  entry={v().entry}
+                  entries={props.entries}
+                  settledView={props.settledView}
+                />
+              )}
+            </Match>
             <Match when={agentStateView()}>
               {(v) => (
                 <div class="pipeline-detail">

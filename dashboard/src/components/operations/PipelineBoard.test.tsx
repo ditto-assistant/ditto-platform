@@ -16,10 +16,10 @@ import {
   QUEUE_GATES,
   pipelineBoardStage,
   pipelineRescoreState,
-  policyScreeningLabel,
   queueGateLabel,
   queueRelevantBenchmark,
 } from "./pipeline";
+import { policyScreeningLabel } from "../pipeline/status";
 import type { PipelineEntryExt } from "./pipeline";
 
 beforeEach(() => {

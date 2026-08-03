@@ -120,15 +120,6 @@ export function pipelineRescoreState(
 }
 
 /** The screening-policy chip on a waiting/screening card (6800–6806). */
-export function policyScreeningLabel(
-  entry: Pick<PipelineEntry, "screening_policy_version" | "required_screening_policy_version">,
-): string {
-  const completed = Number(entry.screening_policy_version);
-  const required = Number(entry.required_screening_policy_version);
-  if (!Number.isFinite(completed) || !Number.isFinite(required) || completed >= required) return "";
-  if (completed > 0) return "Rescreen · policy v" + completed + " → v" + required;
-  return "Policy v" + required + " screening";
-}
 
 export interface RescreenNoticeView {
   requiredPolicy: number;

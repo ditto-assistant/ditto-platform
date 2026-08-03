@@ -8,6 +8,7 @@ import type { JSX } from "solid-js";
 import { agentName, agentVersionLabel, fx, relTime } from "../../lib/format";
 import { entityHref } from "../../lib/router";
 import { pushEntityRoute } from "../../stores/routeStore";
+import { policyScreeningLabel } from "../pipeline/status";
 import type { FleetReport } from "../../types/fleet";
 import type { BenchmarkProgress } from "../../types/pipeline";
 import {
@@ -23,7 +24,6 @@ import {
   pipelineColumnViews,
   pipelineRescoreState,
   policyRescreenView,
-  policyScreeningLabel,
   queueGateLabel,
 } from "./pipeline";
 import type { IndexedEntry, PipelineColumnView, PipelineEntryExt } from "./pipeline";
