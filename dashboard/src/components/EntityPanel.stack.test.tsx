@@ -22,6 +22,8 @@ import { syncFromLocation } from "../stores/routeStore";
 import { installFixtureFetch, loadFixture } from "../test-fixtures";
 import type { FleetEntry, OperationsPayload } from "../types/fleet";
 import type { LeaderboardPayload } from "../types/leaderboard";
+import type { BenchmarkProgress } from "../types/pipeline";
+import type { FleetEntryExt } from "./operations/fleet";
 import { EntityPanel } from "./EntityPanel";
 
 const leaderboard = loadFixture<LeaderboardPayload>("leaderboard");
@@ -74,11 +76,11 @@ afterEach(() => {
 
 /** A deep copy of the recorded snapshot with one validator patched, so a
  * synthetic shape never leaks into the next test. */
-function patched(hotkey: string, patch: Partial<FleetEntry>): OperationsPayload {
+function patched(hotkey: string, patch: Partial<FleetEntryExt>): OperationsPayload {
   const payload = structuredClone(operations);
   const rows = payload.validators.validators ?? [];
   const index = rows.findIndex((row) => row.validator_hotkey === hotkey);
-  rows[index] = { ...(rows[index] as FleetEntry), ...patch };
+  rows[index] = { ...(rows[index] as FleetEntry), ...patch } as FleetEntry;
   return payload;
 }
 
@@ -498,5 +500,315 @@ describe("validator modal · Component health (9128–9139, 9160–9162)", () =>
     const pylon = component("Pylon");
     expect(value(pylon, "Provenance")).toBe("unknown");
     expect(value(pylon, "Identity")).toBe("None pinned");
+  });
+});
+
+// ── Signed report: assignment, evicted leases and the legacy fallback ───────
+// (renderValidatorDetail 9060–9099 + renderValidatorAssignment 8709–8767 and
+// orphanedSlotLabel 8783–8804). All three shapes are absent from the recorded
+// snapshot — every validator in it reports assignment_state "unassigned", no
+// orphaned_slots and a null active_benchmark — so the payloads below are
+// synthetic, patched onto a real recorded row.
+
+const AGENT_A = "11111111-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+const AGENT_B = "22222222-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+const AGENT_C = "33333333-cccc-4ccc-8ccc-cccccccccccc";
+
+function running(slotId: string, agentId: string): BenchmarkProgress {
+  return {
+    slot_id: slotId,
+    agent_id: agentId,
+    agent_name: "Mnemosyne",
+    bench_version: 7,
+    stage: "running_benchmark",
+    percent: 42,
+    completed_checks: 118,
+    total_checks: 281,
+    started_at: "2026-07-31T13:31:00Z",
+  } as BenchmarkProgress;
+}
+
+/** The evicted slot-3 lease: the validator's own signed claim that it is still
+ * executing, with a deadline still ahead of the frozen clock. */
+const ORPHAN_RUNNING = {
+  slot_id: "slot-3",
+  state: "still_running",
+  orphaned_for_seconds: 900,
+  agent_id: AGENT_A,
+  agent_name: "Mnemosyne",
+  evicted_at: "2026-07-31T13:45:00Z",
+  original_deadline: "2026-07-31T15:20:00Z",
+  protocol_version: 18,
+  reason: "operator eviction",
+  bench_version: 7,
+};
+/** A higher slot the platform cannot see into: protocol 15 omits a
+ * claimed-but-quiet slot, and this one carries no deadline either. */
+const ORPHAN_UNKNOWN = {
+  slot_id: "slot-10",
+  state: "unknown",
+  orphaned_for_seconds: 5400,
+  agent_id: AGENT_C,
+  agent_name: null,
+  evicted_at: "2026-07-31T12:30:00Z",
+  original_deadline: null,
+  protocol_version: 15,
+  reason: "slot omitted by heartbeat protocol 15",
+  bench_version: 6,
+};
+
+/** The anchors inside one row's value, as [label, href] pairs. */
+function anchors(scope: ParentNode, key: string): Array<[string, string]> {
+  return Array.from(row(scope, key).querySelectorAll<HTMLAnchorElement>("a.entity-link")).map(
+    (el) => [el.textContent ?? "", el.getAttribute("href") ?? ""],
+  );
+}
+
+function assignmentHeadings(scope: ParentNode): string[] {
+  return Array.from(row(scope, "Assignment").querySelectorAll(".assignment-detail b")).map(
+    (el) => el.textContent ?? "",
+  );
+}
+
+describe("validator modal · Assignment (9073–9074)", () => {
+  it("names both sides of a skew, between Platform received and Slots", () => {
+    open(
+      MANAGED,
+      patched(MANAGED, {
+        assignment_state: "assignment_mismatch",
+        assigned_agent_id: AGENT_A,
+        assigned_agent_name: "Mnemosyne",
+        reported_agent_id: AGENT_B,
+      }),
+    );
+    const signed = section("Signed report");
+    // Position is the point: the row reads as the platform's last word on this
+    // validator, immediately under the two heartbeat timestamps it contradicts.
+    const keys = rowKeys(signed);
+    expect(keys.slice(keys.indexOf("Platform received"), keys.indexOf("Slots") + 1)).toEqual([
+      "Platform received",
+      "Assignment",
+      "Slots",
+    ]);
+    expect(chipOf(signed, "Assignment")).toEqual(["Assignment mismatch", "stage bad"]);
+    expect(assignmentHeadings(signed)).toEqual(["Platform", "Heartbeat"]);
+    expect(anchors(signed, "Assignment")).toEqual([
+      ["Mnemosyne · 11111111", "/#/operations?agent=" + AGENT_A],
+      ["Agent · 22222222", "/#/operations?agent=" + AGENT_B],
+    ]);
+  });
+
+  it("reads a one-poll gap as delayed telemetry, not a fleet-wide failure", () => {
+    open(
+      MANAGED,
+      patched(MANAGED, {
+        assignment_state: "assignment_mismatch",
+        assigned_agent_id: AGENT_A,
+        assigned_agent_name: "Mnemosyne",
+        reported_agent_id: AGENT_B,
+        _telemetry_grace: true,
+      }),
+    );
+    const signed = section("Signed report");
+    expect(chipOf(signed, "Assignment")).toEqual(["Telemetry delayed", "stage warn"]);
+    // One plain sentence: neither side is named, because neither is at fault.
+    expect(assignmentHeadings(signed)).toEqual([]);
+    expect(anchors(signed, "Assignment")).toEqual([]);
+    expect(row(signed, "Assignment").querySelector(".assignment-detail")?.textContent).toBe(
+      "Waiting for the next signed slot update; the last reported progress is retained briefly.",
+    );
+  });
+
+  it("says which side is empty rather than dropping the side", () => {
+    open(
+      MANAGED,
+      patched(MANAGED, {
+        assignment_state: "assignment_mismatch",
+        assigned_agent_id: null,
+        assigned_agent_name: null,
+        reported_agent_id: null,
+      }),
+    );
+    const signed = section("Signed report");
+    expect(anchors(signed, "Assignment")).toEqual([]);
+    expect(value(signed, "Assignment")).toContain("No active assignment");
+    expect(value(signed, "Assignment")).toContain("No active agent");
+  });
+
+  it("marks a hand-off in flight as a hand-off, not a mismatch", () => {
+    open(
+      MANAGED,
+      patched(MANAGED, {
+        assignment_state: "assigning",
+        assigned_agent_id: AGENT_A,
+        assigned_agent_name: "Mnemosyne",
+      }),
+    );
+    const signed = section("Signed report");
+    expect(chipOf(signed, "Assignment")).toEqual(["Assigning", "stage progress"]);
+    expect(assignmentHeadings(signed)).toEqual(["Platform assignment"]);
+    expect(value(signed, "Assignment")).toContain("Mnemosyne · 11111111 · handing off");
+  });
+
+  it("falls back to a bare agent label while assigning with no id yet", () => {
+    open(MANAGED, patched(MANAGED, { assignment_state: "assigning", assigned_agent_id: null }));
+    const signed = section("Signed report");
+    expect(anchors(signed, "Assignment")).toEqual([]);
+    expect(value(signed, "Assignment")).toContain("Agent · handing off");
+  });
+
+  it("names only the platform's side when the validator went quiet", () => {
+    open(
+      MANAGED,
+      patched(MANAGED, {
+        assignment_state: "heartbeat_stale",
+        assigned_agent_id: AGENT_A,
+        assigned_agent_name: "Mnemosyne",
+      }),
+    );
+    const signed = section("Signed report");
+    expect(chipOf(signed, "Assignment")).toEqual(["Heartbeat stale", "stage warn"]);
+    // The heartbeat's side is exactly what went missing, so it is not invented.
+    expect(assignmentHeadings(signed)).toEqual(["Platform assignment"]);
+    expect(anchors(signed, "Assignment")).toEqual([
+      ["Mnemosyne · 11111111", "/#/operations?agent=" + AGENT_A],
+    ]);
+  });
+
+  it("says Unknown for a stale heartbeat with nothing assigned", () => {
+    open(
+      MANAGED,
+      patched(MANAGED, { assignment_state: "heartbeat_stale", assigned_agent_id: null }),
+    );
+    expect(value(section("Signed report"), "Assignment")).toContain("Unknown");
+  });
+
+  it("renders no Assignment row at all once the assignment is reconciled", () => {
+    open(MANAGED);
+    expect(rowKeys(section("Signed report"))).not.toContain("Assignment");
+  });
+});
+
+describe("validator modal · evicted leases (9068–9087)", () => {
+  it("lists every orphaned slot in ordinal order ABOVE the running slots", () => {
+    open(
+      MANAGED,
+      patched(MANAGED, {
+        // Deliberately out of order in the payload, and slot-10 sorts after
+        // slot-9 numerically, never lexically.
+        orphaned_slots: [ORPHAN_UNKNOWN, ORPHAN_RUNNING],
+        active_benchmarks: [running("slot-1", AGENT_B)],
+      }),
+    );
+    const keys = rowKeys(section("Signed report"));
+    // An operator opening this modal is usually asking "does this host have
+    // room", and the answer is no while any of these are listed.
+    expect(keys.slice(keys.indexOf("Slots"))).toEqual([
+      "Slots",
+      "slot-3 · evicted lease",
+      "slot-10 · evicted lease",
+      "slot-1",
+    ]);
+  });
+
+  it("carries the eviction chip, the doomed agent and when it stops burning CPU", () => {
+    open(MANAGED, patched(MANAGED, { orphaned_slots: [ORPHAN_RUNNING] }));
+    const signed = section("Signed report");
+    const key = "slot-3 · evicted lease";
+    expect(chipOf(signed, key)).toEqual(["Evicted · still running · 15m", "stage warn"]);
+    expect(row(signed, key).querySelector(".stage")?.getAttribute("title")).toBe(
+      "The validator still reports this slot occupied by Mnemosyne · 11111111, 15m after the " +
+        "platform evicted the lease. The run cannot produce a score — its result will be refused " +
+        "with a 409. Expected to self-terminate by its original deadline (in 2h). This slot is " +
+        "not free.",
+    );
+    expect(anchors(signed, key)).toEqual([
+      ["Mnemosyne · 11111111", "/#/operations?agent=" + AGENT_A],
+    ]);
+    const detail = row(signed, key).querySelector(".assignment-detail");
+    // The deadline is ahead of now, so it counts forward: relTime would floor a
+    // future instant to "0s ago", which reads as "already over".
+    expect(detail?.textContent).toBe(
+      "Lease released 15m ago · Self-terminates by in 2h · bench v7",
+    );
+    expect(detail?.querySelector(".fleet-time")?.getAttribute("title")).toBe(
+      "2026-07-31T13:45:00Z",
+    );
+  });
+
+  it("keeps state-unknown distinct from still-running and omits an absent deadline", () => {
+    open(MANAGED, patched(MANAGED, { orphaned_slots: [ORPHAN_UNKNOWN] }));
+    const signed = section("Signed report");
+    const key = "slot-10 · evicted lease";
+    expect(chipOf(signed, key)).toEqual(["Evicted · state unknown · 1h", "stage warn"]);
+    expect(row(signed, key).querySelector(".stage")?.getAttribute("title")).toContain(
+      "silence here is not evidence the slot is free (slot omitted by heartbeat protocol 15)",
+    );
+    // No agent name reported: the anchor still names the id it does have.
+    expect(anchors(signed, key)).toEqual([["Agent · 33333333", "/#/operations?agent=" + AGENT_C]]);
+    expect(row(signed, key).querySelector(".assignment-detail")?.textContent).toBe(
+      "Lease released 1h ago · bench v6",
+    );
+  });
+
+  it("falls back to slot-0 for an orphan record with no slot id", () => {
+    open(MANAGED, patched(MANAGED, { orphaned_slots: [{ ...ORPHAN_RUNNING, slot_id: null }] }));
+    expect(rowKeys(section("Signed report"))).toContain("slot-0 · evicted lease");
+  });
+
+  it("renders no evicted rows when the host has no orphaned slots", () => {
+    open(MANAGED);
+    expect(rowKeys(section("Signed report")).filter((key) => key.includes("evicted"))).toEqual([]);
+  });
+});
+
+describe("validator modal · legacy single-benchmark fallback (9097–9098)", () => {
+  it("shows the pre-fan-out active_benchmark as the running work", () => {
+    open(
+      MANAGED,
+      patched(MANAGED, { active_benchmarks: [], active_benchmark: running("slot-0", AGENT_A) }),
+    );
+    const signed = section("Signed report");
+    expect(rowKeys(signed)).toContain("Active benchmark");
+    expect(value(signed, "Active benchmark")).toContain("Benchmark 42% · 118 of 281 checks");
+    expect(anchors(signed, "Active benchmark")).toEqual([
+      ["Mnemosyne · 11111111", "/#/operations?agent=" + AGENT_A],
+    ]);
+  });
+
+  it("yields to the per-slot rows once the payload fans out", () => {
+    open(
+      MANAGED,
+      patched(MANAGED, {
+        active_benchmarks: [running("slot-1", AGENT_B)],
+        active_benchmark: running("slot-0", AGENT_A),
+      }),
+    );
+    const keys = rowKeys(section("Signed report"));
+    expect(keys).toContain("slot-1");
+    expect(keys).not.toContain("Active benchmark");
+  });
+
+  it("stays quiet while the Assignment row already describes the hand-off", () => {
+    open(
+      MANAGED,
+      patched(MANAGED, {
+        active_benchmarks: [],
+        active_benchmark: running("slot-0", AGENT_A),
+        assignment_state: "assigning",
+        assigned_agent_id: AGENT_A,
+        assigned_agent_name: "Mnemosyne",
+      }),
+    );
+    const keys = rowKeys(section("Signed report"));
+    expect(keys).toContain("Assignment");
+    expect(keys).not.toContain("Active benchmark");
+  });
+
+  it("renders neither row for a validator with no running work at all", () => {
+    open(MANAGED);
+    const keys = rowKeys(section("Signed report"));
+    expect(keys).not.toContain("Active benchmark");
+    expect(keys.filter((key) => key.startsWith("slot-"))).toEqual([]);
   });
 });

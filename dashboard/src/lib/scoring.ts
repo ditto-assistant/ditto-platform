@@ -623,11 +623,16 @@ export function caseVerdict(c: {
 
 // ── Composite equations (monolith 5810–5843) ─────────────────
 
+/** The `title` the inline equation carries (5863), naming each factor. It is
+ * the only place the equation's terms are spelled out in words. */
+export const COMPOSITE_EQUATION_TITLE =
+  "base accuracy × benchmark quality gates × token efficiency = final composite";
+
 /**
  * Inline consensus-row equation (5810–5815):
  * "base × quality × token = final", with token "n/a" when the multiplier is
- * absent; "" without a breakdown. (The title copy "base accuracy × benchmark
- * quality gates × token efficiency = final composite" stays in the markup.)
+ * absent; "" without a breakdown. (The title copy is COMPOSITE_EQUATION_TITLE
+ * above.)
  */
 export function compositeEquationText(b: CompositeBreakdown | null | undefined): string {
   if (!b) return "";

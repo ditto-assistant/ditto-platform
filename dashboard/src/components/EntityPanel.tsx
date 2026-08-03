@@ -24,7 +24,15 @@ import type { JSX } from "solid-js";
 
 import { getJSON } from "../lib/api";
 import { entityActions } from "../lib/entity-links";
-import { agentName, agentVersionLabel, fx, monoDisplay, pct, relTime } from "../lib/format";
+import {
+  agentName,
+  agentVersionLabel,
+  fx,
+  monoDisplay,
+  pct,
+  relTime,
+  relTimeUntil,
+} from "../lib/format";
 import { entityHref } from "../lib/router";
 import type { EntityKind, EntityRoute } from "../lib/router";
 import {
@@ -47,9 +55,10 @@ import type {
   StackIdentity,
 } from "../types/fleet";
 import type { LeaderboardEntry } from "../types/leaderboard";
-import type { ActivityEntry, ActivityPayload } from "../types/pipeline";
+import type { ActivityEntry, ActivityPayload, BenchmarkProgress } from "../types/pipeline";
 import { activityStage } from "./pipeline/status";
 import { AgentEvidence } from "./evidence/AgentEvidence";
+import { Consensus } from "./evidence/Consensus";
 // Pure fleet logic the validator body reads: the numeric slot order the
 // per-slot rows sort on, plus the stack-identity/component-health vocabulary.
 // (fleet.ts imports the status ladder back out of this module; both edges are
@@ -60,13 +69,18 @@ import {
   componentHealthChip,
   hasIdentityRows,
   identityComparisonNote,
+  orphanedSlotView,
+  orphanedSlotsInOrder,
   scorerProbeChip,
   scorerProbeDetail,
   scorerStatusChip,
   slotOrdinal,
   stackModeLabel,
+  validatorAssignmentView,
   yesNo,
 } from "./operations/fleet";
+import type { OrphanedSlot } from "./operations/fleet";
+import { AssignmentDetail } from "./operations/FleetTable";
 import { BenchmarkProgressView } from "./operations/progress";
 import { CopyButton } from "./shell/CopyButton";
 import { EntityButton } from "./ui/EntityButton";
@@ -124,7 +138,9 @@ export function offlineAwareFleetStatus(entry: ValidatorEntry): [string, string]
 
 // ── Shared row / section helpers ────────────────────────────────────────────
 
-function Stat(props: { k: string; v: JSX.Element; mono?: boolean }): JSX.Element {
+/** One label/value row of a stat group (vstat 8903–8906). Exported because
+ * the consensus block's canonical-median row is the same row (stat 6109). */
+export function Stat(props: { k: string; v: JSX.Element; mono?: boolean }): JSX.Element {
   return (
     <div class="stat-row">
       <span class="k">{props.k}</span>
@@ -727,7 +743,9 @@ function MinerSummary(props: { entry: RankedEntry; settled: boolean; total: numb
           )}
         </Show>
       </div>
-      <div id="d-consensus" />
+      <div id="d-consensus">
+        <Show when={e().agent_id}>{(id) => <Consensus agentId={id()} />}</Show>
+      </div>
       <div class="gloss-link">
         <a href="#/benchmark">What each category and metric means →</a>
       </div>
@@ -951,6 +969,44 @@ function ScorerBenchmarkRows(props: { scorer: ScorerBenchmarks | null | undefine
   );
 }
 
+/**
+ * One evicted slot's row value (9075–9086). The chip and the agent anchor come
+ * from orphanedSlotView; the detail line adds when the platform let go of the
+ * lease, when the container is expected to stop on its own, and which bench
+ * version it is burning. The deadline is usually still ahead, and relTime
+ * floors a future instant to "0s ago" — which reads as "already over" for the
+ * one number that says when this stops costing the host CPU — so it gets
+ * relTimeUntil instead.
+ */
+function EvictedLease(props: { orphan: OrphanedSlot }): JSX.Element {
+  const view = () => orphanedSlotView(props.orphan);
+  return (
+    <>
+      <span class="stage warn" title={view().detail}>
+        {view().label}
+      </span>
+      <span class="current-agent" title={view().agentId}>
+        <EntityButton kind="agent" id={view().agentId} label={view().agentLabel} />
+      </span>
+      <span class="assignment-detail">
+        <b>Lease released</b> <FleetTime iso={props.orphan.evicted_at} />
+        <Show when={props.orphan.original_deadline}>
+          {(deadline) => (
+            <>
+              {" · "}
+              <b>Self-terminates by</b>{" "}
+              <span class="fleet-time" title={deadline()}>
+                {relTimeUntil(deadline())}
+              </span>
+            </>
+          )}
+        </Show>
+        {" · bench v" + String(props.orphan.bench_version)}
+      </span>
+    </>
+  );
+}
+
 // ── Validator tenant summary ────────────────────────────────────────────────
 
 function ValidatorSummary(props: {
@@ -971,6 +1027,11 @@ function ValidatorSummary(props: {
     }
     return summary + " · " + String(e().admission || "accepting");
   };
+  // Present only while the platform's assignment and the validator's own
+  // heartbeat disagree, or a hand-off is in flight (9073–9074). A reconciled
+  // assignment renders no row at all.
+  const assignment = () => validatorAssignmentView(e());
+  const orphanedSlots = () => orphanedSlotsInOrder(e());
   // One row per running job, ordered by slot ordinal (9088–9096). The modal
   // used to show only the lowest slot, so a second concurrent benchmark was
   // invisible here — the #540 regression the slot-fan-out suite exists for.
@@ -978,6 +1039,14 @@ function ValidatorSummary(props: {
     (e().active_benchmarks || [])
       .slice()
       .sort((left, right) => slotOrdinal(left.slot_id) - slotOrdinal(right.slot_id));
+  // A payload from before the slot fan-out carries one `active_benchmark`
+  // instead of the per-slot list (9097–9098). Without this the running work on
+  // such a validator is simply absent from the modal. Suppressed once the
+  // assignment row is already describing the same hand-off.
+  const legacyBenchmark = (): BenchmarkProgress | null => {
+    if (activeSlots().length || assignment()) return null;
+    return e().active_benchmark || null;
+  };
   return (
     <div class="vdetail">
       <Section title="Signed report" open>
@@ -1004,7 +1073,21 @@ function ValidatorSummary(props: {
           <Stat k="First seen" v={<FleetTime iso={e().first_seen_at} />} />
           <Stat k="Validator reported" v={<FleetTime iso={e().reported_at} />} />
           <Stat k="Platform received" v={<FleetTime iso={e().seen_at} />} />
+          <Show when={assignment()}>
+            <Stat k="Assignment" v={<AssignmentDetail entry={e()} />} />
+          </Show>
           <Stat k="Slots" v={slotSummary()} />
+          {/* Above the running slots deliberately: an operator opening this
+              modal is usually asking "does this host have room", and the
+              answer is no while any of these are listed (9065–9087). */}
+          <For each={orphanedSlots()}>
+            {(orphan) => (
+              <Stat
+                k={(orphan.slot_id || "slot-0") + " · evicted lease"}
+                v={<EvictedLease orphan={orphan} />}
+              />
+            )}
+          </For>
           <For each={activeSlots()}>
             {(benchmark) => (
               <Stat
@@ -1013,6 +1096,14 @@ function ValidatorSummary(props: {
               />
             )}
           </For>
+          <Show when={legacyBenchmark()}>
+            {(benchmark) => (
+              <Stat
+                k="Active benchmark"
+                v={<BenchmarkProgressView progress={benchmark()} showAgent={true} />}
+              />
+            )}
+          </Show>
         </>
       </Section>
       <Section title="Capabilities">

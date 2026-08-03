@@ -18,9 +18,13 @@ export interface OrphanedSlot {
   orphaned_for_seconds?: number | null;
   agent_id?: string | null;
   agent_name?: string | null;
+  /** When the platform released its half of the lease. */
+  evicted_at?: string | null;
   original_deadline?: string | null;
   protocol_version?: number | string | null;
   reason?: string | null;
+  /** The benchmark version the doomed run is still burning CPU on. */
+  bench_version?: number | string | null;
 }
 
 /** Fleet fields beyond the shared wire type. */
@@ -252,6 +256,15 @@ export function orphanedSlotView(orphan: OrphanedSlot): OrphanedSlotViewModel {
       ? "Evicted · still running · " + age
       : "Evicted · state unknown · " + age;
   return { label, detail, agentId: String(orphan.agent_id || ""), agentLabel: agent };
+}
+
+/** A validator's orphaned slots in slot order (9068–9070). The modal lists
+ * them ABOVE the running slots deliberately, so the ordering is part of the
+ * contract rather than an accident of payload order. */
+export function orphanedSlotsInOrder(entry: FleetEntryExt): OrphanedSlot[] {
+  return (entry.orphaned_slots || [])
+    .slice()
+    .sort((left, right) => slotOrdinal(left.slot_id) - slotOrdinal(right.slot_id));
 }
 
 /**
