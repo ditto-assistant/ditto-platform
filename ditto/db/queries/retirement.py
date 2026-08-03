@@ -196,7 +196,10 @@ async def load_retirement(
 
 
 async def retired_agent_ids(
-    session: AsyncSession, *, bench_version: int | None = None
+    session: AsyncSession,
+    *,
+    bench_version: int | None = None,
+    agent_ids: set[UUID] | None = None,
 ) -> set[UUID]:
     """Every retired agent, optionally scoped to one benchmark era.
 
@@ -206,6 +209,10 @@ async def retired_agent_ids(
     statement = select(SubmissionRetirement.agent_id)
     if bench_version is not None:
         statement = statement.where(SubmissionRetirement.bench_version == bench_version)
+    if agent_ids is not None:
+        if not agent_ids:
+            return set()
+        statement = statement.where(SubmissionRetirement.agent_id.in_(agent_ids))
     return set(await session.scalars(statement))
 
 

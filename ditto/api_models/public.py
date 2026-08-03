@@ -2266,12 +2266,57 @@ class PublicProvisionalScore(BaseModel):
     ] = None
 
 
+class PublicAgentSummary(BaseModel):
+    """Glance-level state for opening one agent card.
+
+    The full screening, score, and validator histories are intentionally absent.
+    Clients load ``PublicSubmissionPipeline`` only when the reader expands that
+    evidence.
+    """
+
+    generated_at: datetime
+    agent_id: UUID
+    miner_hotkey: Annotated[
+        str, Field(pattern=_SS58_PATTERN, description="Submitting miner's SS58 hotkey.")
+    ]
+    name: Annotated[str, Field(description="Miner-provided agent display name.")]
+    version: Annotated[int | None, Field(default=None, ge=1)] = None
+    status: Annotated[str, Field(description="Current public lifecycle stage.")]
+    submitted_at: datetime
+    last_scored_at: datetime | None = None
+    score_count: Annotated[int, Field(ge=0)]
+    score_composite: Annotated[
+        float | None,
+        Field(
+            default=None,
+            ge=0.0,
+            le=1.0,
+            description="Median composite across accepted current-benchmark scores.",
+        ),
+    ] = None
+    quorum: Annotated[int, Field(ge=1)]
+    screening_reason: str | None = None
+    duplicate_of: UUID | None = None
+    duplicate_name: str | None = None
+    duplicate_version: Annotated[int | None, Field(default=None, ge=1)] = None
+    review_reason: str | None = None
+    review_event: Literal["opened", "reopened", "cleared", "rejected"] | None = None
+    review_event_at: datetime | None = None
+    review_original_reason: str | None = None
+    review_opened_at: datetime | None = None
+    preserved_composite: Annotated[
+        float | None, Field(default=None, ge=0.0, le=1.0)
+    ] = None
+    active_benchmarks: list[PublicBenchmarkProgress] = Field(default_factory=list)
+
+
 class PublicSubmissionPipeline(BaseModel):
     """Full public execution history for one submitted agent."""
 
     generated_at: datetime
     agent_id: UUID
     status: str
+    artifact_release: PublicArtifactRelease
     submission_family: PublicSubmissionFamily | None = Field(
         default=None,
         description=(

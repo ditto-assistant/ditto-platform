@@ -3878,6 +3878,100 @@ class TestPublicFleet:
 
 
 class TestPublicActivity:
+    async def test_agent_summary_is_a_targeted_glance_level_projection(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        agent_id = await _seed_agent(
+            session_maker,
+            miner=_MINER_A,
+            name="hot-path-agent",
+            status=AgentStatus.UPLOADED,
+        )
+        _install_db(app, session_maker)
+        # The deep link must never fall back to the global projection that loads
+        # and derives the entire activity population before applying its search.
+        monkeypatch.setattr(
+            public_endpoint,
+            "list_public_activity",
+            AsyncMock(side_effect=AssertionError("global activity query used")),
+        )
+
+        response = await client.get(f"/api/v1/public/agent/{agent_id}/summary")
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body == {
+            "generated_at": body["generated_at"],
+            "agent_id": agent_id,
+            "miner_hotkey": _MINER_A,
+            "name": "hot-path-agent",
+            "version": None,
+            "status": "waiting_screening",
+            "submitted_at": body["submitted_at"],
+            "last_scored_at": None,
+            "score_count": 0,
+            "score_composite": None,
+            "quorum": 3,
+            "screening_reason": None,
+            "duplicate_of": None,
+            "duplicate_name": None,
+            "duplicate_version": None,
+            "review_reason": None,
+            "review_event": None,
+            "review_event_at": None,
+            "review_original_reason": None,
+            "review_opened_at": None,
+            "preserved_composite": None,
+            "active_benchmarks": [],
+        }
+        assert "artifact_release" not in body
+        assert "screening_attempts" not in body
+        assert "validation_attempts" not in body
+        assert "provisional_scores" not in body
+
+    async def test_agent_summary_reports_the_canonical_median_not_the_mean(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        await _activate_era(session_maker)
+        agent_id = await _seed_k3(
+            session_maker,
+            miner=_MINER_A,
+            composites=[0.1, 0.2, 0.9],
+        )
+        _install_db(app, session_maker)
+
+        response = await client.get(f"/api/v1/public/agent/{agent_id}/summary")
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["score_count"] == body["quorum"] == 3
+        assert body["score_composite"] == pytest.approx(0.2)
+
+    async def test_agent_summary_returns_not_found_without_global_activity(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _install_db(app, session_maker)
+        monkeypatch.setattr(
+            public_endpoint,
+            "list_public_activity",
+            AsyncMock(side_effect=AssertionError("global activity query used")),
+        )
+
+        response = await client.get(f"/api/v1/public/agent/{uuid4()}/summary")
+
+        assert response.status_code == 404
+
     async def test_operations_lists_desired_rollout_members_as_queue_work(
         self,
         app: FastAPI,
