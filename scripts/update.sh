@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 #
 # Scripted update for the Ditto Platform API:
-#   fetch -> reset -> preflight -> uv sync -> set deploy config -> ensure Pylon
-#   -> migrate -> pm2 start/reload/recreate -> verify the app is serving the
-#   commit that was checked out.
+#   fetch -> reset -> preflight -> uv sync -> build dashboard -> set deploy
+#   config -> ensure Pylon -> migrate -> pm2 start/reload/recreate -> verify
+#   the app is serving the commit that was checked out.
 # NOT zero-downtime: ditto-api is a single fork-mode pm2 process, so the reload
 # below is a stop/start with ~6s of refused connections (measured), not a
 # rolling handover. See scripts/ecosystem.config.js.
@@ -278,6 +278,20 @@ deploy_stage="sync"
 echo "==> syncing dependencies"
 uv sync
 deploy_synced=1
+
+deploy_stage="dashboard-build"
+# Build the dashboard SPA the factory serves from dashboard/dist. Ordered with
+# the other pre-pm2 stages on purpose: a failed build aborts the deploy while
+# the old process (and its previously built dist/, which git reset does not
+# touch) is still serving, so the EXIT trap's rollback rules apply unchanged.
+# A checkout without the dashboard is served API-only by the factory, so the
+# build is skipped on the same condition rather than failing the deploy.
+if [ -f dashboard/package.json ]; then
+  echo "==> building dashboard"
+  (cd dashboard && npm ci --no-audit --no-fund && npm run build)
+else
+  echo "==> no dashboard/package.json; skipping dashboard build"
+fi
 
 deploy_stage="deploy-config"
 # Ansible is the only writer of .env. Deploy-owned values live in a separate
