@@ -9,6 +9,7 @@
 import { For, Show, createMemo, createSignal, onCleanup, onMount } from "solid-js";
 import type { JSX } from "solid-js";
 
+import { agentCardOpen, hydrateOnAgentCardClose } from "../../data/useEndpoint";
 import { REFRESH_MS } from "../../lib/config";
 import { agentLabel, athDate, fx, relTime, shortKey } from "../../lib/format";
 import type { AthReview, AthSnapshot } from "../../types/pipeline";
@@ -150,10 +151,13 @@ export function AthQueue(): JSX.Element {
 
   onMount(() => {
     load(false);
+    // Paused while an agent card is open, like every other global read (#648);
+    // closing the card re-reads the queue once.
     const refresh = setInterval(() => {
-      if (document.hidden) return;
+      if (document.hidden || agentCardOpen()) return;
       load(false);
     }, REFRESH_MS);
+    hydrateOnAgentCardClose(() => load(false));
     const reAge = setInterval(() => setNow(Date.now()), 15000);
     onCleanup(() => {
       clearInterval(refresh);

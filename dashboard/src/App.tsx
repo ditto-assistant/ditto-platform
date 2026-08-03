@@ -22,7 +22,12 @@ import { GlobalSearch } from "./components/shell/GlobalSearch";
 import { Sidebar } from "./components/shell/Sidebar";
 import { UnavailableBanner } from "./components/ui/States";
 import { installTooltips } from "./components/ui/Tooltip";
-import { refreshAllEndpoints, useEndpoint } from "./data/useEndpoint";
+import {
+  agentCardOpen,
+  hydrateOnAgentCardClose,
+  refreshAllEndpoints,
+  useEndpoint,
+} from "./data/useEndpoint";
 import type { ResourceState } from "./data/useEndpoint";
 import { OPS_REFRESH_MS, REFRESH_MS } from "./lib/config";
 import { relTime } from "./lib/format";
@@ -126,27 +131,43 @@ export default function App(): JSX.Element {
     if (manualRefresh() && !leaderboard.loading()) setManualRefresh(false);
   });
 
+  // An agent deep link is an entity-first surface: while its card is open the
+  // global reads pause (agentCardOpen, useEndpoint.ts), and closing it hydrates
+  // the dashboard exactly once (#648). One pass over the registry, not
+  // refreshTick: it reaches the shell's own endpoints as well as the ones pages
+  // and module-scope stores own, and every section is stale by now — the same
+  // seed-everything shape the monolith's close-hydrate had (load() with
+  // bootComplete still false).
+  hydrateOnAgentCardClose(refreshAllEndpoints);
+
   onMount(() => {
     // Background tabs skip network refreshes entirely and catch up once on
-    // return, so idle dashboards stop polling the API.
+    // return, so idle dashboards stop polling the API. Every unattended read
+    // goes through backgroundTick, so the entity-first pause is one rule
+    // rather than one per timer.
     let refreshStale = false;
+    const backgroundTick = (): void => {
+      if (agentCardOpen()) return;
+      refreshTick(false);
+    };
     const master = setInterval(() => {
       if (document.hidden) {
         refreshStale = true;
         return;
       }
-      refreshTick(false);
+      backgroundTick();
     }, REFRESH_MS);
     // The fleet page is the live one: poll just the shared operations
     // snapshot on a tighter cadence while a viewer is actually on that page.
     const ops = setInterval(() => {
       if (document.hidden) return;
+      if (agentCardOpen()) return;
       if (currentPage() === "operations") operations.refresh();
     }, OPS_REFRESH_MS);
     const onVisibility = (): void => {
       if (!document.hidden && refreshStale) {
         refreshStale = false;
-        refreshTick(false);
+        backgroundTick();
       }
     };
     document.addEventListener("visibilitychange", onVisibility);

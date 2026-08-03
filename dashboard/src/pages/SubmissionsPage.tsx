@@ -8,6 +8,7 @@ import type { JSX } from "solid-js";
 
 import { ActivityBoard } from "../components/pipeline/ActivityBoard";
 import { createActivityStore } from "../components/pipeline/activity-store";
+import { agentCardOpen, hydrateOnAgentCardClose } from "../data/useEndpoint";
 import { REFRESH_MS } from "../lib/config";
 
 function onSubmissionsRoute(): boolean {
@@ -61,11 +62,14 @@ export function SubmissionsPage(): JSX.Element {
     const clearButton = document.getElementById("search-clear");
     clearButton?.addEventListener("click", onSearchClear);
 
-    // Background refresh: silent (never aria-busy), skipped while hidden.
+    // Background refresh: silent (never aria-busy), skipped while hidden and
+    // while an agent card is open — the board behind it is not the answer the
+    // reader is waiting for (#648). Closing the card reloads the page once.
     const timer = setInterval(() => {
-      if (document.hidden) return;
+      if (document.hidden || agentCardOpen()) return;
       store.load(store.page(), null, false);
     }, REFRESH_MS);
+    hydrateOnAgentCardClose(() => store.load(store.page(), null, false));
 
     onCleanup(() => {
       window.removeEventListener("popstate", onPopState);

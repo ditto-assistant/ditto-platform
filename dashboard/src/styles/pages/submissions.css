@@ -231,6 +231,43 @@
   gap: var(--detail-space-xl);
   padding-top: var(--detail-space-xl);
 }
+/* The deferred-history disclosure (#648). The summary states the cost of
+   opening it in the affordance itself — "Load details", not a bare caret —
+   because the click is a fetch, not a reveal. */
+.pipeline-history-disclosure {
+  margin-top: var(--detail-space-xl);
+  border-top: 1px solid color-mix(in oklab, var(--border) 72%, transparent);
+}
+.pipeline-history-disclosure > summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--detail-space-md);
+  padding: var(--detail-space-lg) 0;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 750;
+  cursor: pointer;
+  list-style: none;
+}
+.pipeline-history-disclosure > summary::-webkit-details-marker {
+  display: none;
+}
+.pipeline-history-disclosure > summary::after {
+  content: "Load details";
+  color: var(--text-faint);
+  font: 650 10.5px/1.3 var(--mono);
+  text-transform: uppercase;
+}
+.pipeline-history-disclosure[open] > summary::after {
+  content: "Hide details";
+}
+.pipeline-history-disclosure > summary:hover {
+  color: var(--accent);
+}
+.pipeline-history-disclosure-body[aria-busy="true"] {
+  color: var(--text-faint);
+}
 .pipeline-section-heading {
   display: flex;
   align-items: baseline;

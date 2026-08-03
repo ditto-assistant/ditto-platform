@@ -1,7 +1,8 @@
-import { createResource, getOwner, onCleanup } from "solid-js";
+import { createEffect, createResource, getOwner, onCleanup } from "solid-js";
 import type { Accessor } from "solid-js";
 
 import { getJSON } from "../lib/api";
+import { entityRoute } from "../stores/routeStore";
 
 export interface ResourceState<T> {
   data: Accessor<T | undefined>;
@@ -24,6 +25,37 @@ const liveRefreshes = new Set<() => void>();
 
 export function refreshAllEndpoints(): void {
   liveRefreshes.forEach((refresh) => refresh());
+}
+
+/**
+ * True while an agent card owns the surface (monolith load() 10086–10095,
+ * #648). An agent deep link is an entity-first surface: the global board,
+ * fleet, search-corpus, and timeline reads are unrelated to the answer the
+ * reader is waiting for, so every periodic read pauses while the card is open.
+ * The card's OWN summary and pipeline requests are not routed through here and
+ * are never paused. Reactive — callers may gate a timer with it or watch it.
+ */
+export function agentCardOpen(): boolean {
+  const route = entityRoute();
+  return route !== null && route.kind === "agent";
+}
+
+/**
+ * Run `hydrate` once when an agent card closes, and only if a card was open
+ * (monolith closeModal 6449–6454: "Closing the card hydrates the dashboard
+ * once"). Must be called under an owner — a component body or onMount.
+ */
+export function hydrateOnAgentCardClose(hydrate: () => void): void {
+  let paused = false;
+  createEffect(() => {
+    if (agentCardOpen()) {
+      paused = true;
+      return;
+    }
+    if (!paused) return;
+    paused = false;
+    hydrate();
+  });
 }
 
 export function useEndpoint<T>(
@@ -67,6 +99,9 @@ export function useEndpoint<T>(
         refreshStale = true;
         return;
       }
+      // Paused, not deferred: closing the card hydrates once (App.tsx), so a
+      // stale flag here would only queue a second, redundant read.
+      if (agentCardOpen()) return;
       refresh();
     }, options.pollMs);
     onVisibility = () => {

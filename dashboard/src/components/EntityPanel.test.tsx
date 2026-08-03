@@ -6,9 +6,12 @@
 // Also guards the shell slice of assert-inventory row 26
 // (test_validator_names_remain_optional_untrusted_decoration): the validator
 // display name is optional untrusted decoration — rendered as text, never
-// markup — and the hotkey stays the anchor identity.
+// markup — and the hotkey stays the anchor identity; and row 30's #648 slice:
+// a cold agent link resolves through /public/agent/{id}/summary (never the
+// activity feed), the loading state shows for overlay routes too, and the deep
+// history stays unrequested behind its disclosure.
 import { cleanup, render, waitFor } from "@solidjs/testing-library";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { rankEntries } from "../lib/scoring";
 import { syncFromLocation } from "../stores/routeStore";
@@ -151,27 +154,49 @@ describe("EntityPanel validator tenant (row 26 shell slice)", () => {
 });
 
 describe("EntityPanel agent tenant", () => {
-  it("resolves an agent overlay via the public activity lookup and mounts the evidence slot", async () => {
+  it("resolves an agent route through the summary endpoint, not the activity feed", async () => {
+    const spy = vi.spyOn(globalThis, "fetch");
     renderPanel();
     visit("/#/submissions?agent=" + FIXTURE_TOP_AGENT_ID);
     await waitFor(() => expect(modal().classList.contains("open")).toBe(true));
-    expect(document.getElementById("d-title")).toHaveTextContent("bolt-v7-top1");
-    // The deep-evidence container the submissions/reviews port fills, with
-    // the ledger section ids.
-    for (const id of [
-      "pipeline-current-title",
-      "pipeline-meta-title",
-      "pipeline-screening-history",
-      "pipeline-accepted-scores",
-      "pipeline-confirmation-scores",
-      "pipeline-validator-history",
-    ]) {
-      expect(document.getElementById(id), id).toBeTruthy();
-    }
+    await waitFor(() =>
+      expect(document.getElementById("d-title")).toHaveTextContent("bolt-v7-top1"),
+    );
+    const paths = (): string[] => spy.mock.calls.map((call) => String(call[0]));
+    await waitFor(() =>
+      expect(
+        paths().some((path) => path.endsWith("/public/agent/" + FIXTURE_TOP_AGENT_ID + "/summary")),
+      ).toBe(true),
+    );
+    // #648: one addressed submission, never the global feed narrowed to it.
+    expect(paths().some((path) => path.includes("/public/activity"))).toBe(false);
+    // The summary paints immediately; the deep history is behind a disclosure
+    // and its endpoint has not been touched.
     expect(document.querySelector("[data-agent-evidence]")).toHaveAttribute(
       "data-agent-evidence",
       FIXTURE_TOP_AGENT_ID,
     );
+    for (const id of ["pipeline-current-title", "pipeline-meta-title"]) {
+      expect(document.getElementById(id), id).toBeTruthy();
+    }
+    expect(document.querySelector("[data-agent-history]")).toBeTruthy();
+    expect(document.querySelector("[data-agent-history-body]")?.textContent).toBe(
+      "Open to load the full evidence record.",
+    );
+    expect(paths().some((path) => path.includes("/pipeline"))).toBe(false);
+    expect(document.getElementById("pipeline-validator-history")).toBeNull();
+    spy.mockRestore();
+  });
+
+  it("shows the loading state while an overlay route resolves, not only a full page", async () => {
+    renderPanel();
+    visit("/#/submissions?agent=" + FIXTURE_TOP_AGENT_ID);
+    // #648 dropped the entity.full condition: the wait is the same wait.
+    expect(document.getElementById("d-stats")?.textContent).toContain(
+      "Loading submission details…",
+    );
+    expect(document.getElementById("d-bench")).toHaveTextContent("Loading");
+    await waitFor(() => expect(document.getElementById("d-title")).toHaveTextContent("bolt-v7"));
   });
 
   it("renders the dedicated /agent/{id} page as a main region, not a dialog", async () => {
@@ -191,14 +216,18 @@ describe("EntityPanel agent tenant", () => {
     expect(modal().classList.contains("open")).toBe(true);
   });
 
-  it("states plainly when a full-page submission cannot be found", async () => {
+  // #648 dropped the "could not be found" branch: the summary endpoint 404s
+  // for an unknown id, and a 404 is not distinguishable here from any other
+  // failed read — both mean the card cannot be painted right now.
+  it("states plainly when a submission's details cannot be read", async () => {
     renderPanel();
     visit("/agent/ffffffff-0000-0000-0000-000000000000");
     await waitFor(() =>
       expect(document.getElementById("d-stats")?.textContent).toContain(
-        "This submission could not be found.",
+        "Submission details are temporarily unavailable. Try refreshing in a moment.",
       ),
     );
+    expect(document.getElementById("d-stats")?.textContent).not.toContain("could not be found");
     expect(document.getElementById("d-bench")).toHaveTextContent("Unavailable");
   });
 });

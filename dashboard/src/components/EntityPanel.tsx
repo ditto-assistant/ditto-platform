@@ -55,9 +55,10 @@ import type {
   StackIdentity,
 } from "../types/fleet";
 import type { LeaderboardEntry } from "../types/leaderboard";
-import type { ActivityEntry, ActivityPayload, BenchmarkProgress } from "../types/pipeline";
+import type { AgentSummaryPayload, BenchmarkProgress } from "../types/pipeline";
 import { activityStage } from "./pipeline/status";
 import { AgentEvidence } from "./evidence/AgentEvidence";
+import type { AgentEvidenceEntry } from "./evidence/AgentEvidence";
 import { Consensus } from "./evidence/Consensus";
 // Pure fleet logic the validator body reads: the numeric slot order the
 // per-slot rows sort on, plus the stack-identity/component-health vocabulary.
@@ -207,7 +208,7 @@ function Section(props: { title: string; open?: boolean; children: JSX.Element }
 type PanelView =
   | { tenant: "miner"; key: string; entry: RankedEntry }
   | { tenant: "validator"; key: string; hotkey: string; entry: ValidatorEntry }
-  | { tenant: "agent"; key: string; entry: ActivityEntry }
+  | { tenant: "agent"; key: string; entry: AgentEvidenceEntry }
   | { tenant: "agent-state"; key: string; id: string; message: string; state: "loading" | "error" };
 
 export interface EntityPanelProps {
@@ -242,41 +243,35 @@ export function EntityPanel(props: EntityPanelProps): JSX.Element {
   const isOpen = () => view() !== null;
   const settled = () => (props.settledView ? props.settledView() : false);
 
+  // A cold agent link resolves through /public/agent/{id}/summary (#648): one
+  // addressed submission, not the first page of the global activity feed
+  // filtered down to it. The loading state now shows for an overlay route too
+  // — the fetch is the same wait either way — and there is no "could not be
+  // found" branch: the endpoint 404s for an unknown id, which is the same
+  // "temporarily unavailable, try again" answer as any other failure, and the
+  // old branch could not tell them apart anyway.
   function resolveAgent(route: EntityRoute): void {
     const key = route.key;
     const current = untrack(view);
     if (current && current.key === key && current.tenant === "agent") return;
     if (resolvingKey === key) return;
     resolvingKey = key;
-    if (route.full) {
-      setView({
-        tenant: "agent-state",
-        key,
-        id: route.id,
-        message: "Loading submission details…",
-        state: "loading",
-      });
-    }
-    getJSON<ActivityPayload>("/public/activity?page=1&limit=1&q=" + encodeURIComponent(route.id))
-      .then((data) => {
+    setView({
+      tenant: "agent-state",
+      key,
+      id: route.id,
+      message: "Loading submission details…",
+      state: "loading",
+    });
+    getJSON<AgentSummaryPayload>("/public/agent/" + encodeURIComponent(route.id) + "/summary")
+      .then((entry) => {
         const now = entityRoute();
         if (!now || now.key !== key) return;
-        const entry = (data.entries || []).find((item) => String(item.agent_id) === route.id);
-        if (entry) {
-          setView({ tenant: "agent", key, entry });
-        } else if (route.full) {
-          setView({
-            tenant: "agent-state",
-            key,
-            id: route.id,
-            message: "This submission could not be found.",
-            state: "error",
-          });
-        }
+        setView({ tenant: "agent", key, entry });
       })
       .catch(() => {
         const now = entityRoute();
-        if (route.full && now && now.key === key) {
+        if (now && now.key === key) {
           setView({
             tenant: "agent-state",
             key,

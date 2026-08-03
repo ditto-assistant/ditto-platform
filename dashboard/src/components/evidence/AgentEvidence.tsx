@@ -1,12 +1,28 @@
 // The agent evidence deep view — the drawer body for one submission
-// (monolith renderPipelineSummary 7784–7829, renderScoreHeadline 7726–7755,
-// renderFamilyStanding 7757–7782, renderPipelineDetail 7589–7719,
-// renderAcceptedScores 7313–7379, renderConfirmationScores 7381–7459,
-// openActivityEntry 7853–7899): screening evidence, validator quorum
-// progress with superseded failures kept as history (#459), per-check
-// benchmark progress, terminal screening review cards, model-use verdicts
-// (#527), the review packet, artifact download (#278), and the dispute form.
-import { For, Show, createMemo, createResource } from "solid-js";
+// (monolith renderPipelineSummary 7940–7999, renderScoreHeadline 7882–7911,
+// renderFamilyStanding 7913–7938, renderPipelineDetail 7745–7880,
+// renderPipelineHistoryDisclosure 8001–8010, bindPipelineHistory 8012–8039,
+// renderAcceptedScores, renderConfirmationScores, openActivityEntry):
+// screening evidence, validator quorum progress with superseded failures kept
+// as history (#459), per-check benchmark progress, terminal screening review
+// cards, model-use verdicts (#527), the review packet, artifact download
+// (#278), and the dispute form.
+//
+// #648: the summary paints from the activity/summary entry alone, and the
+// deep history sits behind a disclosure that fetches
+// /public/agent/{id}/pipeline on its FIRST open — never on mount. A direct
+// link is a question about one submission's standing, and the full evidence
+// record is several joins the reader has not asked for yet.
+import {
+  For,
+  Match,
+  Show,
+  Switch,
+  createEffect,
+  createMemo,
+  createResource,
+  createSignal,
+} from "solid-js";
 import type { JSX } from "solid-js";
 
 import { getJSON } from "../../lib/api";
@@ -25,6 +41,7 @@ import type { LeaderboardEntry } from "../../types/leaderboard";
 import type {
   AcceptedScore,
   ActivityEntry,
+  BenchmarkProgress,
   PipelinePayload,
   ScreeningAttempt,
   ValidationAttempt,
@@ -94,12 +111,27 @@ export interface PipelineDetailPayload extends PipelinePayload {
   score_floor_agent_id?: string | null;
   score_floor_agent_name?: string | null;
   score_floor_agent_version?: number | null;
+  /** #648 added the release to the pipeline payload; the deferred history is
+   * the authority once it lands, the entry is what paints until then. */
+  artifact_release?: ArtifactRelease | null;
 }
 
 type ScoredScore = AcceptedScore & { model_use?: ModelUse | null };
 
+/**
+ * What the drawer needs of a submission before any history is loaded: an
+ * activity row, an operations pipeline row, or a `/public/agent/{id}/summary`
+ * payload. `score_composite` and `active_benchmarks` only ride the summary and
+ * operations shapes, and only the summary path renders them (#648).
+ */
+export type AgentEvidenceEntry = ActivityEntry & {
+  artifact_release?: ArtifactRelease | null;
+  active_benchmarks?: BenchmarkProgress[] | null;
+  score_composite?: number | null;
+};
+
 export interface AgentEvidenceProps {
-  entry: ActivityEntry & { artifact_release?: ArtifactRelease | null };
+  entry: AgentEvidenceEntry;
   /** Ranked board entries (continual retests + family standing cross-ref). */
   entries?: () => RankedEntry[];
   /** Mid-rollout settled view, for the family representative's composite. */
@@ -689,57 +721,43 @@ function ValidationAttemptRow(props: { attempt: ValidationAttempt }): JSX.Elemen
   );
 }
 
-// ── History skeleton (the section shells while the pipeline loads) ──────────
-
-/**
- * The pipeline-history section skeleton with the ledger ids
- * (pipeline-screening-history, pipeline-accepted-scores,
- * pipeline-confirmation-scores, pipeline-validator-history), rendered while
- * the deep history is in flight so the drawer's structure — and every
- * anchor/AT landmark — exists from the first paint rather than popping in
- * with the fetch.
- */
-function HistorySkeleton(): JSX.Element {
-  return (
-    <div class="pipeline-history">
-      <section class="pipeline-section" aria-labelledby="pipeline-screening-history">
-        <div class="pipeline-section-heading">
-          <h4 id="pipeline-screening-history">Screener result</h4>
-        </div>
-        <div class="attempt-list" />
-      </section>
-      <section class="pipeline-section" aria-labelledby="pipeline-accepted-scores">
-        <div class="pipeline-section-heading">
-          <h4 id="pipeline-accepted-scores">Accepted validator scores</h4>
-        </div>
-      </section>
-      <section class="pipeline-section" aria-labelledby="pipeline-confirmation-scores">
-        <div class="pipeline-section-heading">
-          <h4 id="pipeline-confirmation-scores">Continual top-five retests</h4>
-        </div>
-      </section>
-      <section class="pipeline-section" aria-labelledby="pipeline-validator-history">
-        <div class="pipeline-section-heading">
-          <h4 id="pipeline-validator-history">Validator progress</h4>
-        </div>
-        <div class="benchmark-cohort-list" />
-      </section>
-    </div>
-  );
-}
-
 // ── The drawer body ──────────────────────────────────────────────────────────
+//
+// The history skeleton that used to hold the ledger section ids while the
+// eager pipeline fetch was in flight is gone with #648: unopened, the
+// disclosure states what opening it will do, and the sections arrive with the
+// record they describe.
 
 export function AgentEvidence(props: AgentEvidenceProps): JSX.Element {
   const entries = () => (props.entries ? props.entries() : []);
   const settled = () => (props.settledView ? props.settledView() : false);
   const agentId = () => String(props.entry.agent_id || "");
 
-  // Fenced by createResource's own race handling (the monolith's
-  // pipelineToken): a slow fetch for one agent never lands in another's view.
-  const [pipeline, { refetch }] = createResource(agentId, (id) =>
-    getJSON<PipelineDetailPayload>("/public/agent/" + encodeURIComponent(id) + "/pipeline"),
+  // The history request counter is the deferral: at 0 the resource has no
+  // source, so createResource never calls the fetcher and nothing is requested
+  // on mount. The first open sets it to 1; a reopen after a failure bumps it
+  // again, which is what makes "close and reopen to retry" true rather than
+  // just advertised. Fenced by createResource's own race handling (the
+  // monolith's pipelineToken): a slow fetch for one agent never lands in
+  // another's view.
+  const [historyRequest, setHistoryRequest] = createSignal(0);
+  const [historyOpen, setHistoryOpen] = createSignal(false);
+  const [pipeline, { refetch }] = createResource(
+    () => (historyRequest() > 0 ? { id: agentId(), attempt: historyRequest() } : false),
+    (key: { id: string; attempt: number }) =>
+      getJSON<PipelineDetailPayload>("/public/agent/" + encodeURIComponent(key.id) + "/pipeline"),
   );
+  // Re-pointing the drawer at another submission (an entity link inside the
+  // card) closes the disclosure and forgets the request, so the next agent's
+  // history is loaded when its reader asks for it, not inherited.
+  createEffect((previous: string | undefined) => {
+    const id = agentId();
+    if (previous !== undefined && previous !== id) {
+      setHistoryOpen(false);
+      setHistoryRequest(0);
+    }
+    return id;
+  });
   // Transcript templates + category names; both effectively static payloads.
   const benchConfig = useEndpoint<BenchConfigPayload>("/public/bench/config");
   const glossary = useEndpoint<GlossaryPayload>("/public/bench/glossary");
@@ -786,6 +804,19 @@ export function AgentEvidence(props: AgentEvidenceProps): JSX.Element {
   const current = createMemo(() =>
     pipelineDisplayState(props.entry as ActivityStatusEntry, loadedPipeline()),
   );
+  const displayScoreCount = (): number =>
+    current().score_count == null ? 0 : Number(current().score_count);
+  const displayQuorum = (): number => (current().quorum == null ? 3 : Number(current().quorum));
+  // Until the deep history loads, the summary is the whole answer — so it
+  // carries the two facts the pipeline payload would otherwise supply: the
+  // benchmark runs in flight and the median under the label its score count
+  // earns (#648). Both step aside once the history's own headline is there.
+  const summaryBenchmarks = (): BenchmarkProgress[] =>
+    loadedPipeline() || !Array.isArray(props.entry.active_benchmarks)
+      ? []
+      : props.entry.active_benchmarks;
+  const summaryComposite = (): number | null =>
+    !loadedPipeline() && props.entry.score_composite != null ? props.entry.score_composite : null;
   const currentCohort = () => pipelineCurrentCohort(current() as PipelinePayload);
   const validationLabel = () => {
     const cohort = currentCohort();
@@ -841,191 +872,238 @@ export function AgentEvidence(props: AgentEvidenceProps): JSX.Element {
     return detail ? benchmarkCohorts(detail) : [];
   });
 
+  // The fetch fires here and nowhere else: on the first open, and again on a
+  // reopen after a failure. Toggling closed is not a request, and a loaded
+  // record is never re-requested (the monolith's dataset.loading / .loaded
+  // pair, bindPipelineHistory 8012–8039).
+  function onHistoryToggle(event: Event): void {
+    const details = event.currentTarget as HTMLDetailsElement;
+    setHistoryOpen(details.open);
+    if (!details.open || loadedPipeline() || pipeline.loading) return;
+    setHistoryRequest((attempt) => attempt + 1);
+  }
+
   return (
-    <div class="pipeline-detail" data-agent-evidence={agentId()}>
-      <Show when={loadedPipeline()}>
-        {(detail) => (
-          <>
-            <ScoreHeadline pipeline={detail()} />
-            <FamilyStanding pipeline={detail()} entries={entries} settledView={settled()} />
-          </>
-        )}
-      </Show>
-      <div class="pipeline-summary">
-        <section class="pipeline-current" aria-labelledby="pipeline-current-title">
-          <h4 id="pipeline-current-title">Current progress</h4>
-          <p class="pipeline-current-message">
-            {validationDetail(current() as ActivityStatusEntry)}
-          </p>
-          <dl class="pipeline-key-facts">
-            <div>
-              <dt>{validationLabel()}</dt>
-              <dd>
-                {current().score_count == null ? 0 : current().score_count} of{" "}
-                {current().quorum == null ? 3 : current().quorum}
-              </dd>
-            </div>
-            <Show when={retestFacts().length}>
+    <>
+      <div class="pipeline-detail" data-agent-evidence={agentId()}>
+        <Show when={loadedPipeline()}>
+          {(detail) => (
+            <>
+              <ScoreHeadline pipeline={detail()} />
+              <FamilyStanding pipeline={detail()} entries={entries} settledView={settled()} />
+            </>
+          )}
+        </Show>
+        <div class="pipeline-summary">
+          <section class="pipeline-current" aria-labelledby="pipeline-current-title">
+            <h4 id="pipeline-current-title">Current progress</h4>
+            <p class="pipeline-current-message">
+              {validationDetail(current() as ActivityStatusEntry)}
+            </p>
+            <For each={summaryBenchmarks()}>
+              {(progress) => <BenchmarkProgressView progress={progress} />}
+            </For>
+            <dl class="pipeline-key-facts">
               <div>
-                <dt>Continual retests</dt>
-                <dd>{retestFacts().join(" · ")}</dd>
+                <dt>{validationLabel()}</dt>
+                <dd>
+                  {displayScoreCount()} of {displayQuorum()}
+                </dd>
               </div>
-            </Show>
-            <Show when={preliminary()}>
-              {(fact) => (
+              <Show when={summaryComposite() != null}>
                 <div>
-                  <dt>{benchmarkVersionLabel(fact().cohort.key)} preliminary</dt>
-                  <dd>
-                    <span class="pipeline-preliminary-value">{fx(fact().latest.composite)}</span>
-                    <span class="pipeline-preliminary-progress">
-                      {fact().cohort.scores.length} of {fact().quorum}
-                    </span>
-                  </dd>
+                  <dt>
+                    {displayScoreCount() >= displayQuorum()
+                      ? "Canonical median"
+                      : "Preliminary median"}
+                  </dt>
+                  <dd>{fx(summaryComposite() as number)}</dd>
                 </div>
-              )}
-            </Show>
-            <div>
-              <dt>Submitted</dt>
-              <dd>{new Date(props.entry.submitted_at || "").toLocaleString()}</dd>
+              </Show>
+              <Show when={retestFacts().length}>
+                <div>
+                  <dt>Continual retests</dt>
+                  <dd>{retestFacts().join(" · ")}</dd>
+                </div>
+              </Show>
+              <Show when={preliminary()}>
+                {(fact) => (
+                  <div>
+                    <dt>{benchmarkVersionLabel(fact().cohort.key)} preliminary</dt>
+                    <dd>
+                      <span class="pipeline-preliminary-value">{fx(fact().latest.composite)}</span>
+                      <span class="pipeline-preliminary-progress">
+                        {fact().cohort.scores.length} of {fact().quorum}
+                      </span>
+                    </dd>
+                  </div>
+                )}
+              </Show>
+              <div>
+                <dt>Submitted</dt>
+                <dd>{new Date(props.entry.submitted_at || "").toLocaleString()}</dd>
+              </div>
+            </dl>
+          </section>
+          <section class="pipeline-meta" aria-labelledby="pipeline-meta-title">
+            <h4 id="pipeline-meta-title">Submission details</h4>
+            <dl class="pipeline-meta-list">
+              <div>
+                <dt>Agent</dt>
+                <dd>{agentName(props.entry.name)}</dd>
+              </div>
+              <div>
+                <dt>Submission</dt>
+                <dd>{agentVersionLabel(props.entry.version)}</dd>
+              </div>
+              <div>
+                <dt>Agent ID</dt>
+                <dd>
+                  <span class="copyable">
+                    <code>
+                      <EntityButton kind="agent" id={agentId()} label={agentId()} />
+                    </code>
+                    <CopyButton value={agentId()} label="agent ID" />
+                  </span>
+                </dd>
+              </div>
+              <div>
+                <dt>Evidence</dt>
+                <dd>{evidence()}</dd>
+              </div>
+            </dl>
+            <div class="review-copy-row">
+              <CopyButton
+                class="review-copy"
+                value={reviewPacket(props.entry)}
+                label="review details"
+              >
+                <span>Copy review details</span>
+              </CopyButton>
             </div>
-          </dl>
-        </section>
-        <section class="pipeline-meta" aria-labelledby="pipeline-meta-title">
-          <h4 id="pipeline-meta-title">Submission details</h4>
-          <dl class="pipeline-meta-list">
-            <div>
-              <dt>Agent</dt>
-              <dd>{agentName(props.entry.name)}</dd>
-            </div>
-            <div>
-              <dt>Submission</dt>
-              <dd>{agentVersionLabel(props.entry.version)}</dd>
-            </div>
-            <div>
-              <dt>Agent ID</dt>
-              <dd>
-                <span class="copyable">
-                  <code>
-                    <EntityButton kind="agent" id={agentId()} label={agentId()} />
-                  </code>
-                  <CopyButton value={agentId()} label="agent ID" />
-                </span>
-              </dd>
-            </div>
-            <div>
-              <dt>Evidence</dt>
-              <dd>{evidence()}</dd>
-            </div>
-          </dl>
-          <div class="review-copy-row">
-            <CopyButton
-              class="review-copy"
-              value={reviewPacket(props.entry)}
-              label="review details"
-            >
-              <span>Copy review details</span>
-            </CopyButton>
-          </div>
-        </section>
+          </section>
+        </div>
+        <ArtifactReleaseCard
+          release={loadedPipeline()?.artifact_release || props.entry.artifact_release}
+          agentId={agentId()}
+        />
       </div>
-      <ArtifactReleaseCard release={props.entry.artifact_release} agentId={agentId()} />
-      <Show when={pipeline.loading}>
-        <p class="pipeline-detail-state loading" role="status">
-          Loading screening and validation history…
-        </p>
-      </Show>
-      <Show when={pipeline.error}>
-        <p class="pipeline-detail-state error" role="status">
-          Detailed history is temporarily unavailable.
-        </p>
-      </Show>
-      <Show
-        when={loadedPipeline()}
-        fallback={
-          <Show when={!pipeline.error}>
-            <HistorySkeleton />
-          </Show>
-        }
+      <details
+        class="pipeline-history-disclosure"
+        data-agent-history=""
+        open={historyOpen()}
+        onToggle={onHistoryToggle}
       >
-        {(detail) => (
-          <div class="pipeline-history">
-            <ScreeningDispute
-              agentId={agentId()}
-              status={detail().status}
-              dispute={detail().dispute}
-              onSubmitted={() => void refetch()}
-            />
-            <section class="pipeline-section" aria-labelledby="pipeline-screening-history">
-              <div class="pipeline-section-heading">
-                <h4 id="pipeline-screening-history">Screener result</h4>
+        <summary>Screening, scores, and validator history</summary>
+        <div
+          class="pipeline-history-disclosure-body"
+          data-agent-history-body=""
+          aria-busy={pipeline.loading ? "true" : undefined}
+        >
+          <Show
+            when={loadedPipeline()}
+            fallback={
+              <Switch
+                fallback={
+                  <p class="pipeline-detail-state">Open to load the full evidence record.</p>
+                }
+              >
+                <Match when={pipeline.loading}>
+                  <p class="pipeline-detail-state loading" role="status">
+                    Loading the full evidence record…
+                  </p>
+                </Match>
+                <Match when={pipeline.error}>
+                  {/* Naming the retry is the whole affordance: the toggle
+                      handler re-requests on the next open. */}
+                  <p class="pipeline-detail-state error" role="status">
+                    Full history is temporarily unavailable. Close and reopen this section to retry.
+                  </p>
+                </Match>
+              </Switch>
+            }
+          >
+            {(detail) => (
+              <div class="pipeline-history">
+                <ScreeningDispute
+                  agentId={agentId()}
+                  status={detail().status}
+                  dispute={detail().dispute}
+                  onSubmitted={() => void refetch()}
+                />
+                <section class="pipeline-section" aria-labelledby="pipeline-screening-history">
+                  <div class="pipeline-section-heading">
+                    <h4 id="pipeline-screening-history">Screener result</h4>
+                  </div>
+                  <div class="attempt-list">
+                    <Show
+                      when={currentScreening().length}
+                      fallback={
+                        <p class="pipeline-detail-state">
+                          No versioned screening attempt recorded yet.
+                        </p>
+                      }
+                    >
+                      <For each={currentScreening()}>
+                        {(attempt) => <ScreeningAttemptRow attempt={attempt} isOld={false} />}
+                      </For>
+                    </Show>
+                    <Show when={oldScreening().length}>
+                      <details class="old-screeners">
+                        <summary>Old screener results</summary>
+                        <For each={oldScreening()}>
+                          {(attempt) => <ScreeningAttemptRow attempt={attempt} isOld={true} />}
+                        </For>
+                      </details>
+                    </Show>
+                  </div>
+                </section>
+                <AcceptedScores pipeline={detail()} config={config} glossary={glossaryData} />
+                <ConfirmationScores pipeline={detail()} entries={entries} />
+                <section class="pipeline-section" aria-labelledby="pipeline-validator-history">
+                  <div class="pipeline-section-heading">
+                    <h4 id="pipeline-validator-history">Validator progress</h4>
+                  </div>
+                  <div class="benchmark-cohort-list">
+                    <Show
+                      when={validationCohorts().length}
+                      fallback={<p class="pipeline-detail-state">No validator is assigned yet.</p>}
+                    >
+                      <For each={validationCohorts()}>
+                        {(cohort) => (
+                          <div class="benchmark-cohort">
+                            <div class="benchmark-cohort-heading">
+                              <h5>{benchmarkVersionLabel(cohort.key)}</h5>
+                              <span class="benchmark-cohort-summary">
+                                {cohortProgressSummary(cohort, detail().quorum)}
+                              </span>
+                            </div>
+                            <div class="attempt-list">
+                              <Show
+                                when={cohort.attempts.length}
+                                fallback={
+                                  <p class="pipeline-detail-state">
+                                    No validator assignment history is available for this benchmark
+                                    version.
+                                  </p>
+                                }
+                              >
+                                <For each={cohort.attempts}>
+                                  {(attempt) => <ValidationAttemptRow attempt={attempt} />}
+                                </For>
+                              </Show>
+                            </div>
+                          </div>
+                        )}
+                      </For>
+                    </Show>
+                  </div>
+                </section>
               </div>
-              <div class="attempt-list">
-                <Show
-                  when={currentScreening().length}
-                  fallback={
-                    <p class="pipeline-detail-state">
-                      No versioned screening attempt recorded yet.
-                    </p>
-                  }
-                >
-                  <For each={currentScreening()}>
-                    {(attempt) => <ScreeningAttemptRow attempt={attempt} isOld={false} />}
-                  </For>
-                </Show>
-                <Show when={oldScreening().length}>
-                  <details class="old-screeners">
-                    <summary>Old screener results</summary>
-                    <For each={oldScreening()}>
-                      {(attempt) => <ScreeningAttemptRow attempt={attempt} isOld={true} />}
-                    </For>
-                  </details>
-                </Show>
-              </div>
-            </section>
-            <AcceptedScores pipeline={detail()} config={config} glossary={glossaryData} />
-            <ConfirmationScores pipeline={detail()} entries={entries} />
-            <section class="pipeline-section" aria-labelledby="pipeline-validator-history">
-              <div class="pipeline-section-heading">
-                <h4 id="pipeline-validator-history">Validator progress</h4>
-              </div>
-              <div class="benchmark-cohort-list">
-                <Show
-                  when={validationCohorts().length}
-                  fallback={<p class="pipeline-detail-state">No validator is assigned yet.</p>}
-                >
-                  <For each={validationCohorts()}>
-                    {(cohort) => (
-                      <div class="benchmark-cohort">
-                        <div class="benchmark-cohort-heading">
-                          <h5>{benchmarkVersionLabel(cohort.key)}</h5>
-                          <span class="benchmark-cohort-summary">
-                            {cohortProgressSummary(cohort, detail().quorum)}
-                          </span>
-                        </div>
-                        <div class="attempt-list">
-                          <Show
-                            when={cohort.attempts.length}
-                            fallback={
-                              <p class="pipeline-detail-state">
-                                No validator assignment history is available for this benchmark
-                                version.
-                              </p>
-                            }
-                          >
-                            <For each={cohort.attempts}>
-                              {(attempt) => <ValidationAttemptRow attempt={attempt} />}
-                            </For>
-                          </Show>
-                        </div>
-                      </div>
-                    )}
-                  </For>
-                </Show>
-              </div>
-            </section>
-          </div>
-        )}
-      </Show>
-    </div>
+            )}
+          </Show>
+        </div>
+      </details>
+    </>
   );
 }

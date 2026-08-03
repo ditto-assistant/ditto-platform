@@ -58,7 +58,7 @@ table honest: if you move or retire one of these, edit the row.
 | 27 | `test_includes_system_and_time_aware_theme_switcher` | No docstring. Guards the four-mode theme switcher (system/light/dark/time) with localStorage persistence, prefers-color-scheme tracking, time-phase (dawn) logic, and sidebar grid layout. | src/components/shell/ThemeSwitcher.test.tsx |
 | 28 | `test_sidebar_shell_routes_every_section` | Inline comment: dashboard is a sidebar shell with hash-routed pages; theme switcher lives in the sidebar; leaderboard has a dedicated page alongside its compact home in the overview. | src/components/shell/Sidebar.test.tsx |
 | 29 | `test_advertises_public_source_repositories` | No docstring. Guards the open-source repo links (platform twice, subnet, screener) with accessible labels. | src/components/shell/Sidebar.test.tsx |
-| 30 | `test_dashboard_entities_use_query_popovers_and_pages` | Inline comments: entity params live in the hash query (real query carries config knobs only); drilldowns are overlays over the current page; `ENTITY_PAGES` is only the cold-link fallback; legacy real-query and path-style entity links are recognized and normalized. | src/lib/entity-links.test.ts (endpoint path → src/lib/api.test.ts) |
+| 30 | `test_dashboard_entities_use_query_popovers_and_pages` | Inline comments: entity params live in the hash query (real query carries config knobs only); drilldowns are overlays over the current page; `ENTITY_PAGES` is only the cold-link fallback; legacy real-query and path-style entity links are recognized and normalized. #648 rewrote how an agent link resolves and what it costs; that slice is row 42. | src/lib/entity-links.test.ts (endpoint path → src/lib/api.test.ts; #648's deep-link / deferral / pause slice → row 42) |
 | 31 | `test_mobile_sidebar_stays_below_modal` | No docstring. Guards z-index layering: modal (50) above backdrop (40) above sticky sidebar (30) on mobile. | src/components/shell/Sidebar.test.tsx |
 | 32 | `test_includes_accessible_global_search` | No docstring. Guards the combobox/listbox global search with keyboard shortcuts (/, cmd-k, arrows, escape) navigating to pages via pushState. | src/components/shell/GlobalSearch.test.tsx |
 | 33 | `test_benchmark_badge_communicates_rollout_transition` | No docstring. Guards the DittoBench badge naming the rollout transition instead of a bare "latest" claim. | src/components/shell/BenchBadge.test.tsx (ABSENT grep → src/build-invariants.test.ts) |
@@ -70,6 +70,7 @@ table honest: if you move or retire one of these, edit the row.
 | 39 | `TestDashboardScoringTransparency.test_benchmark_version_is_never_a_literal` | Class docstring (as #35); static markup carries only a placeholder — the frozen-setup tag and version copy are filled from the API. | src/pages/Benchmark.test.tsx |
 | 40 | `TestDashboardScoringTransparency.test_no_reference_baseline_stat` | Docstring: the stock-harness reference baseline is deliberately unpublished — v7 calibration is sharply bimodal (15 of 20 seeds score conversational_sanity exactly 0.000, composite 0.185-0.221; 5 clear the gate at 0.344-0.450; no mass at the mean 0.248, sd 0.087), so any single number describes a run that does not exist; guards against the stat reappearing as a bare composite. | src/build-invariants.test.ts |
 | 41 | `TestDashboardScoringTransparency.test_neighbouring_comparison_features_survive` | Docstring: removing the baseline must not take out its neighbours — the off-network third-party harness comparison and the token-efficiency budget are separate measurements that merely live beside the removed card. | src/pages/Benchmark.test.tsx |
+| 42 | `test_dashboard_entities_use_query_popovers_and_pages` (the assertions #648 added to row 30) | ditto-platform#648, "perf: defer agent history behind targeted summary". Four behaviors: a cold agent link resolves through `/public/agent/{id}/summary`, and the old `getJSON("/public/activity?page=1&limit=1&q="` lookup is banned (asserted as absence of the request, not of the string); the loading state shows for an overlay route too (the `entity.full` condition is gone) and the "This submission could not be found." branch with it — a 404 from the summary endpoint is the same unavailable answer as any other failure; the deep history sits behind `[data-agent-history]` reading "Open to load the full evidence record." and fetches `/public/agent/{id}/pipeline` on the FIRST open only, retrying on close+reopen after a failure; and an open agent card pauses every periodic global read (`if (entity && entity.kind === "agents") return;`) with exactly one hydrate on close. | src/components/EntityPanel.test.tsx (summary deep link, no activity request, overlay loading state, unavailable copy); src/pages/Submissions.test.tsx (the disclosure: nothing requested on open, first-open fetch, retry, the summary's median + runs in flight, the disclosure CSS); src/data/useEndpoint.test.ts (the entity-first pause and the close hydrate) |
 
 ## Slot fan-out behaviors (`test_dashboard_slots.py`)
 
@@ -152,6 +153,15 @@ Everything below diffs non-zero against the goldens and is deliberate.
   hid five with CSS; the SPA mounts the routed one. Visible output matches.
   One consequence worth knowing: the site footer lives inside the benchmark
   section, so it renders on that page only — as it displayed before.
+- **Boot reads on a cold agent deep link (#648).** The monolith had one
+  `load()`, so the entity-first pause skipped its boot seed too: opening
+  `/agent/{id}` cold cost exactly one request until the card was closed. In the
+  SPA each page and store hydrates on mount, so a cold agent link still seeds
+  the shell's endpoints once; only the *periodic* reads are paused
+  (`agentCardOpen`, `data/useEndpoint.ts`). Suppressing the initial reads too
+  would leave every surface behind the card in its connecting state and refetch
+  the lot on close — a flash the monolith never had, because it kept its
+  last-rendered DOM and merely stopped refreshing it.
 
 ## Known gaps: the miner modal body
 

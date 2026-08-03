@@ -53,10 +53,16 @@ export function fixtureNameFor(path: string): string | null {
       return "activity";
     }
     default: {
-      const agent = /^\/public\/agent\/([^/]+)\/(pipeline|scores)$/.exec(pathname);
+      const agent = /^\/public\/agent\/([^/]+)\/(pipeline|scores|summary)$/.exec(pathname);
       if (!agent) return null;
       const [, id, kind] = agent;
       if (kind === "scores") return id === FIXTURE_TOP_AGENT_ID ? "agent-top-scores" : null;
+      // Only the two recorded agents have a summary: an unknown id must 404
+      // the way the endpoint does, which is the deep-link failure path.
+      if (kind === "summary") {
+        if (id === FIXTURE_TOP_AGENT_ID) return "agent-top-summary";
+        return id === FIXTURE_REJECTED_AGENT_ID ? "agent-rejected-summary" : null;
+      }
       return id === FIXTURE_TOP_AGENT_ID ? "agent-top-pipeline" : "agent-rejected-pipeline";
     }
   }

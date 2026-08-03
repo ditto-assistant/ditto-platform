@@ -1,6 +1,7 @@
-// Submission activity, agent pipeline detail, ATH reviews, and run-telemetry
-// wire shapes (/public/activity, /public/agent/{id}/pipeline, and the
-// digest-verified transcript telemetry sidecar).
+// Submission activity, agent summary/pipeline detail, ATH reviews, and
+// run-telemetry wire shapes (/public/activity, /public/agent/{id}/summary,
+// /public/agent/{id}/pipeline, and the digest-verified transcript telemetry
+// sidecar).
 
 import type { CaseResult } from "./leaderboard";
 
@@ -49,6 +50,27 @@ export interface AthReview extends ActivityEntry {
 
 /** The stitched multi-page ATH review snapshot. */
 export type AthSnapshot = ActivityPayloadBase<AthReview>;
+
+/**
+ * `/public/agent/{id}/summary` — glance-level state for opening ONE agent card
+ * (`PublicAgentSummary`, #648). It is the direct-link hot path: the screening,
+ * score, and validator histories are deliberately absent, and the drawer loads
+ * `PipelinePayload` only once a reader expands that evidence. `score_composite`
+ * and `active_benchmarks` are what let the summary alone state where the
+ * submission stands.
+ */
+export interface AgentSummaryPayload extends ActivityEntry {
+  generated_at?: string;
+  last_scored_at?: string | null;
+  /** Median composite across accepted current-benchmark scores. */
+  score_composite?: number | null;
+  review_event?: "opened" | "reopened" | "cleared" | "rejected" | null;
+  review_event_at?: string | null;
+  review_original_reason?: string | null;
+  review_opened_at?: string | null;
+  preserved_composite?: number | null;
+  active_benchmarks?: BenchmarkProgress[];
+}
 
 // ── Operations pipeline feed + agent pipeline detail ─────────
 
