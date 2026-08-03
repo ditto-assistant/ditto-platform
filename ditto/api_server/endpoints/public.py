@@ -59,6 +59,7 @@ from ditto.api_models import (
     CreateScreeningDisputeResponse,
     PublicActivityEntry,
     PublicActivityResponse,
+    PublicAgentSummary,
     PublicArtifactDownload,
     PublicArtifactRelease,
     PublicAuditEntry,
@@ -207,7 +208,7 @@ from ditto.db.models import (
     ScreeningQuarantine,
     ValidatorTicket,
 )
-from ditto.db.queries.agents import list_public_activity
+from ditto.db.queries.agents import get_public_activity_by_id, list_public_activity
 from ditto.db.queries.artifact_fetch_audit import (
     ENDPOINT_PUBLIC_ARTIFACT,
     record_artifact_fetch,
@@ -292,6 +293,7 @@ from ditto.db.queries.screening import (
     list_screening_attempts,
 )
 from ditto.db.queries.tickets import (
+    get_score_continuation_floor,
     get_score_continuation_floor_row,
     get_score_priority_floors,
 )
@@ -4172,6 +4174,137 @@ async def create_screening_dispute(
     return CreateScreeningDisputeResponse(dispute=_public_dispute(dispute))
 
 
+@router.get("/agent/{agent_id}/summary", response_model=PublicAgentSummary)
+async def agent_summary(
+    response: Response,
+    session: SessionDep,
+    agent_id: UUID,
+) -> PublicAgentSummary:
+    """Return only the fields needed to paint an agent card at a glance.
+
+    This route is the direct-link hot path. It deliberately avoids the global
+    activity population, queue preview, artifact-release calculation, and full
+    attempt/score history. Those remain available from the deferred pipeline
+    route when the reader expands the evidence.
+    """
+    response.headers["Cache-Control"] = "public, max-age=10"
+    now = datetime.now(UTC)
+    active_version = await active_bench_version(session)
+    row = await get_public_activity_by_id(
+        session,
+        agent_id=agent_id,
+        bench_version=active_version,
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="submission not found")
+
+    active_work = await list_active_validator_work(
+        session,
+        now=now,
+        cutoff=now - _VALIDATOR_ONLINE_WINDOW,
+        agent_id=agent_id,
+    )
+    assignments = await list_active_validator_assignments(
+        session,
+        now=now,
+        agent_id=agent_id,
+    )
+    active_assignment_agent_ids = {
+        assignment.agent.agent_id
+        for assignment in assignments
+        if assignment.ticket.bench_version == active_version
+    }
+    needs_queue_state = row.agent.status in {
+        AgentStatus.SCREENING_PASSED,
+        AgentStatus.EVALUATING,
+    }
+    admitted = (
+        await agent_is_admitted(
+            session,
+            bench_version=active_version,
+            agent_id=agent_id,
+        )
+        if needs_queue_state
+        else True
+    )
+    retired = (
+        agent_id in await retired_agent_ids(session, agent_ids={agent_id})
+        if needs_queue_state
+        else False
+    )
+    score_floor = (
+        await get_score_continuation_floor(
+            session,
+            bench_version=active_version,
+        )
+        if row.agent.status == AgentStatus.EVALUATING
+        and row.score_count == SCORING_QUORUM - 1
+        else None
+    )
+    status = _public_activity_status(
+        row.agent.status,
+        screening_policy_version=row.agent.screening_policy_version,
+        has_active_attempt=row.screening_attempt is not None,
+        has_active_validation=any(
+            work.ticket.bench_version == active_version for work in active_work
+        ),
+        has_live_assignment=agent_id in active_assignment_agent_ids,
+        score_count=row.score_count,
+        highest_composite=row.highest_composite,
+        score_continuation_floor=score_floor,
+        benchmark_admitted=admitted,
+        retired=retired,
+    )
+
+    ath_reviews: dict[UUID, _PublicAthReviewSnapshot] = {}
+    ath_composites: dict[UUID, float] = {}
+    if row.agent.status in {AgentStatus.ATH_PENDING_REVIEW, AgentStatus.BANNED}:
+        ath_reviews, ath_composites = await _ath_review_public_snapshot(session, [row])
+    duplicate_metadata = (
+        await _duplicate_submission_metadata(session, [row])
+        if row.agent.duplicate_of is not None
+        else {}
+    )
+    review = ath_reviews.get(agent_id)
+    duplicate = (
+        duplicate_metadata.get(row.agent.duplicate_of)
+        if row.agent.duplicate_of is not None
+        else None
+    )
+    duplicate_name = duplicate[0] if duplicate is not None else None
+    duplicate_version = duplicate[1] if duplicate is not None else None
+    return PublicAgentSummary(
+        generated_at=now,
+        agent_id=agent_id,
+        miner_hotkey=row.agent.miner_hotkey,
+        name=row.agent.name,
+        version=row.agent.version,
+        status=status,
+        submitted_at=row.agent.created_at,
+        last_scored_at=_aware(row.last_scored_at),
+        score_count=row.score_count,
+        score_composite=row.score_composite,
+        quorum=SCORING_QUORUM,
+        screening_reason=(
+            None
+            if status in {"waiting_screening", "screening"}
+            else row.agent.screening_reason
+        ),
+        duplicate_of=row.agent.duplicate_of,
+        duplicate_name=duplicate_name,
+        duplicate_version=duplicate_version,
+        review_reason=review.reason if review is not None else row.agent.review_reason,
+        review_event=review.event if review is not None else None,
+        review_event_at=review.event_at if review is not None else None,
+        review_original_reason=review.original_reason if review is not None else None,
+        review_opened_at=review.opened_at if review is not None else None,
+        preserved_composite=ath_composites.get(agent_id),
+        active_benchmarks=[
+            _public_benchmark_progress(work, now) for work in active_work
+        ],
+    )
+
+
 @router.get("/agent/{agent_id}/pipeline", response_model=PublicSubmissionPipeline)
 async def agent_pipeline(
     response: Response,
@@ -4362,6 +4495,13 @@ async def agent_pipeline(
     return PublicSubmissionPipeline(
         generated_at=now,
         agent_id=agent_id,
+        artifact_release=(
+            await _artifact_release_snapshot(
+                session,
+                statuses={agent_id: agent.status},
+                now=now,
+            )
+        )[agent_id],
         status=_public_activity_status(
             agent.status,
             screening_policy_version=agent.screening_policy_version,

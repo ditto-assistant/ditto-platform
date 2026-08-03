@@ -33,3 +33,11 @@ condition = "AND"
 regexTarget = "secret"
 regexes = ['''^5ColdkeyOwner$''']
 paths = ['''^ditto/tests/db/queries/test_scores\.py$''']
+
+[[allowlists]]
+description = "Git revision used by the dashboard entity-panel test fixture"
+targetRules = ["generic-api-key"]
+condition = "AND"
+regexTarget = "secret"
+regexes = ['''^[0-9a-f]{40}$''']
+paths = ['''^dashboard/src/components/EntityPanel\.stack\.test\.tsx$''']

@@ -452,6 +452,7 @@ async def list_active_validator_work(
     *,
     now: datetime,
     cutoff: datetime,
+    agent_id: UUID | None = None,
 ) -> list[ActiveValidatorWork]:
     """Return only fresh heartbeats still bound to the exact live ticket.
 
@@ -459,29 +460,27 @@ async def list_active_validator_work(
     compatible, but only when their signed report is newer than the current ticket
     issuance; this prevents a stale row from reviving after a same-agent requeue.
     """
-    rows = (
-        await session.execute(
-            select(ValidatorHeartbeat, ValidatorTicket, Agent)
-            .join(
-                ValidatorTicket,
-                (ValidatorTicket.agent_id == ValidatorHeartbeat.active_agent_id)
-                & (
-                    ValidatorTicket.validator_hotkey
-                    == ValidatorHeartbeat.validator_hotkey
-                ),
-            )
-            .join(Agent, Agent.agent_id == ValidatorHeartbeat.active_agent_id)
-            .where(
-                ValidatorHeartbeat.state == "running_benchmark",
-                ValidatorHeartbeat.active_agent_id.is_not(None),
-                ValidatorHeartbeat.seen_at >= cutoff,
-                ValidatorTicket.status == TicketStatus.ISSUED,
-                ValidatorTicket.deadline > now,
-                Agent.status.in_(SCOREABLE_AGENT_STATUSES),
-            )
-            .order_by(ValidatorHeartbeat.validator_hotkey)
+    statement = (
+        select(ValidatorHeartbeat, ValidatorTicket, Agent)
+        .join(
+            ValidatorTicket,
+            (ValidatorTicket.agent_id == ValidatorHeartbeat.active_agent_id)
+            & (ValidatorTicket.validator_hotkey == ValidatorHeartbeat.validator_hotkey),
         )
-    ).all()
+        .join(Agent, Agent.agent_id == ValidatorHeartbeat.active_agent_id)
+        .where(
+            ValidatorHeartbeat.state == "running_benchmark",
+            ValidatorHeartbeat.active_agent_id.is_not(None),
+            ValidatorHeartbeat.seen_at >= cutoff,
+            ValidatorTicket.status == TicketStatus.ISSUED,
+            ValidatorTicket.deadline > now,
+            Agent.status.in_(SCOREABLE_AGENT_STATUSES),
+        )
+        .order_by(ValidatorHeartbeat.validator_hotkey)
+    )
+    if agent_id is not None:
+        statement = statement.where(ValidatorHeartbeat.active_agent_id == agent_id)
+    rows = (await session.execute(statement)).all()
     active: list[ActiveValidatorWork] = []
     for heartbeat, ticket, agent in rows:
         progress: BenchmarkProgress | None = None
@@ -519,19 +518,21 @@ async def list_active_validator_assignments(
     session: AsyncSession,
     *,
     now: datetime,
+    agent_id: UUID | None = None,
 ) -> list[ActiveValidatorAssignment]:
     """Return platform assignment truth without inferring validator liveness."""
-    rows = (
-        await session.execute(
-            select(ValidatorTicket, Agent)
-            .join(Agent, Agent.agent_id == ValidatorTicket.agent_id)
-            .where(
-                ValidatorTicket.status == TicketStatus.ISSUED,
-                ValidatorTicket.deadline > now,
-            )
-            .order_by(ValidatorTicket.validator_hotkey)
+    statement = (
+        select(ValidatorTicket, Agent)
+        .join(Agent, Agent.agent_id == ValidatorTicket.agent_id)
+        .where(
+            ValidatorTicket.status == TicketStatus.ISSUED,
+            ValidatorTicket.deadline > now,
         )
-    ).all()
+        .order_by(ValidatorTicket.validator_hotkey)
+    )
+    if agent_id is not None:
+        statement = statement.where(ValidatorTicket.agent_id == agent_id)
+    rows = (await session.execute(statement)).all()
     return [
         ActiveValidatorAssignment(ticket=ticket, agent=agent) for ticket, agent in rows
     ]
