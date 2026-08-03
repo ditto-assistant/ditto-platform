@@ -196,7 +196,12 @@ export function validatorSlotIds(entry: FleetEntryExt): string[] {
   return Object.keys(seen).sort((a, b) => slotOrdinal(a) - slotOrdinal(b));
 }
 
-export function slotOrdinal(slotId: string): number {
+/** Slot order is numeric, not lexical: "slot-10" comes after "slot-9". An id
+ * that carries no ordinal (a missing `slot_id`, a scheme this build does not
+ * know) sorts last rather than crashing or claiming slot zero — the wire type
+ * makes `slot_id` optional, so the parameter is as wide as the payload
+ * (8768–8771). */
+export function slotOrdinal(slotId: string | null | undefined): number {
   const parsed = parseInt(String(slotId).replace(/^slot-/, ""), 10);
   return isNaN(parsed) ? Number.MAX_SAFE_INTEGER : parsed;
 }

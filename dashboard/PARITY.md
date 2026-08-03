@@ -1,12 +1,16 @@
 # Parity: served-HTML assertions to vitest
 
-The pre-SPA dashboard was one `index.html`, and `ditto/tests/api_server/test_dashboard.py`
+The pre-SPA dashboard was one `index.html`, and two Python suites were the only
+executable record of what it is supposed to show. `ditto/tests/api_server/test_dashboard.py`
 asserted on the served markup, copy, and inline script — 52 tests, ~837
-assertions. That file was the only executable record of what the dashboard is
-supposed to show, so none of it was dropped in the port: the 11
+assertions. The second suite, `ditto/tests/api_server/test_dashboard_slots.py`,
+lifted the five slot fan-out functions out of `index.html` with regexes and ran
+them under node against fixture heartbeats — 24 tests, because slot fan-out is
+logic rather than markup and a served substring cannot tell "renders two jobs"
+from "renders one job twice". None of the 76 was dropped in the port: the 11
 serving-contract tests stayed in Python (wandb injection, cache headers, 304s,
-`/assets/`, the disabled and missing-build fallbacks) and the 41 appearance
-tests moved here, translated by kind.
+`/assets/`, the disabled and missing-build fallbacks) and the 65 appearance and
+behavior tests moved here, translated by kind.
 
 | kind | becomes |
 | --- | --- |
@@ -66,6 +70,52 @@ table honest: if you move or retire one of these, edit the row.
 | 39 | `TestDashboardScoringTransparency.test_benchmark_version_is_never_a_literal` | Class docstring (as #35); static markup carries only a placeholder — the frozen-setup tag and version copy are filled from the API. | src/pages/Benchmark.test.tsx |
 | 40 | `TestDashboardScoringTransparency.test_no_reference_baseline_stat` | Docstring: the stock-harness reference baseline is deliberately unpublished — v7 calibration is sharply bimodal (15 of 20 seeds score conversational_sanity exactly 0.000, composite 0.185-0.221; 5 clear the gate at 0.344-0.450; no mass at the mean 0.248, sd 0.087), so any single number describes a run that does not exist; guards against the stat reappearing as a bare composite. | src/build-invariants.test.ts |
 | 41 | `TestDashboardScoringTransparency.test_neighbouring_comparison_features_survive` | Docstring: removing the baseline must not take out its neighbours — the off-network third-party harness comparison and the token-efficiency budget are separate measurements that merely live beside the removed card. | src/pages/Benchmark.test.tsx |
+
+## Slot fan-out behaviors (`test_dashboard_slots.py`)
+
+The 24 behaviors of the second source suite (#540, 2026-07-29). Five of its
+tests were source greps over `index.html`; those became renders of the real
+components (`FleetTable` in the operations page, `EntityPanel`'s validator
+modal). The rest were pure logic and are now plain imports from
+`src/components/operations/fleet.ts`. Six of them were already asserted by
+`fleet.test.ts` when it was written from the same issue, so they are mapped
+there rather than duplicated, and `slots.test.ts` carries a comment at each
+point where it stops short for that reason.
+
+| old test (`ditto/tests/api_server/test_dashboard_slots.py`) | guards | now lives in |
+| --- | --- | --- |
+| `TestValidatorSlotIds.test_renders_one_row_per_configured_slot` | One slot row per advertised slot. | `src/components/operations/slots.test.ts` › "renders one row per configured slot" |
+| `…test_two_concurrent_jobs_are_both_addressable` | "The regression this change exists for": two jobs, two distinct rows — never one row rendered twice. | `slots.test.ts` › "makes two concurrent jobs both addressable" (rendered half: › "never synthesises slot ids from a count, and draws two jobs as two rows") |
+| `…test_active_slot_outside_configured_range_is_still_shown` | A job is never dropped because the count looks smaller; synthesising ids from `configured_slots` hid exactly the case an operator most needs to see. | `slots.test.ts` › "still shows an active slot outside the configured range" |
+| `…test_assigned_but_not_yet_active_slots_appear` | An assigned-but-not-yet-running slot is part of the union. | `slots.test.ts` › "shows assigned-but-not-yet-active slots" |
+| `…test_slots_order_numerically_not_lexically` | Slot order is by ordinal, not string. | `slots.test.ts` › "orders slots numerically, not lexically" (+ › "compares by ordinal, so slot-10 follows slot-9") |
+| `…test_single_slot_validator_is_unchanged` | The fan-out did not change the one-slot fleet. | `slots.test.ts` › "leaves a single-slot validator unchanged" |
+| `…test_missing_capacity_fields_fall_back_to_one_slot` | An empty payload still renders one slot, never zero. | `slots.test.ts` › "falls back to one slot when the capacity fields are missing" |
+| `TestAnyBenchmarkStage.test_stage_on_a_higher_slot_counts_as_progress` | "Keying off slot zero alone suppressed live progress for slot one." | `slots.test.ts` › "counts a stage on a higher slot as progress" |
+| `…test_idle_validator_reports_no_granular_progress` | An idle validator keeps its plain worker-state chip. | `slots.test.ts` › "reports no granular progress for an idle validator" |
+| `…test_legacy_single_benchmark_still_counts` | The pre-fan-out `active_benchmark` field still counts as progress. | `slots.test.ts` › "still counts a legacy single benchmark" |
+| `TestCappedSlots.test_slots_above_the_cap_are_marked` | Eight advertised under a cap of six: the top two are capped, not idle. | `src/components/operations/fleet.test.ts` › "caps the leftover healthy slots from the highest ordinal down" |
+| `…test_a_validator_inside_the_cap_has_nothing_capped` | A fleet inside its cap is marked nowhere. | `slots.test.ts` › "caps nothing on a validator inside the cap" |
+| `…test_running_work_is_charged_first_and_never_marked` | "Lowering the cap costs new leases only, never one in flight" — and the leftover budget lands on the lowest idle ordinal. | `slots.test.ts` › "charges running work first and never marks it" |
+| `…test_leases_beyond_the_cap_do_not_borrow_from_idle_slots` | A cap dropped under live work caps every idle slot, not a negative. | `slots.test.ts` › "never lets leases beyond the cap borrow from idle slots" |
+| `…test_an_unhealthy_slot_keeps_its_own_state` | "Unavailable is about the validator; capped is about the operator" — an unhealthy slot is neither marked nor charged. | `slots.test.ts` › "leaves an unhealthy slot its own state" |
+| `…test_a_payload_without_the_field_marks_nothing` | "A dashboard served against an older API must not invent a cap." | `fleet.test.ts` › "says nothing when the payload predates allowed_slots" |
+| `TestFundedSlotCount.test_the_cap_binds_below_healthy_capacity` | The numerator is `min(allowed, healthy)` when the cap binds. | `fleet.test.ts` › "counts funded slots as min(allowed, healthy) with the full tooltip" |
+| `…test_health_binds_below_the_cap` | …and when the validator's own health binds instead. | `slots.test.ts` › "binds on health when health is the smaller number" |
+| `…test_without_the_field_it_falls_back_to_healthy_slots` | No cap field: healthy slots are the number. | `slots.test.ts` › "binds on health when health is the smaller number" (second assertion) |
+| `TestDashboardSource.test_slot_ids_are_not_synthesised_from_a_count` | The old loop built ids as `"slot-" + slotIndex` and dropped the rest. | `slots.test.ts` › "never synthesises slot ids from a count, and draws two jobs as two rows" |
+| `…test_per_slot_rows_have_their_own_style_hook` | `.fleet-slot` per slot plus the `+ .fleet-slot` separator rule, so stacked slots read as lines instead of the table growing a column per slot. | `slots.test.ts` › "gives every slot its own row and its own style hook" |
+| `…test_a_capped_slot_is_rendered_as_its_own_state` | Not "Idle" (claims usable capacity) and not "Unavailable" (a fault); the tooltip names the cap from the snapshot. | `slots.test.ts` › "renders a capped slot as its own state — not Idle, not Unavailable" |
+| `…test_the_fleet_row_reports_funded_capacity` | "The numerator is what dispatch funds, not what is advertised" — and never the old healthy-of-advertised phrasing. | `slots.test.ts` › "reports funded capacity in the row, not advertised or healthy" |
+| `…test_detail_modal_renders_every_active_slot` | The modal used to show only the lowest slot, so a second concurrent benchmark was invisible there. | `slots.test.ts` › "renders every active slot, in slot order" |
+
+Two behaviors gained coverage they never had, because the Python suite only
+reached `slotOrdinal` and `anyBenchmarkStage` indirectly: an id with no ordinal
+(a missing `slot_id`, an unknown naming scheme) sorts last rather than claiming
+slot zero or dropping out of the union, and a leased slot that has not reported
+a stage yet is not progress. Porting the modal guard also found that
+`EntityPanel`'s validator body had the `Slots` summary but not the per-slot rows
+under it — that regression was live until it was fixed alongside these tests.
 
 ## Notes on the translation
 
