@@ -19,10 +19,16 @@ The int63 masking mirrors dittobench-api's ``gen.FreshSeed`` (``int64(uint64 >>
 from __future__ import annotations
 
 import hashlib
+import math
 from collections.abc import Iterable, Mapping
 from uuid import UUID
 
-from ditto.api_server.koth import TOP5_MAX_CONFIRMATION_SEEDS
+from ditto.api_server.koth import (
+    KOTH_DETHRONE_Z,
+    KOTH_MARGIN,
+    TOP5_MAX_CONFIRMATION_SEEDS,
+    TOP5_MIN_CONFIRMATION_SEEDS,
+)
 
 # Mask to a non-negative signed-63-bit integer, matching dittobench-api's
 # FreshSeed (``int64(uint64 >> 1)``): JSON-clean and never negative.
@@ -83,22 +89,87 @@ def champion_anchored_seeds(
     )
 
 
-def continual_anchor_horizon(
-    seeds_by_agent: Mapping[UUID, Iterable[int]],
+def elastic_confirmation_seed_ceiling(
+    composites_by_agent: Mapping[UUID, Mapping[int, float]],
     *,
-    minimum: int = TOP5_MAX_CONFIRMATION_SEEDS,
+    minimum: int = TOP5_MIN_CONFIRMATION_SEEDS,
+    maximum: int = TOP5_MAX_CONFIRMATION_SEEDS,
+    target_half_width: float = KOTH_MARGIN,
+    z: float = KOTH_DETHRONE_Z,
 ) -> int:
-    """Enough deterministic anchor seeds to include one unseen growth seed.
+    """Variance-sized shared-seed target, clamped to a finite work budget.
 
-    The historical fixed horizon of sixteen exhausted permanently. A finite
-    durable history can contain at most ``N`` distinct seeds, so generating
-    ``N + 1`` anchor candidates guarantees at least one fresh seed without an
-    arbitrary new ceiling.
+    Use the noisiest emission member's sample variance so one quiet agent cannot
+    prematurely stop evidence collection for a noisy sibling. The unconstrained
+    target solves ``z * sample_sd / sqrt(n) <= target_half_width``. With fewer
+    than two observations there is no variance estimate, so the lane gathers the
+    minimum first. This is scheduling policy only; accepted rows stay append-only
+    and the fold keeps using them after the target later shrinks.
     """
-    observed: set[int] = set()
-    for seeds in seeds_by_agent.values():
-        observed.update(int(seed) for seed in seeds)
-    return max(1, int(minimum), len(observed) + 1)
+    floor = max(2, int(minimum))
+    cap = max(floor, int(maximum))
+    if target_half_width <= 0.0 or z <= 0.0:
+        return cap
+    max_variance = 0.0
+    measured = False
+    for composites in composites_by_agent.values():
+        values = [
+            float(value)
+            for value in composites.values()
+            if not isinstance(value, bool)
+            and isinstance(value, (int, float))
+            and math.isfinite(value)
+            and 0.0 <= value <= 1.0
+        ]
+        if len(values) < 2:
+            continue
+        measured = True
+        mean = sum(values) / len(values)
+        variance = sum((value - mean) ** 2 for value in values) / (len(values) - 1)
+        max_variance = max(max_variance, variance)
+    if not measured:
+        return floor
+    required = math.ceil(max_variance * (z / target_half_width) ** 2)
+    return min(cap, max(floor, required))
+
+
+def bounded_continual_seed_set(
+    champion_agent_id: UUID,
+    *,
+    version: int,
+    composites_by_agent: Mapping[UUID, Mapping[int, float]],
+) -> tuple[int, ...]:
+    """The elastic cohort target: most-shared durable seeds, then fresh CRNs.
+
+    Existing evidence is ordered by cohort coverage first so a churned member
+    catches up to the seeds that buy the largest paired intersection. If the
+    durable universe is shallower than the elastic target, deterministic seeds
+    from the current champion fill the remainder. Once the target is full no new
+    seed is introduced, which is the actual continual-work cap.
+    """
+    ceiling = elastic_confirmation_seed_ceiling(composites_by_agent)
+    anchor = champion_anchored_seeds(
+        champion_agent_id, version=version, max_seeds=ceiling
+    )
+    anchor_order = {seed: index for index, seed in enumerate(anchor)}
+    coverage: dict[int, int] = {}
+    for composites in composites_by_agent.values():
+        for seed in composites:
+            coverage[int(seed)] = coverage.get(int(seed), 0) + 1
+    targets = sorted(
+        coverage,
+        key=lambda seed: (-coverage[seed], anchor_order.get(seed, ceiling), seed),
+    )[:ceiling]
+    if len(targets) < ceiling:
+        selected = set(targets)
+        for seed in anchor:
+            if seed in selected:
+                continue
+            targets.append(seed)
+            selected.add(seed)
+            if len(targets) == ceiling:
+                break
+    return tuple(targets)
 
 
 def fold_seed_bound(

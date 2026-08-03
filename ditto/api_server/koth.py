@@ -35,9 +35,12 @@ KOTH_DETHRONE_Z = 1.64
 # a reign-backoff over the champion's crown (see ``top5_round_is_due``).
 BLOCKS_PER_TEMPO = 360
 
-# Backwards-compatible minimum champion-anchored planning horizon. The live
-# horizon extends from durable observed history; this is no longer a ceiling.
-TOP5_MAX_CONFIRMATION_SEEDS = 16
+# Continual retests gather enough shared-seed evidence to make the one-sided
+# 95% uncertainty half-width no wider than the fixed KOTH margin. Eight is the
+# minimum credible variance sample; 32 is the fleet-work hard stop when current
+# variance would otherwise ask for an impractical number of runs.
+TOP5_MIN_CONFIRMATION_SEEDS = 8
+TOP5_MAX_CONFIRMATION_SEEDS = 32
 
 
 @dataclass(frozen=True)
