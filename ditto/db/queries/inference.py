@@ -870,6 +870,9 @@ async def finish_inference_request(
     timed_out: bool = False,
     latency_ms: int | None = None,
     upstream_attempts: int = 0,
+    openrouter_attempts: int = 0,
+    fallback_phase: int = 0,
+    terminal_error_code: str | None = None,
 ) -> bool:
     snapshot = await session.get(InferenceGrant, grant_id)
     if snapshot is None:
@@ -942,6 +945,9 @@ async def finish_inference_request(
     request.cost_microusd = cost_microusd
     request.upstream_provider = upstream_provider
     request.upstream_attempts = max(0, upstream_attempts)
+    request.openrouter_attempts = max(0, openrouter_attempts)
+    request.fallback_phase = min(1, max(0, fallback_phase))
+    request.terminal_error_code = terminal_error_code
     request.timed_out = timed_out
     request.latency_ms = latency_ms
     request.completed_at = now

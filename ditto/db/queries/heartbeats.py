@@ -52,6 +52,8 @@ _STAGE_ORDER: dict[BenchmarkProgressStage, int] = {
     "generating_dataset": 2,
     "starting_harness": 3,
     "running_benchmark": 4,
+    # A relay pause is a reversible sub-state of the running stage.
+    "waiting_for_relay": 4,
     "finalizing": 5,
     "submitting_result": 6,
     "failed_retrying": 7,

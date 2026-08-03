@@ -2269,6 +2269,12 @@ async def leaderboard(
             for row in owner_rows
         ],
     )
+    finalized_owner_roots = {
+        row.agent_id: root
+        for row, root in zip(
+            finalized_rows, owner_roots[: len(finalized_rows)], strict=True
+        )
+    }
     finalized_owners = set(owner_roots[: len(finalized_rows)])
     provisional_by_owner: dict[str, tuple[LedgerRow, int]] = {}
     for owner, candidate in zip(
@@ -2375,10 +2381,7 @@ async def leaderboard(
                 artifact_release=artifact_releases[row.agent_id],
                 submission_family=_public_submission_family(
                     family_members_by_owner.get(
-                        emission_owner(
-                            miner_hotkey=row.miner_hotkey,
-                            miner_coldkey=row.miner_coldkey,
-                        ),
+                        finalized_owner_roots[row.agent_id],
                         [],
                     ),
                     representative_agent_id=row.agent_id,

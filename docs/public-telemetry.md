@@ -465,6 +465,9 @@ rate-limited, `Cache-Control: public, max-age=30`. Read-only, aggregate-only.
   It does not update the ticket, submission, benchmark, or any accepted score.
   Progress regression for a still-valid lease remains rejected. Telemetry
   failure therefore cannot abort scoring or weights.
+  `waiting_for_relay` is a reversible running sub-stage: it preserves aggregate
+  check counts while the scorer backs off between provider attempts, then may
+  return to `running_benchmark` without being treated as a regression.
 
   Screener heartbeat protocol v2 may also sign a current-job start time and one
   coarse stage: `preparing`, `downloading`, `validating`, `building`, `starting`,

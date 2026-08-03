@@ -184,6 +184,40 @@ class _ProviderCallError(Exception):
         self.timed_out = timed_out
 
 
+@dataclass(frozen=True)
+class _ChatCompletionResult:
+    raw: bytes
+    usage: tuple[int, int, int]
+    upstream_provider: str
+    upstream_attempts: int
+    openrouter_attempts: int
+    fallback_phase: int
+
+
+class _ChatProviderExhausted(Exception):
+    """All reviewed provider phases failed without a deliverable completion."""
+
+    def __init__(
+        self,
+        *,
+        upstream_attempts: int,
+        openrouter_attempts: int,
+        fallback_phase: int,
+        terminal_error_code: str,
+        timed_out: bool,
+        upstream_provider: str | None,
+        route_observable: bool,
+    ) -> None:
+        super().__init__(terminal_error_code)
+        self.upstream_attempts = upstream_attempts
+        self.openrouter_attempts = openrouter_attempts
+        self.fallback_phase = fallback_phase
+        self.terminal_error_code = terminal_error_code
+        self.timed_out = timed_out
+        self.upstream_provider = upstream_provider
+        self.route_observable = route_observable
+
+
 async def _post_provider_with_retry(
     client: httpx.AsyncClient,
     url: str,
@@ -435,14 +469,12 @@ def _provider_preferences(
 ) -> dict[str, Any]:
     if routing_mode == "aggregate_throughput":
         return {
-            # Route for reliability first. Live production evidence showed
-            # Amazon Bedrock returning HTTP 200 responses that violated the
-            # required tool-call contract; throughput sorting repeatedly sent
-            # fresh work back to that provider. OpenRouter still owns fallback
-            # within the reviewed set, but the preferred order is explicit and
-            # the known-bad provider is excluded.
-            "order": ["coreweave", "deepinfra", "groq"],
-            "ignore": ["amazon-bedrock"],
+            # Normal traffic optimizes for the throughput miners actually feel.
+            # CoreWeave is excluded because its reviewed route is 4-bit. A
+            # separate bounded recovery phase below deliberately switches
+            # objectives after this fast path has failed.
+            "sort": "throughput",
+            "ignore": ["coreweave"],
             "allow_fallbacks": True,
             "data_collection": "deny",
             "zdr": True,
@@ -456,6 +488,216 @@ def _provider_preferences(
     if quantization:
         preferences["quantizations"] = [quantization]
     return preferences
+
+
+def _reliability_provider_preferences() -> dict[str, Any]:
+    """Reviewed recovery order after the normal throughput route is exhausted."""
+    return {
+        "order": ["deepinfra", "groq"],
+        "ignore": ["coreweave"],
+        "allow_fallbacks": False,
+        "data_collection": "deny",
+        "zdr": True,
+    }
+
+
+def _openrouter_attempt_count(payload: object) -> int:
+    """Extract a bounded count of OpenRouter-internal provider attempts."""
+    if not isinstance(payload, dict):
+        return 0
+    metadata = payload.get("openrouter_metadata")
+    if not isinstance(metadata, dict):
+        return 0
+    attempt = metadata.get("attempt")
+    if (
+        isinstance(attempt, int)
+        and not isinstance(attempt, bool)
+        and 1 <= attempt <= 100
+    ):
+        return attempt
+    attempts = metadata.get("attempts")
+    if isinstance(attempts, list) and len(attempts) <= 100:
+        return len(attempts)
+    return 0
+
+
+def _openrouter_last_attempted_provider(payload: object) -> str | None:
+    """Return the last bounded provider named in router attempt metadata."""
+    if not isinstance(payload, dict):
+        return None
+    metadata = payload.get("openrouter_metadata")
+    if not isinstance(metadata, dict):
+        return None
+    attempts = metadata.get("attempts")
+    if not isinstance(attempts, list) or not 1 <= len(attempts) <= 100:
+        return None
+    last = attempts[-1]
+    provider = last.get("provider") if isinstance(last, dict) else None
+    return provider if isinstance(provider, str) and 1 <= len(provider) <= 120 else None
+
+
+def _phase_error_code(error: HTTPException) -> str:
+    detail = error.detail if isinstance(error.detail, str) else ""
+    return {
+        "provider response is too large": "response_too_large",
+        "invalid provider response": "invalid_provider_response",
+        "provider identity mismatch": "provider_identity_mismatch",
+        "inference provider unavailable": "provider_unavailable",
+    }.get(detail, "provider_unavailable")
+
+
+async def _complete_chat_with_recovery(
+    client: httpx.AsyncClient,
+    config: InferenceProxyConfig,
+    *,
+    payload: dict[str, Any],
+    model: str,
+    expected_provider: str,
+    expected_quantization: str | None,
+    expected_prompt_price: float | None,
+    expected_completion_price: float | None,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+) -> _ChatCompletionResult:
+    """Run fast OpenRouter, then the bounded reliable OpenRouter route.
+
+    Each phase is bounded. The first phase retains throughput routing; the
+    second restricts recovery to the reviewed reliable providers. No request
+    or response content is retained by this orchestration layer.
+    """
+    aggregate = config.routing_mode == "aggregate_throughput"
+    phases: list[tuple[int, str, dict[str, str], dict[str, Any]]] = []
+    primary = dict(payload)
+    primary["provider"] = _provider_preferences(
+        routing_mode=config.routing_mode,
+        provider=expected_provider,
+        quantization=expected_quantization,
+    )
+    phases.append(
+        (
+            0,
+            config.upstream_url,
+            _openrouter_headers(config.openrouter_api_key or "", include_metadata=True),
+            primary,
+        )
+    )
+    if aggregate:
+        reliable = dict(payload)
+        reliable["provider"] = _reliability_provider_preferences()
+        phases.append(
+            (
+                1,
+                config.upstream_url,
+                _openrouter_headers(
+                    config.openrouter_api_key or "", include_metadata=True
+                ),
+                reliable,
+            )
+        )
+
+    total_attempts = 0
+    router_attempts = 0
+    last_code = "provider_unavailable"
+    last_timed_out = False
+    last_phase = 0
+    last_provider: str | None = None
+    route_observable = False
+    for phase, url, headers, phase_payload in phases:
+        last_phase = phase
+        try:
+            provider_result = await _post_provider_with_retry(
+                client,
+                url,
+                payload=phase_payload,
+                headers=headers,
+                sleep=sleep,
+            )
+        except _ProviderCallError as error:
+            total_attempts += error.attempts
+            last_timed_out = error.timed_out
+            last_code = "provider_timeout" if error.timed_out else "provider_transport"
+            route_observable = True
+            continue
+
+        total_attempts += provider_result.attempts
+        response = provider_result.response
+        raw = response.content
+        if len(raw) > config.response_body_bytes:
+            last_code = "response_too_large"
+            continue
+        try:
+            decoded = response.json()
+        except ValueError:
+            decoded = None
+        router_attempts += _openrouter_attempt_count(decoded)
+        last_provider = _openrouter_last_attempted_provider(decoded) or last_provider
+        if response.status_code >= 400:
+            last_timed_out = response.status_code in {408, 504}
+            last_code = f"upstream_http_{response.status_code}"
+            route_observable = (
+                route_observable
+                or _provider_rejection_is_route_observable(response.status_code)
+            )
+            continue
+        route_observable = True
+        if not isinstance(decoded, dict):
+            last_code = "invalid_provider_response"
+            continue
+        if decoded.get("model") != model:
+            last_code = "provider_identity_mismatch"
+            continue
+        try:
+            provider_value = _upstream_provider(decoded)
+            if provider_value is None or (
+                not aggregate and provider_value != expected_provider
+            ):
+                raise HTTPException(
+                    status_code=502, detail="provider identity mismatch"
+                )
+            bounded = _bounded_usage(decoded)
+            if bounded is None:
+                raise HTTPException(status_code=502, detail="invalid provider response")
+            prompt, completion, _ = bounded
+            if aggregate:
+                provider_cost = _bounded_provider_cost(decoded)
+                if provider_cost is None:
+                    raise HTTPException(
+                        status_code=502, detail="invalid provider response"
+                    )
+                cost = provider_cost
+            else:
+                if expected_prompt_price is None or expected_completion_price is None:
+                    raise HTTPException(
+                        status_code=502, detail="invalid provider response"
+                    )
+                cost = int(
+                    (
+                        prompt * expected_prompt_price
+                        + completion * expected_completion_price
+                    )
+                    * 1_000_000
+                )
+            public_response = _public_provider_response(decoded)
+        except HTTPException as error:
+            last_code = _phase_error_code(error)
+            continue
+        return _ChatCompletionResult(
+            raw=json.dumps(public_response, separators=(",", ":")).encode(),
+            usage=(prompt, completion, cost),
+            upstream_provider=provider_value,
+            upstream_attempts=total_attempts,
+            openrouter_attempts=router_attempts,
+            fallback_phase=phase,
+        )
+
+    raise _ChatProviderExhausted(
+        upstream_attempts=total_attempts,
+        openrouter_attempts=router_attempts,
+        fallback_phase=last_phase,
+        terminal_error_code=last_code,
+        timed_out=last_timed_out,
+        upstream_provider=last_provider,
+        route_observable=route_observable,
+    )
 
 
 def _openrouter_headers(
@@ -1326,12 +1568,6 @@ async def proxy_chat_completions(
     reserved_grant = reserved[0]
     if not reserved_grant.route_provider:
         raise HTTPException(status_code=409, detail="inference route unavailable")
-    aggregate_routing = config.routing_mode == "aggregate_throughput"
-    upstream_payload["provider"] = _provider_preferences(
-        routing_mode=config.routing_mode,
-        provider=reserved_grant.route_provider,
-        quantization=reserved_grant.route_quantization,
-    )
     status = "failed"
     usage: tuple[int, int, int] | None = None
     raw: bytes | None = None
@@ -1340,77 +1576,36 @@ async def proxy_chat_completions(
     route_observable = False
     upstream_provider: str | None = None
     upstream_attempts = 0
+    openrouter_attempts = 0
+    fallback_phase = 0
+    terminal_error_code: str | None = None
     try:
-        provider_result = await _post_provider_with_retry(
+        recovered = await _complete_chat_with_recovery(
             request.app.state.inference_client,
-            config.upstream_url,
+            config,
             payload=upstream_payload,
-            headers=_openrouter_headers(
-                config.openrouter_api_key, include_metadata=True
-            ),
+            model=model,
+            expected_provider=reserved_grant.route_provider,
+            expected_quantization=reserved_grant.route_quantization,
+            expected_prompt_price=reserved_grant.route_prompt_price_per_token,
+            expected_completion_price=(reserved_grant.route_completion_price_per_token),
         )
-        upstream = provider_result.response
-        upstream_attempts = provider_result.attempts
-        raw = upstream.content
-        # Authentication, balance, throttling, and availability failures are
-        # route-health evidence. A 400/422 can still be an unrecognized caller
-        # request-shape error and must not let one ticket cool the shared route.
-        route_observable = _provider_rejection_is_route_observable(upstream.status_code)
-        if len(raw) > config.response_body_bytes:
-            raise HTTPException(
-                status_code=502, detail="provider response is too large"
-            )
-        if upstream.status_code >= 400:
-            raise HTTPException(
-                status_code=502, detail="inference provider unavailable"
-            )
-        try:
-            decoded = upstream.json()
-        except ValueError as error:
-            raise HTTPException(
-                status_code=502, detail="invalid provider response"
-            ) from error
+        raw = recovered.raw
+        usage = recovered.usage
+        upstream_provider = recovered.upstream_provider
+        upstream_attempts = recovered.upstream_attempts
+        openrouter_attempts = recovered.openrouter_attempts
+        fallback_phase = recovered.fallback_phase
         route_observable = True
-        usage = _bounded_usage(decoded if isinstance(decoded, dict) else {})
-        if not isinstance(decoded, dict) or decoded.get("model") != model:
-            raise HTTPException(status_code=502, detail="provider identity mismatch")
-        provider_value = _upstream_provider(decoded)
-        if provider_value is None:
-            raise HTTPException(status_code=502, detail="provider identity mismatch")
-        upstream_provider = provider_value
-        if not aggregate_routing and provider_value != reserved_grant.route_provider:
-            raise HTTPException(status_code=502, detail="provider identity mismatch")
-        if usage is not None:
-            prompt, completion, _ = usage
-            if aggregate_routing:
-                trusted_cost = _bounded_provider_cost(decoded)
-                if trusted_cost is None:
-                    usage = None
-                else:
-                    usage = (prompt, completion, trusted_cost)
-            elif (
-                reserved_grant.route_prompt_price_per_token is None
-                or reserved_grant.route_completion_price_per_token is None
-            ):
-                usage = None
-            else:
-                trusted_cost = int(
-                    (
-                        prompt * reserved_grant.route_prompt_price_per_token
-                        + completion * reserved_grant.route_completion_price_per_token
-                    )
-                    * 1_000_000
-                )
-                usage = (prompt, completion, trusted_cost)
-        # The harness needs the normalized completion and token counts, not
-        # provider, payer, router, system-fingerprint, or native-error metadata.
-        public_response = _public_provider_response(decoded)
-        raw = json.dumps(public_response, separators=(",", ":")).encode()
         status = "completed"
-    except _ProviderCallError as error:
-        upstream_attempts = error.attempts
+    except _ChatProviderExhausted as error:
+        upstream_attempts = error.upstream_attempts
+        openrouter_attempts = error.openrouter_attempts
+        fallback_phase = error.fallback_phase
+        terminal_error_code = error.terminal_error_code
         timed_out = error.timed_out
-        route_observable = True
+        upstream_provider = error.upstream_provider
+        route_observable = error.route_observable
         detail = (
             "inference provider timed out"
             if timed_out
@@ -1419,8 +1614,6 @@ async def proxy_chat_completions(
         raise HTTPException(
             status_code=504 if timed_out else 502, detail=detail
         ) from error
-    except HTTPException:
-        raise
     finally:
         finished_at = datetime.now(UTC)
         async with session_maker() as session, session.begin():
@@ -1439,6 +1632,9 @@ async def proxy_chat_completions(
                 timed_out=timed_out,
                 latency_ms=max(0, round((time.monotonic() - started) * 1000)),
                 upstream_attempts=upstream_attempts,
+                openrouter_attempts=openrouter_attempts,
+                fallback_phase=fallback_phase,
+                terminal_error_code=terminal_error_code,
             )
             from ditto.db.models import InferenceGrant
 

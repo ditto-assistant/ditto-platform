@@ -23,6 +23,7 @@ _DEADLINE = datetime(2030, 1, 1, tzinfo=UTC)
         ("starting_harness", None, None),
         ("running_benchmark", None, None),
         ("running_benchmark", 51, 114),
+        ("waiting_for_relay", 51, 114),
         ("finalizing", 114, 114),
         ("submitting_result", 114, 114),
         ("failed_retrying", None, None),

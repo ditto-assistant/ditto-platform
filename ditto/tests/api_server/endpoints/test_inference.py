@@ -1,6 +1,8 @@
 import base64
+import json
 from datetime import UTC, datetime
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 import bittensor
@@ -11,6 +13,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from fastapi import HTTPException
 
 from ditto.api_models.inference import InferenceExchangeRequest, InferenceGrantOffer
+from ditto.api_server.config import InferenceProxyConfig
 from ditto.api_server.endpoints.inference import (
     _ALLOWED_REQUEST_FIELDS,
     _DROPPED_REQUEST_FIELDS,
@@ -19,12 +22,15 @@ from ditto.api_server.endpoints.inference import (
     _PINNED_REQUEST_FIELDS,
     _REFUSED_REQUEST_FIELDS,
     _bounded_provider_cost,
+    _complete_chat_with_recovery,
     _estimated_tokens,
     _exchange_message,
     _locked_grant_model,
     _locked_upstream_payload,
     _max_chargeable_tokens,
+    _openrouter_attempt_count,
     _openrouter_headers,
+    _openrouter_last_attempted_provider,
     _output_token_limit,
     _post_provider_with_retry,
     _provider_preferences,
@@ -33,6 +39,7 @@ from ditto.api_server.endpoints.inference import (
     _proxy_message,
     _public_embedding_response,
     _public_provider_response,
+    _reliability_provider_preferences,
     _upstream_provider,
     _validate_request_schema,
     _validated_embedding_payload,
@@ -455,20 +462,109 @@ def test_tool_result_name_must_be_a_non_empty_string(name: object) -> None:
     assert raised.value.detail == "invalid tool name"
 
 
-def test_aggregate_route_is_reliability_ordered_private_and_fallback_enabled() -> None:
+def test_aggregate_route_is_throughput_sorted_and_excludes_unreviewed_routes() -> None:
     assert _provider_preferences(
         routing_mode="aggregate_throughput",
         provider="openrouter",
         quantization=None,
     ) == {
-        "order": ["coreweave", "deepinfra", "groq"],
-        "ignore": ["amazon-bedrock"],
+        "sort": "throughput",
+        "ignore": ["coreweave"],
         "allow_fallbacks": True,
+        "data_collection": "deny",
+        "zdr": True,
+    }
+    assert _reliability_provider_preferences() == {
+        "order": ["deepinfra", "groq"],
+        "ignore": ["coreweave"],
+        "allow_fallbacks": False,
         "data_collection": "deny",
         "zdr": True,
     }
     assert _bounded_provider_cost({"usage": {"cost": 0.012345}}) == 12_345
     assert _bounded_provider_cost({"usage": {"cost": float("nan")}}) is None
+
+
+def _recovery_config() -> InferenceProxyConfig:
+    return cast(
+        InferenceProxyConfig,
+        SimpleNamespace(
+            routing_mode="aggregate_throughput",
+            upstream_url="https://openrouter.ai/api/v1/chat/completions",
+            openrouter_api_key="test-key",
+            response_body_bytes=2 << 20,
+        ),
+    )
+
+
+def _provider_completion(*, provider: str | None, attempt: int = 1) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "id": "gen-test",
+        "object": "chat.completion",
+        "created": 1,
+        "model": "openai/gpt-oss-20b",
+        "choices": [
+            {
+                "index": 0,
+                "finish_reason": "stop",
+                "message": {"role": "assistant", "content": "OK"},
+            }
+        ],
+        "usage": {
+            "prompt_tokens": 10,
+            "completion_tokens": 2,
+            "cost": 0.00000135,
+        },
+    }
+    if provider is not None:
+        payload["openrouter_metadata"] = {
+            "attempt": attempt,
+            "endpoints": {"available": [{"provider": provider, "selected": True}]},
+        }
+    return payload
+
+
+@pytest.mark.asyncio
+async def test_invalid_fast_response_recovers_through_deepinfra() -> None:
+    requests: list[dict[str, Any]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        requests.append(body)
+        if len(requests) == 1:
+            return httpx.Response(
+                200,
+                request=request,
+                json={"model": "openai/gpt-oss-20b", "choices": []},
+            )
+        return httpx.Response(
+            200,
+            request=request,
+            json=_provider_completion(provider="DeepInfra", attempt=2),
+        )
+
+    async def no_sleep(_: float) -> None:
+        return None
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await _complete_chat_with_recovery(
+            client,
+            _recovery_config(),
+            payload={"model": "openai/gpt-oss-20b", "messages": []},
+            model="openai/gpt-oss-20b",
+            expected_provider="openrouter",
+            expected_quantization=None,
+            expected_prompt_price=None,
+            expected_completion_price=None,
+            sleep=no_sleep,
+        )
+
+    assert requests[0]["provider"]["sort"] == "throughput"
+    assert requests[1]["provider"]["order"] == ["deepinfra", "groq"]
+    assert result.upstream_provider == "DeepInfra"
+    assert result.fallback_phase == 1
+    assert result.upstream_attempts == 2
+    assert result.openrouter_attempts == 2
 
 
 def test_openrouter_headers_attribute_chat_and_embedding_traffic() -> None:
@@ -478,6 +574,26 @@ def test_openrouter_headers_attribute_chat_and_embedding_traffic() -> None:
         "HTTP-Referer": "https://heyditto.ai/",
         "X-OpenRouter-Title": "Ditto",
     }
+
+
+def test_openrouter_failure_metadata_preserves_internal_attempts() -> None:
+    payload = {
+        "openrouter_metadata": {
+            "attempt": 2,
+            "attempts": [
+                {"provider": "DeepInfra", "status": 502},
+                {"provider": "Groq", "status": 503},
+            ],
+            "endpoints": {
+                "available": [
+                    {"provider": "DeepInfra", "selected": False},
+                    {"provider": "Groq", "selected": False},
+                ]
+            },
+        }
+    }
+    assert _openrouter_attempt_count(payload) == 2
+    assert _openrouter_last_attempted_provider(payload) == "Groq"
     assert _openrouter_headers("secret", include_metadata=True) == {
         "Authorization": "Bearer secret",
         "Content-Type": "application/json",
