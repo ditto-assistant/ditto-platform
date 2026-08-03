@@ -164,6 +164,49 @@ describe("continual retests and rescores in Evaluating", () => {
     ).toContain("Bench v7 rescore");
   });
 
+  it("projects secondary-slot jobs into Scoring without duplicating submission cards", () => {
+    const secondarySlots = waiting({
+      agent_id: "secondary-slots",
+      status: "waiting_validator",
+      active_benchmarks: [
+        {
+          slot_id: "slot-1",
+          stage: "running_benchmark",
+          percent: 35,
+          bench_version: 8,
+        },
+        {
+          slot_id: "slot-4",
+          stage: "running_benchmark",
+          percent: 62,
+          bench_version: 8,
+        },
+      ],
+    });
+    const oneSlot = waiting({
+      agent_id: "one-slot",
+      status: "waiting_validator",
+      active_benchmarks: [
+        {
+          slot_id: "slot-2",
+          stage: "running_benchmark",
+          percent: 18,
+          bench_version: 8,
+        },
+      ],
+    });
+
+    const container = board([secondarySlots, oneSlot], {
+      activeVersion: 8,
+      statusCounts: { waiting_validator: 2 },
+    });
+
+    expect(container.querySelectorAll("#pipeline-wait-validator .pipeline-item").length).toBe(0);
+    expect(container.querySelectorAll("#pipeline-evaluating .pipeline-item").length).toBe(2);
+    expect(container.querySelectorAll("#pipeline-evaluating .benchmark-progress").length).toBe(3);
+    expect(container.querySelector("#pipeline-evaluating-count")?.textContent).toBe("3");
+  });
+
   it("labels an inherited-cohort qualification and keeps the old score live", () => {
     const qualifying: PipelineEntryExt = {
       ...retest,
