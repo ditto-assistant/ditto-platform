@@ -119,8 +119,7 @@ from ditto.api_server.continual_retest_settings import (
     rollout_standdown_reason,
 )
 from ditto.api_server.crn import (
-    champion_anchored_seeds,
-    continual_anchor_horizon,
+    bounded_continual_seed_set,
     fold_seed_bound,
 )
 from ditto.api_server.datapipeline import DatasetGenerator
@@ -216,7 +215,6 @@ from ditto.db.queries.confirmation_scores import (
     confirmation_catchup_seeds,
     confirmation_composites_by_seed,
     fold_eligible_seeds_by_agent,
-    lane_seed_universe,
 )
 from ditto.db.queries.desired_era_backlog import desired_era_work_outstanding
 from ditto.db.queries.heartbeats import (
@@ -3344,10 +3342,10 @@ async def _champion_anchored_seed_set(
         bench_version=canonical_version,
     )
     return frozenset(
-        champion_anchored_seeds(
+        bounded_continual_seed_set(
             members[0].agent_id,
             version=canonical_version,
-            max_seeds=continual_anchor_horizon(history),
+            composites_by_agent=history,
         )
     )
 
@@ -3373,21 +3371,15 @@ async def _top5_confirmation_seed_plan(
 
     Two kinds of work come back, and the difference is load-bearing:
 
-    *Catch-up* -- seeds ANY other cohort member already holds and this one does
-    not. Recorded evidence, no wave left to tear, so the whole backlog is
-    returned at once and the fleet can drain it in parallel (one lease per seed,
+    *Catch-up* -- target seeds another cohort member already holds and this one
+    does not. Recorded evidence, no wave left to tear, so the bounded backlog is
+    returned at once and the fleet can drain it in parallel (one lease per seed;
     see :func:`_claimable_confirmation_seed`). This is what a member promoted
-    into the top five at depth zero owes, and returning it one seed at a time is
-    what made a membership change degrade the board for N rounds instead of one.
+    into the top five at depth zero owes.
 
-    *Growth* -- at most the single next unfinished wave seed, exactly as before.
-    Paced one at a time because the wave is a synchronisation point: nobody may
-    run ahead of the seed the rest of the set is still working.
-
-    Catch-up is scoped to emission-set members on purpose. The extended retest
-    cohort is spare-capacity work whose depth gates nothing, so widening it to
-    a full backlog would multiply retest volume by the cohort size for no
-    convergence benefit; it keeps the one-seed-per-round pacing it has today.
+    *Growth* -- at most the single next unfinished target seed. The target is
+    variance-sized from the emission set and hard-capped, so a completed target
+    stops introducing datasets instead of growing forever.
     """
     cohort_ids = tuple(dict.fromkeys((*cohort_member_ids, *wave_member_ids)))
     history = await confirmation_composites_by_seed(
@@ -3395,21 +3387,13 @@ async def _top5_confirmation_seed_plan(
         agent_ids=tuple(dict.fromkeys((*cohort_ids, member_agent_id))),
         bench_version=canonical_version,
     )
-    anchor = champion_anchored_seeds(
+    wave_history = {agent_id: history.get(agent_id, {}) for agent_id in wave_member_ids}
+    target_seeds = bounded_continual_seed_set(
         champion_agent_id,
         version=canonical_version,
-        max_seeds=continual_anchor_horizon(history),
+        composites_by_agent=wave_history,
     )
     seeds_by_agent = {agent_id: values.keys() for agent_id, values in history.items()}
-    # The live reign's seeds first, in issuing order, then everything the lane has
-    # already recorded. Growth walks the anchor prefix exactly as before; catch-up
-    # reaches the whole cumulative set so an outgoing reign's coverage becomes
-    # backlog to converge onto rather than a write-off.
-    universe = await lane_seed_universe(
-        session, agent_ids=cohort_ids, bench_version=canonical_version
-    )
-    anchored = set(anchor)
-    full = (*anchor, *(seed for seed in universe if seed not in anchored))
     # Catch-up spans the whole retest cohort, not just the emission set. It used
     # to be scoped to the top five on the grounds that widening it "would
     # multiply retest volume by the cohort size for no convergence benefit" --
@@ -3421,7 +3405,7 @@ async def _top5_confirmation_seed_plan(
     catchup = confirmation_catchup_seeds(
         member_id=member_agent_id,
         peer_ids=cohort_ids,
-        anchored_seeds=full,
+        anchored_seeds=target_seeds,
         seeds_by_agent=seeds_by_agent,
     )
     # Deliberately the STRICT intersection, and not ``wave_membership``. This
@@ -3435,12 +3419,7 @@ async def _top5_confirmation_seed_plan(
         member_ids=wave_member_ids,
         seeds_by_agent=seeds_by_agent,
     )
-    # Growth walks the live anchor only, never the cumulative universe. A
-    # universe seed the cohort has partly covered is backlog and belongs to
-    # catch-up, which leases it in full; routing it through growth as well would
-    # pace it one round at a time and reintroduce exactly the slow convergence
-    # the union reading exists to remove.
-    next_seed = next((seed for seed in anchor if seed not in completed), None)
+    next_seed = next((seed for seed in target_seeds if seed not in completed), None)
     if (
         next_seed is None
         or next_seed in history.get(member_agent_id, {})
@@ -3535,10 +3514,10 @@ async def _unserved_catchup_members(
     history = await confirmation_composites_by_seed(
         session, agent_ids=members, bench_version=canonical_version
     )
-    full = champion_anchored_seeds(
+    target_seeds = bounded_continual_seed_set(
         champion_agent_id,
         version=canonical_version,
-        max_seeds=continual_anchor_horizon(history),
+        composites_by_agent=history,
     )
     seeds_by_agent = {agent_id: values.keys() for agent_id, values in history.items()}
     leases = await _live_retest_leases(
@@ -3552,7 +3531,7 @@ async def _unserved_catchup_members(
         catchup = confirmation_catchup_seeds(
             member_id=member_id,
             peer_ids=members,
-            anchored_seeds=full,
+            anchored_seeds=target_seeds,
             seeds_by_agent=seeds_by_agent,
         )
         if not catchup:
