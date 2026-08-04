@@ -664,7 +664,12 @@ async def open_copy_review(
                 )
             if existing.status != "resolved":
                 raise HTTPException(status_code=409, detail="ATH review already exists")
-            if agent.status not in (AgentStatus.SCORED, AgentStatus.LIVE):
+            reconsidering_rejection = (
+                existing.resolution == "reject" and agent.status == AgentStatus.BANNED
+            )
+            if agent.status not in (AgentStatus.SCORED, AgentStatus.LIVE) and not (
+                reconsidering_rejection
+            ):
                 raise HTTPException(
                     status_code=409,
                     detail=f"agent is {agent.status.value}, not scored or live",
@@ -672,6 +677,24 @@ async def open_copy_review(
 
             reopened_at = datetime.now(UTC)
             previous_status = agent.status.value
+            if reconsidering_rejection:
+                # A rejected ATH review is the operation that put this exact
+                # submission in BANNED. Reopening that same guarded review must
+                # retain the status that a later clear should restore, rather
+                # than recording BANNED as though it predated the review.
+                previous_status = (
+                    latest_reopen.evidence.get("previous_status")
+                    if latest_reopen is not None
+                    else existing.original_evidence.get("previous_status")
+                )
+                if previous_status not in {
+                    AgentStatus.SCORED.value,
+                    AgentStatus.LIVE.value,
+                }:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="review has no restorable previous status",
+                    )
             existing.status = "pending"
             existing.reopened_at = reopened_at
             existing.resolved_at = None
