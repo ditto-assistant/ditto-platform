@@ -89,6 +89,7 @@ from ditto.db.queries.queue_policy_settings import (
 )
 from ditto.db.queries.scores import count_ranked_quorum_agents, list_eligible_ledger
 from ditto.db.queries.screening import claim_screening_attempts
+from ditto.db.queries.tickets import MAX_ATTEMPTS_PER_VERSION
 from ditto.tests.legacy_era import (
     grandfather_active_era,
     retired_era_writes_allowed,
@@ -1321,7 +1322,7 @@ async def test_rollout_ticket_respects_retry_cooldown_and_attempt_cap(
         exhausted.status = TicketStatus.EXPIRED
         exhausted.deadline = now
         exhausted.retry_after = now
-        exhausted.attempt_count = 2
+        exhausted.attempt_count = MAX_ATTEMPTS_PER_VERSION
 
         cooling = await issue_rollout_ticket(
             session,
@@ -1354,7 +1355,7 @@ async def test_rollout_ticket_respects_retry_cooldown_and_attempt_cap(
         )
         assert granted is exhausted
         assert granted.status == TicketStatus.ISSUED
-        assert granted.attempt_count == 3
+        assert granted.attempt_count == MAX_ATTEMPTS_PER_VERSION + 1
 
 
 async def test_rollout_preempts_idle_source_lease_only_when_target_work_exists(

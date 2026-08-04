@@ -5865,6 +5865,7 @@ class TestPublicActivity:
                     bench_version=_ERA,
                     attempt_count=1,
                     manual_retry_grants=0,
+                    infra_retry_grants=1,
                     retry_after=cooldown_until,
                 )
             )

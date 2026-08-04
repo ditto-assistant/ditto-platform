@@ -5565,9 +5565,11 @@ class TestFailJob:
                 ValidatorTicket, (agent_id, _BENCH_VERSION, _VALIDATOR_HOTKEY)
             )
             assert ticket is not None
-            # A scoring_error closes for immediate reissue: expired now with
-            # retry_after=now, not the 6h cooldown, so the next request_job mints
-            # a fresh lease. (Infrastructure failures instead back off.)
+            # A scoring_error closes immediately: expired now with
+            # retry_after=now, not the 6h timeout cooldown. Another validator
+            # may take the open quorum slot, while this validator has spent its
+            # one-attempt base budget. (Infrastructure failures earn a grant and
+            # back off.)
             assert ticket.status == TicketStatus.EXPIRED
             now = datetime.now(UTC)
             assert ticket.retry_after is not None
@@ -5576,19 +5578,18 @@ class TestFailJob:
                 retry_after = retry_after.replace(tzinfo=UTC)
             assert abs((retry_after - now).total_seconds()) < 60
 
-    async def test_reissues_a_fresh_ticket_after_failure(
+    async def test_scoring_error_exhausts_same_validator_without_a_grant(
         self,
         app: FastAPI,
         client: httpx.AsyncClient,
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
-        # End-to-end reattempt seam: a scoring_error fails the lease, then
-        # request_job hands the same validator a brand-new ticket (fresh
-        # deadline) instead of resuming.
+        # A deterministic scoring_error fails the lease and spends this
+        # validator's one-attempt base budget. Reissuing it automatically would
+        # pay for the same broken run twice.
         agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
         await _seed_ticket(session_maker, agent_id)
-        # The reissue is the point, so the validator has to be one the allocator
-        # will hand a v7 lease to.
+        # Exercise the real allocator path with a validator eligible for v7.
         await _seed_capable_pool(session_maker, keypairs=(_KEYPAIR,))
         _install_db(app, session_maker)
         _install_chain(app)
@@ -5605,11 +5606,7 @@ class TestFailJob:
             headers=_AUTH_HEADER,
             json=_job_payload(slot_id=_SLOT_ID),
         )
-        assert reissued.status_code == 200, reissued.text
-        job = reissued.json()
-        assert job["agent_id"] == str(agent_id)
-        # A fresh lease, not the failed one: the deadline moved off the seed value.
-        assert datetime.fromisoformat(job["deadline"]) != _TICKET_DEADLINE
+        assert reissued.status_code == 204, reissued.text
 
     async def test_infrastructure_failure_backs_off_before_reissue(
         self,
@@ -7731,7 +7728,7 @@ class TestMultiValidatorConsensus:
         assert reopened.status_code == 200, reopened.text
         assert reopened.json()["agent_id"] == str(agent_id)
 
-    async def test_expired_ticket_cools_down_before_same_validator_retry(
+    async def test_expired_ticket_does_not_retry_without_a_grant(
         self,
         app: FastAPI,
         client: httpx.AsyncClient,
@@ -7777,8 +7774,7 @@ class TestMultiValidatorConsensus:
             headers=headers,
             json=_job_payload(keypair, slot_id=_SLOT_ID),
         )
-        assert retried.status_code == 200, retried.text
-        assert retried.json()["agent_id"] == str(agent_id)
+        assert retried.status_code == 204, retried.text
 
 
 def test_dev_bypass_permit_refused_on_mainnet(monkeypatch) -> None:

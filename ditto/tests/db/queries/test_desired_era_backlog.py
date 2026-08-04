@@ -101,6 +101,7 @@ def _ticket(
     validator_hotkey: str,
     status: TicketStatus,
     attempt_count: int = 1,
+    infra_retry_grants: int = 0,
     retry_after: datetime | None = None,
     deadline: datetime | None = None,
 ) -> ValidatorTicket:
@@ -114,6 +115,7 @@ def _ticket(
         bench_version=_DESIRED_VERSION,
         attempt_count=attempt_count,
         manual_retry_grants=0,
+        infra_retry_grants=infra_retry_grants,
         retry_after=retry_after,
     )
 
@@ -282,6 +284,7 @@ class TestDesiredEraWorkOutstanding:
                         agent_id=agent_id,
                         validator_hotkey=hotkey,
                         status=TicketStatus.EXPIRED,
+                        infra_retry_grants=1,
                         retry_after=_NOW + timedelta(hours=1),
                         deadline=_NOW - timedelta(hours=1),
                     )
