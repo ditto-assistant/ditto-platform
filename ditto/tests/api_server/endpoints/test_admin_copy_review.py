@@ -487,6 +487,124 @@ async def test_resolved_review_reopens_without_rewriting_original_evidence(
         assert len(actions) == 3
 
 
+@pytest.mark.parametrize("previous_status", [AgentStatus.SCORED, AgentStatus.LIVE])
+async def test_rejected_review_reopens_and_clear_restores_previous_status(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    maker: async_sessionmaker[AsyncSession],
+    previous_status: AgentStatus,
+) -> None:
+    agent_id, sha256 = await _seed_scored_agent(maker, status=previous_status)
+    _install(app, maker)
+    opened = await client.post(
+        f"/api/v1/admin/copy-reviews/{agent_id}/open",
+        json={
+            "expected_sha256": sha256,
+            "expected_score_count": 3,
+            "reason": "Manual benchmark-overfit review",
+        },
+        headers=_HEADERS,
+    )
+    assert opened.status_code == 200
+    rejected = await client.post(
+        f"/api/v1/admin/copy-reviews/{agent_id}/resolve",
+        json={"resolution": "reject", "reason": "Initial review rejected it"},
+        headers=_HEADERS,
+    )
+    assert rejected.status_code == 200
+    assert rejected.json()["agent_status"] == AgentStatus.BANNED
+
+    reopen_payload = {
+        "expected_sha256": sha256,
+        "expected_score_count": 3,
+        "reason": "Operator reconsideration requires a guarded reversal",
+    }
+    reopened = await client.post(
+        f"/api/v1/admin/copy-reviews/{agent_id}/open",
+        json=reopen_payload,
+        headers=_HEADERS,
+    )
+    assert reopened.status_code == 200
+    assert reopened.json()["reopened"] is True
+    assert reopened.json()["idempotent"] is False
+    assert reopened.json()["agent_status"] == AgentStatus.ATH_PENDING_REVIEW
+
+    retry = await client.post(
+        f"/api/v1/admin/copy-reviews/{agent_id}/open",
+        json=reopen_payload,
+        headers=_HEADERS,
+    )
+    assert retry.status_code == 200
+    assert retry.json()["idempotent"] is True
+
+    audit = await client.get(
+        f"/api/v1/admin/copy-reviews/{agent_id}/audit", headers=_HEADERS
+    )
+    assert audit.status_code == 200
+    assert [event["action"] for event in audit.json()["action_history"]] == [
+        "reject",
+        "reopen",
+    ]
+    assert audit.json()["action_history"][1]["previous_status"] == previous_status
+
+    cleared = await client.post(
+        f"/api/v1/admin/copy-reviews/{agent_id}/resolve",
+        json={
+            "resolution": "clear",
+            "reason": "Reconsideration found no current-policy violation",
+        },
+        headers=_HEADERS,
+    )
+    assert cleared.status_code == 200
+    assert cleared.json()["agent_status"] == previous_status
+    async with maker() as session:
+        agent = await session.get(Agent, agent_id)
+        scores = list(
+            await session.scalars(select(Score).where(Score.agent_id == agent_id))
+        )
+        assert agent is not None and agent.status == previous_status
+        assert len(scores) == 3
+
+
+async def test_resolved_clear_does_not_reopen_an_unrelated_ban(
+    app: FastAPI, client: httpx.AsyncClient, maker: async_sessionmaker[AsyncSession]
+) -> None:
+    agent_id, sha256 = await _seed_scored_agent(maker)
+    _install(app, maker)
+    opened = await client.post(
+        f"/api/v1/admin/copy-reviews/{agent_id}/open",
+        json={
+            "expected_sha256": sha256,
+            "expected_score_count": 3,
+            "reason": "Manual benchmark-overfit review",
+        },
+        headers=_HEADERS,
+    )
+    assert opened.status_code == 200
+    cleared = await client.post(
+        f"/api/v1/admin/copy-reviews/{agent_id}/resolve",
+        json={"resolution": "clear", "reason": "Initial evidence was clear"},
+        headers=_HEADERS,
+    )
+    assert cleared.status_code == 200
+    async with maker() as session, session.begin():
+        agent = await session.get(Agent, agent_id)
+        assert agent is not None
+        agent.status = AgentStatus.BANNED
+
+    response = await client.post(
+        f"/api/v1/admin/copy-reviews/{agent_id}/open",
+        json={
+            "expected_sha256": sha256,
+            "expected_score_count": 3,
+            "reason": "This unrelated ban must remain in force",
+        },
+        headers=_HEADERS,
+    )
+    assert response.status_code == 409
+    assert "agent is banned" in response.text
+
+
 async def test_reopen_still_fails_closed_on_changed_score_count(
     app: FastAPI, client: httpx.AsyncClient, maker: async_sessionmaker[AsyncSession]
 ) -> None:
