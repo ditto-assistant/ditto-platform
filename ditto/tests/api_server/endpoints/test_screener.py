@@ -90,7 +90,7 @@ from ditto.db.models import (
 )
 from ditto.db.queries.attestation import record_attestation
 from ditto.db.queries.screening import MAX_SCREENING_EXPIRIES
-from ditto.db.queries.tickets import issue_ticket
+from ditto.db.queries.tickets import issue_ticket, ticket_attempt_cap
 from ditto.tests.legacy_era import retired_era_writes_allowed
 from ditto_screening_protocol import (
     ScreenResultOutcome,
@@ -3482,7 +3482,7 @@ class TestQuarantineAdmin:
             assert agent.screened_image_sha256 is None
             assert dataset is not None and dataset.sha256 == "aa" * 32
             assert ticket is not None and ticket.status == TicketStatus.EXPIRED
-            assert ticket.manual_retry_grants == 1
+            assert ticket.attempt_count < ticket_attempt_cap(ticket)
             assert event is not None
 
         claim = await client.post(_CLAIM_URL)
@@ -3636,7 +3636,7 @@ class TestQuarantineAdmin:
             assert dataset is None
             assert stale_ticket is not None
             assert stale_ticket.status == TicketStatus.EXPIRED
-            assert stale_ticket.manual_retry_grants == 1
+            assert stale_ticket.attempt_count < ticket_attempt_cap(stale_ticket)
 
         claim = await client.post(_CLAIM_URL)
         fresh_attempt_id = UUID(claim.json()["items"][0]["attempt_id"])

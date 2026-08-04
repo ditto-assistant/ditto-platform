@@ -200,7 +200,11 @@ async def _seed(
                         issued_at=_T0 - timedelta(hours=3 - index / 10),
                         deadline=_T0 - timedelta(hours=2 - index / 10),
                         bench_version=bench_version,
-                        attempt_count=1 if status == TicketStatus.SCORED else 2,
+                        attempt_count=(
+                            1
+                            if status == TicketStatus.SCORED
+                            else MAX_ATTEMPTS_PER_VERSION
+                        ),
                         manual_retry_grants=0,
                         retry_after=_T0 - timedelta(hours=1),
                     )
@@ -344,7 +348,9 @@ async def test_retry_grants_only_minimum_quorum_slots_and_preserves_history(
             ).all()
         )
     assert agent is not None and agent.status == AgentStatus.EVALUATING
-    assert [ticket.attempt_count for ticket in tickets] == [2, 2, 2, 2]
+    assert [ticket.attempt_count for ticket in tickets] == [
+        MAX_ATTEMPTS_PER_VERSION
+    ] * 4
     assert [ticket.manual_retry_grants for ticket in tickets] == [1, 1, 1, 0]
     assert len(actions) == 1
     assert len(actions[0].ticket_snapshot) == 4
@@ -406,7 +412,8 @@ async def test_stale_snapshot_and_active_or_natural_retry_fail_closed(
             ValidatorTicket, (agent_id, _BENCH_VERSION, "validator-0")
         )
         assert ticket is not None
-        ticket.attempt_count = 1
+        ticket.attempt_count = MAX_ATTEMPTS_PER_VERSION
+        ticket.infra_retry_grants = 1
     changed = await client.get(
         f"/api/v1/admin/validation-retries/{agent_id}", headers=_HEADERS
     )
@@ -492,7 +499,7 @@ async def test_manual_grant_allows_exactly_one_more_same_version_issue(
             bench_version=_BENCH_VERSION,
         )
     assert ticket is not None and ticket.agent_id == agent_id
-    assert ticket.attempt_count == 3
+    assert ticket.attempt_count == MAX_ATTEMPTS_PER_VERSION + 1
     assert ticket.manual_retry_grants == 1
 
 
@@ -574,7 +581,7 @@ async def test_many_operator_grants_do_not_block_fresh_audited_recovery(
             bench_version=_BENCH_VERSION,
         )
     assert ticket is not None and ticket.agent_id == agent_id
-    assert ticket.attempt_count == 3
+    assert ticket.attempt_count == MAX_ATTEMPTS_PER_VERSION + 1
     assert ticket.manual_retry_grants == 1
 
 
@@ -1324,7 +1331,9 @@ async def test_reinstatement_returns_an_evicted_submission_to_the_queue(
     second evaluation fee, which made a capacity lever into a fine and is why the
     lever went unused. Reinstatement restores exactly the queue effect — the
     admission predicate, the triage feed, a real re-lease — and preserves the
-    eviction record that justified taking it.
+    eviction record that justified taking it. With a one-attempt base budget,
+    the separately audited retry remains required before the same validator can
+    lease it again; fresh validators remain eligible for quorum.
     """
     from ditto.db.queries.benchmark_admission import agent_is_admitted
 
@@ -1358,19 +1367,34 @@ async def test_reinstatement_returns_an_evicted_submission_to_the_queue(
     assert reinstated["reinstatement"]["actor"] == "operator"
     assert reinstated["reinstatement"]["reason"] == _REINSTATE_REASON
 
-    # Eligibility is back: the admission predicate, the operator triage feed, and
-    # an actual validator claim all agree.
+    # Queue eligibility is back, but reinstatement is budget-neutral: the spent
+    # one-attempt lease cannot print a retry by cycling eviction/reinstatement.
     async with retry_maker() as session:
         assert await agent_is_admitted(
             session, bench_version=_BENCH_VERSION, agent_id=agent_id
         )
     triage = await client.get("/api/v1/admin/validation-retries", headers=_HEADERS)
-    assert any(row["agent_id"] == str(agent_id) for row in triage.json()["submissions"])
+    row = next(
+        row for row in triage.json()["submissions"] if row["agent_id"] == str(agent_id)
+    )
+    assert row["retry_state"] == "queued"
     async with retry_maker() as session, session.begin():
         reissued = await issue_ticket(
             session,
             validator_hotkey="validator-0",
             now=datetime.now(UTC) + timedelta(minutes=5),
+            ttl=timedelta(minutes=90),
+            bench_version=_BENCH_VERSION,
+        )
+    assert reissued is None
+
+    # The same validator spent its base attempt, but another validator remains
+    # free to contribute the next quorum input without any operator grant.
+    async with retry_maker() as session, session.begin():
+        reissued = await issue_ticket(
+            session,
+            validator_hotkey="validator-1",
+            now=datetime.now(UTC) + timedelta(minutes=6),
             ttl=timedelta(minutes=90),
             bench_version=_BENCH_VERSION,
         )
@@ -2292,16 +2316,23 @@ async def test_list_classifies_every_retry_state(
             ("val-2", TicketStatus.EXPIRED, 2, _PAST),
         ],
     )
-    await _seed_states(
+    cooling_id = await _seed_states(
         retry_maker,
         name="cooling-agent",
-        tickets=[("val-0", TicketStatus.EXPIRED, 1, _FUTURE)],
+        tickets=[("val-0", TicketStatus.EXPIRED, MAX_ATTEMPTS_PER_VERSION, _FUTURE)],
     )
-    await _seed_states(
+    available_id = await _seed_states(
         retry_maker,
         name="available-agent",
-        tickets=[("val-0", TicketStatus.EXPIRED, 1, _PAST)],
+        tickets=[("val-0", TicketStatus.EXPIRED, MAX_ATTEMPTS_PER_VERSION, _PAST)],
     )
+    async with retry_maker() as session, session.begin():
+        for agent_id in (cooling_id, available_id):
+            ticket = await session.get(
+                ValidatorTicket, (agent_id, _BENCH_VERSION, "val-0")
+            )
+            assert ticket is not None
+            ticket.infra_retry_grants = 1
     await _seed_states(
         retry_maker,
         name="running-agent",
@@ -2529,7 +2560,7 @@ async def test_rollout_cohort_recovery_keeps_settled_status_and_history(
             )
         )
     assert agent is not None and agent.status == AgentStatus.SCORED
-    assert [ticket.manual_retry_grants for ticket in tickets] == [43, 42, 56, 0]
+    assert [ticket.manual_retry_grants for ticket in tickets] == [44, 43, 57, 0]
     assert all(
         ticket.attempt_count < ticket_attempt_cap(ticket) for ticket in tickets[:3]
     )
@@ -2653,7 +2684,7 @@ async def test_infra_grant_lifts_a_would_be_exhausted_ticket(
                 issued_at=_T0 - timedelta(hours=3),
                 deadline=_T0 - timedelta(hours=2),
                 bench_version=_BENCH_VERSION,
-                attempt_count=2,
+                attempt_count=MAX_ATTEMPTS_PER_VERSION,
                 manual_retry_grants=0,
                 infra_retry_grants=1,
                 retry_after=_PAST,
