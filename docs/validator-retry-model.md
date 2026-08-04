@@ -16,7 +16,7 @@ Each validator gets a bounded number of attempts **per benchmark version**:
 
 | Constant | Value | Meaning |
 | --- | --- | --- |
-| `MAX_ATTEMPTS_PER_VERSION` | `2` | Base attempts a validator may spend on one agent+version. |
+| `MAX_ATTEMPTS_PER_VERSION` | `1` | Base attempts a validator may spend on one agent+version. |
 | `manual_retry_grants` | `0`+ | Per-ticket operator extension; raises the cap for that ticket. |
 | `infra_retry_grants` | `0`–`8` | Per-ticket automatic extension earned when a lease fails on validator-side infrastructure; raises the cap so an outage doesn't spend the agent's budget. |
 | `MAX_AGENT_INFRA_RETRY_GRANTS` | `12` | The same allowance summed over **every** validator on one agent+version. Reported `infrastructure` verdicts stop earning grants once the fleet total reaches it. |
@@ -36,7 +36,7 @@ attempt_count  >=  MAX_ATTEMPTS_PER_VERSION + manual_retry_grants + infra_retry_
   are per-validator, so a timeout on one validator never blocks the other two.
 - **A benchmark-version bump resets the budget.** Tickets are keyed by
   `bench_version`, so repaired scoring software revisits the artifact with a
-  fresh 2-attempt budget on the new version.
+  fresh 1-attempt budget on the new version.
 - **Infrastructure failures don't consume the agent's budget.** The validator
   reports a signed `fail_job` with `reason` (`infrastructure` vs
   `scoring_error`). On `infrastructure` the platform bumps `infra_retry_grants`
@@ -50,16 +50,16 @@ attempt_count  >=  MAX_ATTEMPTS_PER_VERSION + manual_retry_grants + infra_retry_
   artifact whose run reliably reports a scorer-side infrastructure code
   therefore never spent its budget, never reached a verdict, and re-occupied
   quorum slots indefinitely — ditto-subnet#279, where `mnemox-v55` reached
-  `attempts_used: 9` against a base budget of 2 with zero scores while the
-  family held three validator slots per round for a day. A **reported**
+  `attempts_used: 9` against the then-current base budget of 2 with zero scores
+  while the family held three validator slots per round for a day. A **reported**
   `infrastructure` verdict now additionally checks the fleet-wide total for
   that agent and version against `MAX_AGENT_INFRA_RETRY_GRANTS` (`12`). Past it
   the grant is refused, the attempt is billed as normal, the ticket walks down
   to `retry_state = exhausted`, and the artifact appears on the operator
   stuck-list for a manual grant. Nothing is punished; the loop just becomes
-  finite and visible. `12` is twice an agent's genuine budget at quorum
-  (`MAX_ATTEMPTS_PER_VERSION` × `SCORING_QUORUM` = 6) and sits above the
-  per-ticket `8`, so a single validator's local outage is still absorbed whole.
+  finite and visible. `12` is deliberately independent of the ordinary base
+  budget and sits above the per-ticket `8`, so a single validator's local
+  outage is still absorbed whole.
   A lease the **platform** revoked is deliberately exempt: repetition there is
   evidence about the platform, not the artifact, and billing the miner for it
   is the rule #460/#497 settled in the other direction.

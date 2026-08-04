@@ -20,6 +20,7 @@ from ditto.api_server.endpoints.admin_validation_retry import (
 )
 from ditto.db import create_db_engine
 from ditto.db.models import Agent, ValidatorRetryRecovery, ValidatorTicket
+from ditto.db.queries.tickets import MAX_ATTEMPTS_PER_VERSION
 
 pytestmark = pytest.mark.integration
 
@@ -51,7 +52,7 @@ async def test_concurrent_recoveries_have_one_winner() -> None:
                     issued_at=_NOW - timedelta(hours=2),
                     deadline=_NOW - timedelta(hours=1, minutes=index),
                     bench_version=CURRENT_BENCH_VERSION,
-                    attempt_count=2,
+                    attempt_count=MAX_ATTEMPTS_PER_VERSION,
                     retry_after=_NOW - timedelta(minutes=30),
                 )
             )
