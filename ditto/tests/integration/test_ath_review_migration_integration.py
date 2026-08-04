@@ -198,3 +198,28 @@ async def test_conflicting_concurrent_resolution_has_one_winner() -> None:
         assert review is not None and review.status == "resolved"
         assert review.resolution in {"clear", "reject"}
     await engine.dispose()
+
+
+async def test_operator_reason_constraints_have_no_upper_bound() -> None:
+    _alembic("upgrade", "head")
+    engine = create_db_engine()
+    async with engine.connect() as conn:
+        bounded = (
+            (
+                await conn.execute(
+                    text(
+                        "SELECT conrelid::regclass::text, conname, "
+                        "pg_get_constraintdef(oid) "
+                        "FROM pg_constraint "
+                        "WHERE contype = 'c' "
+                        "AND pg_get_constraintdef(oid) ~* 'reason' "
+                        "AND pg_get_constraintdef(oid) ~ '500' "
+                        "ORDER BY 1, 2"
+                    )
+                )
+            )
+            .tuples()
+            .all()
+        )
+    await engine.dispose()
+    assert bounded == []

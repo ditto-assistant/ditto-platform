@@ -129,7 +129,7 @@ class AdminEfficiencyBonusSettingsRequest(BaseModel):
     mismatch is a 409 so a concurrent change is never silently clobbered."""
 
     settings: EfficiencyBonusSettings
-    reason: Annotated[str, Field(min_length=8, max_length=500)]
+    reason: Annotated[str, Field(min_length=8)]
     actor: Annotated[str, Field(min_length=1, max_length=120)] = "admin_api"
     confirmation: str
     """Must equal ``APPLY EFFICIENCY BONUS <ENABLED|DISABLED>`` (the resulting

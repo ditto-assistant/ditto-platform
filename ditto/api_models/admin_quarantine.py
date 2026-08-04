@@ -110,7 +110,7 @@ class AdminScreeningDisputeResolveRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     resolution: DisputeResolution
-    reason: Annotated[str, Field(min_length=3, max_length=500)]
+    reason: Annotated[str, Field(min_length=3)]
 
 
 class AdminScreeningDisputeResolveResponse(BaseModel):
@@ -164,7 +164,7 @@ class AdminScreeningSubmissionList(BaseModel):
 class AdminScreeningRescreenRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    reason: Annotated[str, Field(min_length=3, max_length=500)]
+    reason: Annotated[str, Field(min_length=3)]
     expected_sha256: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
     expected_score_count: Annotated[int, Field(ge=0)]
 
@@ -179,7 +179,7 @@ class AdminScreeningRetryNowRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    reason: Annotated[str, Field(min_length=8, max_length=500)]
+    reason: Annotated[str, Field(min_length=8)]
     expected_sha256: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
     expected_score_count: Annotated[int, Field(ge=0)]
     expected_attempt_id: UUID
@@ -200,7 +200,7 @@ class AdminBenchmarkContractRefreshRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    reason: Annotated[str, Field(min_length=3, max_length=500)]
+    reason: Annotated[str, Field(min_length=3)]
     expected_sha256: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
     expected_bench_version: Annotated[int, Field(gt=2)]
     expected_dataset_sha256: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
@@ -234,7 +234,7 @@ class AdminScreenedImageRebuildRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    reason: Annotated[str, Field(min_length=8, max_length=500)]
+    reason: Annotated[str, Field(min_length=8)]
     expected_sha256: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
     expected_bench_version: Annotated[int, Field(gt=2)]
     expected_score_count: Literal[0]
@@ -271,7 +271,7 @@ class AdminBenchmarkContractMigrationRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    reason: Annotated[str, Field(min_length=3, max_length=500)]
+    reason: Annotated[str, Field(min_length=3)]
     expected_sha256: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
     expected_source_bench_version: Literal[2]
     expected_target_bench_version: Literal[3]
@@ -313,7 +313,7 @@ class AdminBenchmarkQualificationRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    reason: Annotated[str, Field(min_length=3, max_length=500)]
+    reason: Annotated[str, Field(min_length=3)]
     expected_sha256: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
     expected_rollout_id: UUID
     expected_total_score_count: Annotated[int, Field(ge=0)]
@@ -660,7 +660,7 @@ class AdminValidatorAssignmentReleaseRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     expected_deadline: datetime
-    reason: Annotated[str, Field(min_length=8, max_length=500)]
+    reason: Annotated[str, Field(min_length=8)]
 
 
 class AdminValidatorAssignmentReleaseResponse(BaseModel):

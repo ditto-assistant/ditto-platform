@@ -50,6 +50,6 @@ class AdminArtifactReleaseSettingsRequest(BaseModel):
     # honest value is `never`, which is now expressible, so there is no gap
     # between the top of the range and the terminal option.
     embargo_hours: Annotated[int, Field(ge=6, le=8760)]
-    reason: Annotated[str, Field(min_length=8, max_length=500)]
+    reason: Annotated[str, Field(min_length=8)]
     actor: Annotated[str, Field(min_length=1, max_length=120)] = "admin_api"
     confirmation: str

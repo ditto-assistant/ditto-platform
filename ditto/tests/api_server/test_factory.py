@@ -61,6 +61,29 @@ class TestCreateApiServer:
         assert "/health" in paths
         assert "/metrics" in paths
 
+    def test_operator_reason_fields_have_no_upper_bound(self):
+        """Detailed audit evidence must survive every API validation surface."""
+
+        app = create_api_server(make_api_server_config())
+        schema = app.openapi()
+        bounded: list[str] = []
+
+        def visit(node: object, path: str) -> None:
+            if isinstance(node, dict):
+                properties = node.get("properties")
+                if isinstance(properties, dict):
+                    reason = properties.get("reason")
+                    if isinstance(reason, dict) and "maxLength" in reason:
+                        bounded.append(f"{path}.reason={reason['maxLength']}")
+                for key, value in node.items():
+                    visit(value, f"{path}.{key}")
+            elif isinstance(node, list):
+                for index, value in enumerate(node):
+                    visit(value, f"{path}[{index}]")
+
+        visit(schema, "openapi")
+        assert bounded == []
+
 
 class TestLifespanFailureCleanup:
     """``AsyncExitStack`` must dispose the engine if chain open fails."""
