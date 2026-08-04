@@ -505,6 +505,27 @@ describe("superseded validator failures stay history (row 21, #459)", () => {
     expect(view.when).toBe("2026-07-25T21:00:00Z");
   });
 
+  it("makes inference allowance exhaustion terminal and explicit", () => {
+    const view = validationAttemptView({
+      validator_hotkey: "5CFtzzb4",
+      status: "expired",
+      purpose: "canonical_quorum",
+      issued_at: "2026-07-25T20:00:00Z",
+      deadline: "2026-07-25T22:00:00Z",
+      bench_version: 8,
+      actively_running: false,
+      failure_reason: "scoring_error",
+      failure_code: "inference_allowance_exhausted",
+      failed_at: "2026-07-25T21:00:00Z",
+    });
+    expect(view.headline).toBe("Inference allowance exhausted");
+    expect(view.headline).not.toContain("deferred");
+    expect(view.tone).toBe("bad");
+    expect(view.metaRest).toContain("exceeded the run inference allowance");
+    expect(view.retryTip).toContain("not validator infrastructure");
+    expect(view.retryTip).toContain("does not receive an automatic infrastructure retry");
+  });
+
   it("keeps a clean first-attempt score plainly worded", () => {
     const view = validationAttemptView({
       validator_hotkey: "5HmP9732",
@@ -748,6 +769,66 @@ describe("async agent evidence", () => {
     await waitFor(() => expect(document.getElementById("pipeline-validator-history")).toBeTruthy());
     expect(document.getElementById("pipeline-accepted-scores")).toBeTruthy();
     expect(pipelineRequests()).toHaveLength(1);
+  });
+
+  it("shows the authoritative dollar cost and allowance usage for every benchmark run", async () => {
+    stubPipelineFetch(() =>
+      Promise.resolve(
+        pipelineResponse({
+          inference_runs: [
+            {
+              validator_hotkey: "5CFtzzb4mS118",
+              bench_version: 8,
+              ticket_deadline: "2026-07-31T14:30:00Z",
+              status: "exhausted",
+              request_budget: 8192,
+              requests: 8192,
+              prompt_tokens: 7_000_000,
+              completion_tokens: 500_000,
+              token_budget: 25_000_000,
+              embedding_requests: 123,
+              embedding_tokens: 456_789,
+              cost_microusd: 1_246_912,
+              accounting_version: 2,
+              created_at: "2026-07-31T13:00:00Z",
+              updated_at: "2026-07-31T13:55:00Z",
+            },
+            {
+              validator_hotkey: "5GrwvaEFother",
+              bench_version: 8,
+              ticket_deadline: "2026-07-31T13:30:00Z",
+              status: "revoked",
+              request_budget: 8192,
+              requests: 400,
+              prompt_tokens: 1_000_000,
+              completion_tokens: 100_000,
+              token_budget: 25_000_000,
+              embedding_requests: 0,
+              embedding_tokens: 0,
+              cost_microusd: 250_000,
+              accounting_version: 2,
+              created_at: "2026-07-31T12:00:00Z",
+              updated_at: "2026-07-31T12:25:00Z",
+            },
+          ],
+        }),
+      ),
+    );
+
+    render(() => <AgentEvidence entry={summary} />);
+
+    await waitFor(() => expect(document.getElementById("pipeline-inference-spend")).toBeTruthy());
+    const section = document
+      .getElementById("pipeline-inference-spend")
+      ?.closest("section") as HTMLElement;
+    expect(section.textContent).toContain("$1.50 total");
+    expect(section.querySelectorAll(".inference-run")).toHaveLength(2);
+    expect(section.textContent).toContain("$1.25");
+    expect(section.textContent).toContain("$0.2500");
+    expect(section.textContent).toContain("8,192 of 8,192 chat requests");
+    expect(section.textContent).toContain("7,500,000 of 25,000,000 chat tokens");
+    expect(section.textContent).toContain("123 embedding requests / 456,789 tokens");
+    expect(section.textContent).toContain("Allowance exhausted");
   });
 
   it("isolates a detail failure and retries from the section", async () => {

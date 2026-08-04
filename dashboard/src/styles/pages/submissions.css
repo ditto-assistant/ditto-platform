@@ -313,6 +313,55 @@
   font-size: 11.5px;
   font-variant-numeric: tabular-nums;
 }
+.inference-spend-heading {
+  align-items: flex-start;
+}
+.inference-spend-heading p {
+  max-width: 68ch;
+  margin: 3px 0 0;
+  color: var(--text-dim);
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+.inference-spend-total {
+  flex: none;
+  color: var(--text);
+  font: 700 15px/1.3 var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+.inference-run-list {
+  border-top: 1px solid color-mix(in oklab, var(--border) 62%, transparent);
+}
+.inference-run {
+  display: grid;
+  grid-template-columns: 88px minmax(0, 1fr) auto;
+  gap: var(--detail-space-md);
+  align-items: start;
+  padding: var(--detail-space-md) 0;
+  border-bottom: 1px solid color-mix(in oklab, var(--border) 62%, transparent);
+}
+.inference-run-cost {
+  color: var(--text);
+  font: 700 14px/1.4 var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+.inference-run-main {
+  min-width: 0;
+}
+.inference-run-title {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  align-items: center;
+  color: var(--text);
+  font-size: 11.5px;
+}
+.inference-run-meta {
+  margin-top: 4px;
+  color: var(--text-dim);
+  font: 11px/1.45 var(--mono);
+  font-variant-numeric: tabular-nums;
+}
 .pipeline-detail-state {
   margin: 0;
   padding: var(--detail-space-md) 0;
@@ -922,6 +971,17 @@
   }
 }
 @media (max-width: 560px) {
+  .inference-spend-heading {
+    flex-direction: column;
+    gap: var(--detail-space-xs);
+    align-items: flex-start;
+  }
+  .inference-run {
+    grid-template-columns: 76px minmax(0, 1fr);
+  }
+  .inference-run > .attempt-time {
+    grid-column: 2;
+  }
   .pipeline-key-facts {
     display: grid;
     grid-template-columns: 1fr 1fr;

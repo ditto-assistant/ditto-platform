@@ -161,11 +161,32 @@ export interface ValidationAttempt {
   validator_hotkey?: string;
   /** "sandbox_oom" | "infrastructure" | "scoring_error". */
   failure_reason?: string | null;
+  /** Public-safe machine cause behind failure_reason. */
+  failure_code?: "inference_allowance_exhausted" | null;
   deadline?: string | null;
   benchmark_progress?: BenchmarkProgress | null;
   bench_version?: number | null;
   issued_at?: string | null;
   failed_at?: string | null;
+}
+
+/** Platform-metered inference accounting for one validator benchmark lease. */
+export interface InferenceRun {
+  validator_hotkey?: string;
+  bench_version?: number | null;
+  ticket_deadline?: string | null;
+  status?: "pending" | "active" | "revoked" | "exhausted";
+  request_budget?: number | null;
+  requests?: number | null;
+  prompt_tokens?: number | null;
+  completion_tokens?: number | null;
+  token_budget?: number | null;
+  embedding_requests?: number | null;
+  embedding_tokens?: number | null;
+  cost_microusd?: number | null;
+  accounting_version?: number | null;
+  created_at?: string | null;
+  updated_at?: string | null;
 }
 
 /** An accepted (provisional/quorum) validator score with its reproducibility
@@ -211,6 +232,7 @@ export interface PipelinePayload {
   provisional_scores?: AcceptedScore[];
   confirmation_scores?: ConfirmationScore[];
   validation_attempts?: ValidationAttempt[];
+  inference_runs?: InferenceRun[];
   screening_attempts?: ScreeningAttempt[];
   dispute?: Dispute | null;
   active_benchmarks?: BenchmarkProgress[];
