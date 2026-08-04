@@ -57,13 +57,14 @@ MAX_INFRA_RETRY_GRANTS = 8
 # the fleet the same way, because the grant *raises the attempt cap*, so the
 # ticket never becomes `exhausted` and no operator is ever told.
 #
-# 12 is deliberately generous. An agent's genuine budget at quorum is
-# `MAX_ATTEMPTS_PER_VERSION` (2) x `SCORING_QUORUM` (3) = 6 leases, so this hands
-# one artifact *twice its entire budget* for free before a single attempt is
-# billed, and it sits above the per-ticket 8 so one validator's local outage is
-# still absorbed whole in the common case. What it removes is only the
-# unboundedness: the fleet's total exposure to one broken artifact becomes 6 + 12
-# leases instead of 6 + 8 x (however many validators are in the pool).
+# 12 remains deliberately separate from the ordinary attempt budget. An
+# artifact gets one base lease per quorum validator; signed infrastructure
+# failures may earn bounded no-fault grants because billing those failures to
+# the miner would conflate validator health with agent behavior. The fleet-wide
+# cap still sits above the per-ticket 8 so one validator's local outage is
+# absorbed whole in the common case. What it removes is only the unboundedness:
+# the fleet's total exposure to one broken artifact is finite instead of
+# growing by 8 for every validator that ever touches it.
 #
 # Past the bound nothing is punished and nothing is lost -- the attempt is simply
 # billed as it always was, the ticket walks its ordinary budget down to

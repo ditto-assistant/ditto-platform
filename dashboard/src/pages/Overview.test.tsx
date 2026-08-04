@@ -108,7 +108,7 @@ async function waitForBoard(): Promise<void> {
 
 // ── Row 3: test_overview_shows_the_full_board_without_a_disclosure ──
 // "Standings are never hidden behind a click" — ditto-platform#383 collapsed
-// the nine-column table behind a <details>; that stays banned. The overview
+// the leaderboard table behind a <details>; that stays banned. The overview
 // is a two-pane layout with a compact board; the full column set lives on the
 // dedicated Leaderboard page ("compactness through a second surface, not
 // through disclosure").
@@ -138,19 +138,10 @@ describe("overview board disclosure ban (row 3)", () => {
     expect(el("leaderboard-version-pills")).toBeTruthy();
   });
 
-  it("keeps every dropped column as a sortable header, with the emissions column tip", async () => {
+  it("keeps the compact leaderboard metrics sortable, with the emissions column tip", async () => {
     renderOverview();
     await waitForBoard();
-    for (const key of [
-      "rank",
-      "name",
-      "bench",
-      "composite",
-      "tool",
-      "memory",
-      "latency",
-      "first_seen",
-    ]) {
+    for (const key of ["rank", "composite", "cost", "latency", "first_seen"]) {
       expect(document.querySelector('th[data-sort="' + key + '"]'), key).toBeTruthy();
     }
     expect(el("emissions-col-tip")).toBeTruthy();
@@ -386,9 +377,27 @@ describe("off-network harness comparison (row 2)", () => {
     expect(hermesV7?.memoryMean).toBe(0.13636363636363635);
     expect(hermesV7?.model).toBe("openai/gpt-oss-20b");
     expect(hermesV7?.route).toBe("OpenRouter · aggregate throughput");
+    const hermesV8 = hermes?.points.find((p) => p.benchVersion === 8);
+    expect(hermesV8?.runId).toBe("0bce82c0-e1da-42b8-8b25-d3f47b13f117");
+    expect(hermesV8?.memoryMean).toBe(0.029880478087649404);
+    expect(hermesV8?.memoryCorrect).toBe(5);
+    expect(hermesV8?.memoryCases).toBe(251);
+    expect(hermesV8?.seed).toBe("123456789");
+    expect(hermesV8?.datasetSha256).toBe(
+      "6a09587706c95b5f61d3e65e0e34b317fc8ce24d0c927c66864d2869c8728e98",
+    );
     const openclawV7 = openclaw?.points.find((p) => p.benchVersion === 7);
     expect(openclawV7?.runId).toBe("dd651606-bcfd-4ed8-83ae-926a0a19ee6b");
     expect(openclawV7?.memoryMean).toBe(0.22601010101010102);
+    const openclawV8 = openclaw?.points.find((p) => p.benchVersion === 8);
+    expect(openclawV8?.runId).toBe("d3ddbb28-1240-46a5-b851-560582657f08");
+    expect(openclawV8?.memoryMean).toBe(0.40039840637450197);
+    expect(openclawV8?.memoryCorrect).toBe(98);
+    expect(openclawV8?.memoryCases).toBe(251);
+    expect(openclawV8?.seed).toBe("123456789");
+    expect(openclawV8?.datasetSha256).toBe(
+      "6a09587706c95b5f61d3e65e0e34b317fc8ce24d0c927c66864d2869c8728e98",
+    );
   });
 
   it("derives the evidence links from the records instead of hardcoding them", async () => {
@@ -519,29 +528,20 @@ describe("memory timeline gaps (row 6)", () => {
     return out.html;
   }
 
-  it("derives unmeasured contracts from the harness records, never a version literal", () => {
+  it("derives complete v8 coverage from the harness records, never a version literal", () => {
     const shown: Record<number, boolean> = { 6: true, 7: true, 8: true };
     for (const evidence of THIRD_PARTY_HARNESSES) {
-      expect(harnessMeasuredVersions(evidence)).toContain(7);
-      // v8 has no reference run in the records, so it is unmeasured — derived,
-      // not hardcoded.
-      expect(harnessUnmeasuredVersions(evidence, shown)).toEqual([8]);
+      expect(harnessMeasuredVersions(evidence)).toContain(8);
+      expect(harnessUnmeasuredVersions(evidence, shown)).toEqual([]);
     }
   });
 
-  it("labels the gap in place, caps the reference lines, and rows it in the data table", () => {
+  it("extends both reference lines through v8 without rendering a false gap", () => {
     const html = renderGapChart();
-    expect(html).toContain('class="timeline-unmeasured"');
-    expect(html).toContain("not because the score fell");
-    // Legend chips carry their own gap.
-    expect(html).toContain("· not on v8");
-    // The line is over, deliberately, rather than trailing off.
-    expect(html).toContain('class="timeline-series-end hermes"');
-    expect(html).toContain('class="timeline-series-end openclaw"');
-    // Absent measurements are rows in the exact-data table too.
-    expect(html).toContain("not yet measured");
-    // And the caption names the gap as an absence, not a measured zero.
-    expect(html).toContain("not a score of zero");
+    expect(html).not.toContain('class="timeline-unmeasured"');
+    expect(html).not.toContain("· not on v8");
+    expect(html).not.toContain("not yet measured");
+    expect(html).toContain("Every contract shown carries a reference measurement.");
   });
 
   it("marks the collecting rollout's band open with the rollout strip's vocabulary", () => {

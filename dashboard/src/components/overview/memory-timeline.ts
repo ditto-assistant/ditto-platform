@@ -29,6 +29,8 @@ export interface HarnessPoint {
   measuredAt?: string;
   model?: string;
   route?: string;
+  seed?: string;
+  datasetSha256?: string;
 }
 
 export interface HarnessEvidence {
@@ -102,6 +104,18 @@ export const THIRD_PARTY_HARNESSES: HarnessEvidence[] = [
         model: "openai/gpt-oss-20b",
         route: "OpenRouter · aggregate throughput",
       },
+      {
+        benchVersion: 8,
+        memoryMean: 0.029880478087649404,
+        memoryCorrect: 5,
+        memoryCases: 251,
+        runId: "0bce82c0-e1da-42b8-8b25-d3f47b13f117",
+        measuredAt: "2026-08-04",
+        model: "openai/gpt-oss-20b",
+        route: "OpenRouter · aggregate throughput",
+        seed: "123456789",
+        datasetSha256: "6a09587706c95b5f61d3e65e0e34b317fc8ce24d0c927c66864d2869c8728e98",
+      },
     ],
   },
   {
@@ -160,6 +174,18 @@ export const THIRD_PARTY_HARNESSES: HarnessEvidence[] = [
         measuredAt: "2026-07-25",
         model: "openai/gpt-oss-20b",
         route: "OpenRouter · aggregate throughput",
+      },
+      {
+        benchVersion: 8,
+        memoryMean: 0.40039840637450197,
+        memoryCorrect: 98,
+        memoryCases: 251,
+        runId: "d3ddbb28-1240-46a5-b851-560582657f08",
+        measuredAt: "2026-08-03",
+        model: "openai/gpt-oss-20b",
+        route: "OpenRouter · aggregate throughput",
+        seed: "123456789",
+        datasetSha256: "6a09587706c95b5f61d3e65e0e34b317fc8ce24d0c927c66864d2869c8728e98",
       },
     ],
   },
@@ -231,9 +257,9 @@ export function harnessCoverageText(shownVersions: Record<number, boolean>): str
  * from the plotted lines. */
 export function harnessMethodText(shownVersions: Record<number, boolean>): string {
   return (
-    "The miner line is the running high of finalized three-validator memory medians within each benchmark version; points are ordered by their actual scoring completion time. The horizontal axis gives every contract an equal band rather than equal clock time, because contracts ran for very different durations and the short ones were unreadable on a wall-clock scale. Hermes and OpenClaw are single-seed off-network practice runs. Versions 2–6 used the same Qwen3-32B model and pinned OpenRouter/Nebius route; v7 uses its frozen GPT-OSS-20B aggregate OpenRouter route. Every run uses seed " +
+    "The miner line is the running high of finalized three-validator memory medians within each benchmark version; points are ordered by their actual scoring completion time. The horizontal axis gives every contract an equal band rather than equal clock time, because contracts ran for very different durations and the short ones were unreadable on a wall-clock scale. Hermes and OpenClaw are single-seed off-network practice runs. Versions 2–6 used the same Qwen3-32B model and pinned OpenRouter/Nebius route; v7–v8 use the frozen GPT-OSS-20B aggregate OpenRouter route. Versions 2–7 use seed " +
     (THIRD_PARTY_HARNESSES[0] as HarnessEvidence).seed +
-    ", covering " +
+    "; v8 uses its released reference seed 123456789, covering " +
     harnessCoverageText(shownVersions) +
     " Their points are positioned in each immutable contract's band for comparison, not presented as historical measurements. Version changes are not all monotonic difficulty increases: v4 corrects v3 false positives. Third-party harnesses never enter score rank, KOTH, validator weights, or payouts."
   );
@@ -601,6 +627,8 @@ export function memoryTimelineHtml(
             (point.model || evidence.model) +
             " · " +
             (point.route || evidence.route) +
+            " · seed " +
+            (point.seed || evidence.seed) +
             " · measured " +
             (point.measuredAt || evidence.measuredAt),
           source: evidence.subject,

@@ -69,9 +69,7 @@ MINIMUM_ROLLOUT_START_VALIDATORS = 1
 # abort that names no dependency and reads like an auth failure.
 ROLLOUT_STATUS_BUDGET_SECONDS = 12.0
 
-_Reason = Annotated[
-    str, StringConstraints(strip_whitespace=True, min_length=3, max_length=500)
-]
+_Reason = Annotated[str, StringConstraints(strip_whitespace=True, min_length=3)]
 _Actor = Annotated[
     str, StringConstraints(strip_whitespace=True, min_length=1, max_length=120)
 ]

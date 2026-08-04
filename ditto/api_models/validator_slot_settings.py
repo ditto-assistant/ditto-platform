@@ -245,7 +245,7 @@ class AdminValidatorSlotSettingsRequest(BaseModel):
     is a 409 so a concurrent change is never silently clobbered."""
 
     settings: ValidatorSlotSettings
-    reason: Annotated[str, Field(min_length=8, max_length=500)]
+    reason: Annotated[str, Field(min_length=8)]
     actor: Annotated[str, Field(min_length=1, max_length=120)] = "admin_api"
     confirmation: str
     """Must equal ``APPLY VALIDATOR SLOT CAP <max_concurrent_slots>`` (the

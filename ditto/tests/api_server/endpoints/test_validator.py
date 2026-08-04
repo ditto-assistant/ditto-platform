@@ -4802,6 +4802,59 @@ class TestRequestJob:
         assert response.json()["agent_id"] == str(agent_id)
         refresh.assert_not_awaited()
 
+    async def test_v8_only_validator_receives_work_without_v7_calibration(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A v8-only scorer is not forced to advertise the retired v7 manifest.
+
+        The shared capability gate already treated v7 calibration as specific
+        to v7.  The job endpoint duplicated the old broader condition, making
+        an otherwise healthy v8-only validator poll successfully but receive a
+        204 while eligible v8 submissions waited.
+        """
+        await _seed_activated_era(session_maker, version=8)
+        agent_id = await _seed_agent(
+            session_maker,
+            status=AgentStatus.EVALUATING,
+            dataset_version=8,
+        )
+        capabilities = _scorer_capable_capabilities(
+            now=datetime.now(UTC), versions=(8,)
+        )
+        scorer = capabilities["scorer_benchmarks"]
+        assert isinstance(scorer, dict)
+        scorer.pop("v7_calibration")
+        await _seed_validator_heartbeat(
+            session_maker,
+            protocol_version=18,
+            capabilities=capabilities,
+            stack=_V7_STACK,
+            benchmark_capacity=_ACCEPTING_CAPACITY,
+        )
+        _install_db(app, session_maker)
+        _install_chain(app)
+        self._enable_compatibility_gate(app)
+        refresh = AsyncMock(return_value=0)
+        monkeypatch.setattr(
+            "ditto.api_server.endpoints.validator.refresh_rolling_qualification",
+            refresh,
+        )
+
+        response = await client.post(
+            "/api/v1/validator/job",
+            headers=_AUTH_HEADER,
+            json=_job_payload(slot_id=_SLOT_ID),
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["agent_id"] == str(agent_id)
+        assert response.json()["bench_version"] == 8
+        refresh.assert_not_awaited()
+
     async def test_required_proxy_issues_only_to_v10_ticket_inference_slots(
         self,
         app: FastAPI,
@@ -5565,9 +5618,11 @@ class TestFailJob:
                 ValidatorTicket, (agent_id, _BENCH_VERSION, _VALIDATOR_HOTKEY)
             )
             assert ticket is not None
-            # A scoring_error closes for immediate reissue: expired now with
-            # retry_after=now, not the 6h cooldown, so the next request_job mints
-            # a fresh lease. (Infrastructure failures instead back off.)
+            # A scoring_error closes immediately: expired now with
+            # retry_after=now, not the 6h timeout cooldown. Another validator
+            # may take the open quorum slot, while this validator has spent its
+            # one-attempt base budget. (Infrastructure failures earn a grant and
+            # back off.)
             assert ticket.status == TicketStatus.EXPIRED
             now = datetime.now(UTC)
             assert ticket.retry_after is not None
@@ -5576,19 +5631,18 @@ class TestFailJob:
                 retry_after = retry_after.replace(tzinfo=UTC)
             assert abs((retry_after - now).total_seconds()) < 60
 
-    async def test_reissues_a_fresh_ticket_after_failure(
+    async def test_scoring_error_exhausts_same_validator_without_a_grant(
         self,
         app: FastAPI,
         client: httpx.AsyncClient,
         session_maker: async_sessionmaker[AsyncSession],
     ) -> None:
-        # End-to-end reattempt seam: a scoring_error fails the lease, then
-        # request_job hands the same validator a brand-new ticket (fresh
-        # deadline) instead of resuming.
+        # A deterministic scoring_error fails the lease and spends this
+        # validator's one-attempt base budget. Reissuing it automatically would
+        # pay for the same broken run twice.
         agent_id = await _seed_agent(session_maker, status=AgentStatus.EVALUATING)
         await _seed_ticket(session_maker, agent_id)
-        # The reissue is the point, so the validator has to be one the allocator
-        # will hand a v7 lease to.
+        # Exercise the real allocator path with a validator eligible for v7.
         await _seed_capable_pool(session_maker, keypairs=(_KEYPAIR,))
         _install_db(app, session_maker)
         _install_chain(app)
@@ -5605,11 +5659,7 @@ class TestFailJob:
             headers=_AUTH_HEADER,
             json=_job_payload(slot_id=_SLOT_ID),
         )
-        assert reissued.status_code == 200, reissued.text
-        job = reissued.json()
-        assert job["agent_id"] == str(agent_id)
-        # A fresh lease, not the failed one: the deadline moved off the seed value.
-        assert datetime.fromisoformat(job["deadline"]) != _TICKET_DEADLINE
+        assert reissued.status_code == 204, reissued.text
 
     async def test_infrastructure_failure_backs_off_before_reissue(
         self,
@@ -7731,7 +7781,7 @@ class TestMultiValidatorConsensus:
         assert reopened.status_code == 200, reopened.text
         assert reopened.json()["agent_id"] == str(agent_id)
 
-    async def test_expired_ticket_cools_down_before_same_validator_retry(
+    async def test_expired_ticket_does_not_retry_without_a_grant(
         self,
         app: FastAPI,
         client: httpx.AsyncClient,
@@ -7777,8 +7827,7 @@ class TestMultiValidatorConsensus:
             headers=headers,
             json=_job_payload(keypair, slot_id=_SLOT_ID),
         )
-        assert retried.status_code == 200, retried.text
-        assert retried.json()["agent_id"] == str(agent_id)
+        assert retried.status_code == 204, retried.text
 
 
 def test_dev_bypass_permit_refused_on_mainnet(monkeypatch) -> None:
@@ -8186,6 +8235,42 @@ class TestTop5ConfirmationLane:
 
         assert response.status_code == 428
         assert "fresh heartbeat" in response.json()["message"]
+
+    async def test_v8_only_validator_claims_retest_without_v7_calibration(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        champion, *_ = await _seed_top5_emission_set(
+            session_maker,
+            bench_version=8,
+            seed_heartbeats=False,
+        )
+        capabilities = _scorer_capable_capabilities(
+            now=datetime.now(UTC), versions=(8,)
+        )
+        scorer = capabilities["scorer_benchmarks"]
+        assert isinstance(scorer, dict)
+        scorer.pop("v7_calibration")
+        await _seed_validator_heartbeat(
+            session_maker,
+            protocol_version=18,
+            capabilities=capabilities,
+            stack=_V7_STACK,
+        )
+        _install_db(app, session_maker)
+        _install_chain_with_block(app, block_number=1)
+
+        response = await client.post(
+            "/api/v1/validator/top5-confirmation-job",
+            headers=_AUTH_HEADER,
+            json=_top5_job_payload(champion, champion),
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["agent_id"] == str(champion)
+        assert response.json()["bench_version"] == 8
 
     async def test_distributes_concurrent_claims_across_least_covered_members(
         self,

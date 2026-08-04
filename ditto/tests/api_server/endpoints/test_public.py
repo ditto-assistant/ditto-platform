@@ -77,6 +77,7 @@ from ditto.db.models import (
     BenchmarkRolloutAudit,
     BenchmarkRolloutMember,
     EvaluationPayment,
+    InferenceGrant,
     OwnerAttestation,
     Score,
     ScreeningAttempt,
@@ -1207,6 +1208,101 @@ class TestPublicBenchmarkTimeline:
 
 
 class TestPublicLeaderboard:
+    async def test_leaderboard_reports_average_settled_run_cost(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        agent_id = UUID(
+            await _seed_k3(
+                session_maker,
+                miner=_MINER_A,
+                composites=[0.7, 0.71, 0.72],
+                details={"bench_version": _ERA},
+            )
+        )
+        now = datetime.now(UTC)
+        async with session_maker() as session, session.begin():
+            validator = await session.scalar(
+                select(Score.validator_hotkey)
+                .where(Score.agent_id == agent_id)
+                .limit(1)
+            )
+            assert validator is not None
+
+            def grant(
+                *,
+                deadline: datetime,
+                status: str,
+                chat_cost: int,
+                embedding_cost: int,
+            ) -> InferenceGrant:
+                return InferenceGrant(
+                    grant_id=uuid4(),
+                    agent_id=agent_id,
+                    bench_version=_ERA,
+                    validator_hotkey=validator,
+                    slot_id="slot-0",
+                    ticket_deadline=deadline,
+                    expires_at=deadline,
+                    status=status,
+                    generation=1,
+                    allowed_models=["qwen/qwen3-32b"],
+                    request_budget=8192,
+                    request_count=100,
+                    token_budget=25_000_000,
+                    prompt_tokens=1000,
+                    completion_tokens=100,
+                    cost_microusd=chat_cost,
+                    embedding_model="perplexity/pplx-embed-v1-0.6b",
+                    embedding_profile="dittobench-v8-pplx-embed-v1-0.6b-768-v1",
+                    embedding_provider="Perplexity",
+                    embedding_dimensions=768,
+                    embedding_request_budget=10_000,
+                    embedding_request_count=10,
+                    embedding_token_budget=5_000_000,
+                    embedding_tokens=1000,
+                    embedding_cost_microusd=embedding_cost,
+                    usage_accounting_version=2,
+                    created_at=now - timedelta(hours=2),
+                    updated_at=now,
+                )
+
+            session.add_all(
+                [
+                    # Raw active status is stale after the immutable lease end.
+                    grant(
+                        deadline=now - timedelta(hours=1),
+                        status="active",
+                        chat_cost=100_000,
+                        embedding_cost=10_000,
+                    ),
+                    # A terminal grant is settled even before its original deadline.
+                    grant(
+                        deadline=now + timedelta(hours=1),
+                        status="exhausted",
+                        chat_cost=300_000,
+                        embedding_cost=30_000,
+                    ),
+                    # Live partial work must not pull the board average down.
+                    grant(
+                        deadline=now + timedelta(hours=2),
+                        status="active",
+                        chat_cost=900_000,
+                        embedding_cost=90_000,
+                    ),
+                ]
+            )
+        await _activate_era(session_maker)
+        _install_db(app, session_maker)
+
+        body = (await client.get("/api/v1/public/leaderboard")).json()
+        entry = next(row for row in body["entries"] if row["agent_id"] == str(agent_id))
+
+        assert entry["average_run_cost_microusd"] == 220_000
+        assert entry["inference_run_count"] == 2
+
     async def test_distinguishes_raw_rank_one_from_koth_emissions_champion(
         self,
         app: FastAPI,
@@ -3515,6 +3611,19 @@ def _v7_capable_row(
     )
 
 
+def _v8_only_capable_row(
+    now: datetime, *, hotkey: str, seen_at: datetime
+) -> SimpleNamespace:
+    """The v0.44 heartbeat: v8 is verified without retired v7 metadata."""
+
+    row = _v7_capable_row(now, hotkey=hotkey, seen_at=seen_at)
+    row.protocol_version = 18
+    scorer = row.capabilities["scorer_benchmarks"]
+    scorer["supported_bench_versions"] = [8]
+    scorer.pop("v7_calibration")
+    return row
+
+
 def _legacy_row(now: datetime, *, hotkey: str) -> SimpleNamespace:
     """The validator this gate exists for: ancient software, no capabilities.
 
@@ -3591,6 +3700,18 @@ class TestActiveBenchCapabilityGate:
         entry = self._snapshot(
             [_v7_capable_row(now, hotkey=_VALIDATOR_C, seen_at=now)],
             version=7,
+            now=now,
+        ).validators[0]
+
+        assert entry.bench_serviceability == "serving"
+        assert entry.health == "healthy"
+        assert entry.health_reasons == []
+
+    def test_a_v8_only_validator_passes_without_v7_calibration(self) -> None:
+        now = datetime(2026, 8, 4, 20, 20, tzinfo=UTC)
+        entry = self._snapshot(
+            [_v8_only_capable_row(now, hotkey=_VALIDATOR_C, seen_at=now)],
+            version=8,
             now=now,
         ).validators[0]
 
@@ -5865,6 +5986,7 @@ class TestPublicActivity:
                     bench_version=_ERA,
                     attempt_count=1,
                     manual_retry_grants=0,
+                    infra_retry_grants=1,
                     retry_after=cooldown_until,
                 )
             )
@@ -6609,6 +6731,106 @@ class TestPublicActivity:
         assert body["validation_attempts"][0]["failure_reason"] == "sandbox_oom"
         assert body["validation_attempts"][0]["failed_at"] is not None
         assert body["validation_attempts"][0]["attempt_count"] == 1
+
+    async def test_pipeline_publishes_run_cost_and_allowance_exhaustion(
+        self,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        session_maker: async_sessionmaker[AsyncSession],
+    ) -> None:
+        """Publish aggregate spend and an allowlisted terminal agent cause.
+
+        The diagnostic detail remains private. Only the exact typed allowance
+        code is public, alongside the platform's durable aggregate meter for
+        the validator lease that consumed it.
+        """
+        agent_id = UUID(
+            await _seed_agent(
+                session_maker,
+                miner=_MINER_A,
+                status=AgentStatus.EVALUATING,
+                name="allowance-hungry-agent",
+                screening_policy_version=SCREENING_POLICY_VERSION,
+            )
+        )
+        now = datetime.now(UTC)
+        deadline = now - timedelta(minutes=5)
+        async with session_maker() as session, session.begin():
+            session.add(
+                ValidatorTicket(
+                    agent_id=agent_id,
+                    validator_hotkey=_MINER_B,
+                    slot_id="slot-0",
+                    bench_version=_ERA,
+                    status=TicketStatus.EXPIRED,
+                    purpose=TicketPurpose.CANONICAL_QUORUM,
+                    issued_at=now - timedelta(hours=1),
+                    deadline=deadline,
+                    failure_reason="scoring_error",
+                    failure_detail="inference_allowance_exhausted",
+                    failed_at=deadline,
+                )
+            )
+            await session.flush()
+            session.add(
+                InferenceGrant(
+                    grant_id=uuid4(),
+                    agent_id=agent_id,
+                    bench_version=_ERA,
+                    validator_hotkey=_MINER_B,
+                    slot_id="slot-0",
+                    ticket_deadline=deadline,
+                    expires_at=deadline,
+                    status="exhausted",
+                    generation=1,
+                    allowed_models=["qwen/qwen3-32b"],
+                    request_budget=8192,
+                    request_count=8192,
+                    token_budget=25_000_000,
+                    prompt_tokens=7_000_000,
+                    completion_tokens=500_000,
+                    cost_microusd=1_234_567,
+                    embedding_model="perplexity/pplx-embed-v1-0.6b",
+                    embedding_profile="dittobench-v8-pplx-embed-v1-0.6b-768-v1",
+                    embedding_provider="Perplexity",
+                    embedding_dimensions=768,
+                    embedding_request_budget=10_000,
+                    embedding_request_count=123,
+                    embedding_token_budget=5_000_000,
+                    embedding_tokens=456_789,
+                    embedding_cost_microusd=12_345,
+                    usage_accounting_version=2,
+                    created_at=now - timedelta(hours=1),
+                    updated_at=deadline,
+                )
+            )
+        _install_db(app, session_maker)
+
+        response = await client.get(f"/api/v1/public/agent/{agent_id}/pipeline")
+
+        assert response.status_code == 200
+        body = response.json()
+        attempt = body["validation_attempts"][0]
+        assert attempt["failure_reason"] == "scoring_error"
+        assert attempt["failure_code"] == "inference_allowance_exhausted"
+        run = body["inference_runs"][0]
+        assert run == {
+            "validator_hotkey": _MINER_B,
+            "bench_version": _ERA,
+            "ticket_deadline": deadline.isoformat().replace("+00:00", "Z"),
+            "status": "exhausted",
+            "request_budget": 8192,
+            "requests": 8192,
+            "prompt_tokens": 7_000_000,
+            "completion_tokens": 500_000,
+            "token_budget": 25_000_000,
+            "embedding_requests": 123,
+            "embedding_tokens": 456_789,
+            "cost_microusd": 1_246_912,
+            "accounting_version": 2,
+            "created_at": (now - timedelta(hours=1)).isoformat().replace("+00:00", "Z"),
+            "updated_at": deadline.isoformat().replace("+00:00", "Z"),
+        }
 
     async def test_pipeline_dates_a_retried_lease_after_its_kept_failure(
         self,

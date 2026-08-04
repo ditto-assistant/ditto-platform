@@ -95,11 +95,12 @@ def _as_utc(dt: datetime) -> datetime:
 # expired ticket does not count, so its slot re-opens.
 _LIVE_TICKET_STATUSES = (TicketStatus.ISSUED, TicketStatus.SCORED)
 
-# A timed-out artifact must not monopolize one validator. Give transient
-# failures one delayed retry, while allowing other validators to make an
-# independent attempt immediately.
+# A timed-out artifact must not monopolize one validator. Give each validator
+# one base attempt while allowing other validators to make an independent
+# attempt immediately. Signed infrastructure failures and audited operator
+# actions grant their own bounded retries below.
 RETRY_COOLDOWN = timedelta(hours=6)
-MAX_ATTEMPTS_PER_VERSION = 2
+MAX_ATTEMPTS_PER_VERSION = 1
 
 
 def ticket_attempt_cap(ticket: ValidatorTicket) -> int:
@@ -344,7 +345,8 @@ async def issue_ticket(
     2-of-3 submission that can no longer reach this era's emission set sorts
     behind every other candidate rather than being withheld, so it still
     finalizes once the queue drains. A prior expired row is reissued only after
-    its cooldown and only once for the same benchmark version. Returns the
+    its cooldown and only when an infrastructure or operator grant extends its
+    budget for the same benchmark version. Returns the
     ticket, or ``None`` when there is no work for this validator ("no job for
     you"). Runs inside the caller's transaction.
 
@@ -493,8 +495,8 @@ async def issue_ticket(
 
     # Agents this validator must not receive right now: live/scored tickets,
     # same-version tickets cooling down after expiry, and same-version tickets
-    # that already consumed the two-attempt budget. A benchmark-version bump
-    # resets the budget so repaired scoring software can revisit the artifact.
+    # that already consumed the single-attempt base budget. A benchmark-version
+    # bump resets the budget so repaired scoring software can revisit the artifact.
     already_mine = select(ValidatorTicket.agent_id).where(
         ValidatorTicket.validator_hotkey == validator_hotkey,
         ValidatorTicket.bench_version == bench_version,

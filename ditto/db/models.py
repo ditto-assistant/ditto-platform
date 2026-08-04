@@ -530,7 +530,7 @@ class AthReview(Base):
             "AND resolution IS NOT NULL "
             "AND resolution IN ('clear', 'reject') "
             "AND resolution_reason IS NOT NULL "
-            "AND length(trim(resolution_reason)) BETWEEN 3 AND 500)",
+            "AND length(trim(resolution_reason)) >= 3)",
             name="ath_reviews_lifecycle_check",
         ),
         Index("ath_reviews_status_opened_idx", "status", "opened_at", "review_id"),
@@ -561,7 +561,7 @@ class AthReviewAction(Base):
             name="ath_review_actions_action_check",
         ),
         CheckConstraint(
-            "length(trim(reason)) BETWEEN 3 AND 500",
+            "length(trim(reason)) >= 3",
             name="ath_review_actions_reason_check",
         ),
         CheckConstraint(
@@ -608,7 +608,7 @@ class ScreeningRetryOverride(Base):
             name="screening_retry_overrides_score_count_check",
         ),
         CheckConstraint(
-            "length(trim(reason)) BETWEEN 8 AND 500",
+            "length(trim(reason)) >= 8",
             name="screening_retry_overrides_reason_check",
         ),
         CheckConstraint(
@@ -1803,7 +1803,7 @@ class ScreenerReviewSettingsRevision(Base):
             name="screener_review_settings_checksum_check",
         ),
         CheckConstraint(
-            "length(trim(reason)) BETWEEN 8 AND 500",
+            "length(trim(reason)) >= 8",
             name="screener_review_settings_reason_check",
         ),
         CheckConstraint(
@@ -1869,7 +1869,7 @@ class ArtifactReleaseSettingsRevision(Base):
             name="artifact_release_settings_parent_revision_check",
         ),
         CheckConstraint(
-            "length(trim(reason)) BETWEEN 8 AND 500",
+            "length(trim(reason)) >= 8",
             name="artifact_release_settings_reason_check",
         ),
         CheckConstraint(
@@ -1912,7 +1912,7 @@ class SubmissionSettingsRevision(Base):
             name="submission_settings_parent_revision_check",
         ),
         CheckConstraint(
-            "length(trim(reason)) BETWEEN 8 AND 500",
+            "length(trim(reason)) >= 8",
             name="submission_settings_reason_check",
         ),
         CheckConstraint(
@@ -2837,7 +2837,7 @@ class ValidatorRetryRecovery(Base):
             name="validator_retry_recoveries_actor_length",
         ),
         CheckConstraint(
-            "length(trim(reason)) BETWEEN 3 AND 500",
+            "length(trim(reason)) >= 3",
             name="validator_retry_recoveries_reason_length",
         ),
         CheckConstraint(
@@ -2944,7 +2944,7 @@ class ValidatorQueueWithdrawal(Base):
             name="validator_queue_withdrawals_actor_length",
         ),
         CheckConstraint(
-            "length(trim(reason)) BETWEEN 8 AND 500",
+            "length(trim(reason)) >= 8",
             name="validator_queue_withdrawals_reason_length",
         ),
         # One removal *in force* per (agent, benchmark era). Partial rather than
@@ -3052,7 +3052,7 @@ class ValidatorQueueReinstatement(Base):
             name="validator_queue_reinstatements_actor_length",
         ),
         CheckConstraint(
-            "length(trim(reason)) BETWEEN 8 AND 500",
+            "length(trim(reason)) >= 8",
             name="validator_queue_reinstatements_reason_length",
         ),
         # One reversal per removal. The removal row is resolved exactly once, so
@@ -3141,7 +3141,7 @@ class SubmissionRetirement(Base):
             name="submission_retirements_actor_length",
         ),
         CheckConstraint(
-            "length(trim(reason)) BETWEEN 8 AND 500",
+            "length(trim(reason)) >= 8",
             name="submission_retirements_reason_length",
         ),
         UniqueConstraint(
@@ -3312,7 +3312,7 @@ class EfficiencyBonusSettingsRevision(Base):
             name="efficiency_bonus_settings_parent_revision_check",
         ),
         CheckConstraint(
-            "length(trim(reason)) BETWEEN 8 AND 500",
+            "length(trim(reason)) >= 8",
             name="efficiency_bonus_settings_reason_check",
         ),
         CheckConstraint(
@@ -3360,7 +3360,7 @@ class ContinualRetestSettingsRevision(Base):
             name="continual_retest_settings_parent_revision_check",
         ),
         CheckConstraint(
-            "length(trim(reason)) BETWEEN 8 AND 500",
+            "length(trim(reason)) >= 8",
             name="continual_retest_settings_reason_check",
         ),
         CheckConstraint(
@@ -3419,7 +3419,7 @@ class QueuePolicySettingsRevision(Base):
             name="queue_policy_settings_parent_revision_check",
         ),
         CheckConstraint(
-            "length(trim(reason)) BETWEEN 8 AND 500",
+            "length(trim(reason)) >= 8",
             name="queue_policy_settings_reason_check",
         ),
         CheckConstraint(
@@ -3480,7 +3480,7 @@ class InferenceConcurrencySettingsRevision(Base):
             name="inference_concurrency_settings_parent_revision_check",
         ),
         CheckConstraint(
-            "length(trim(reason)) BETWEEN 8 AND 500",
+            "length(trim(reason)) >= 8",
             name="inference_concurrency_settings_reason_check",
         ),
         CheckConstraint(
@@ -3548,7 +3548,7 @@ class ValidatorSlotSettingsRevision(Base):
             name="validator_slot_settings_parent_revision_check",
         ),
         CheckConstraint(
-            "length(trim(reason)) BETWEEN 8 AND 500",
+            "length(trim(reason)) >= 8",
             name="validator_slot_settings_reason_check",
         ),
         CheckConstraint(

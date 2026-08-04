@@ -156,7 +156,7 @@ from ditto.db.queries.payments import (
     get_miner_coldkey_for_agent,
     get_miner_coldkeys_for_agents,
 )
-from ditto.db.queries.tickets import RETRY_COOLDOWN
+from ditto.db.queries.tickets import RETRY_COOLDOWN, ticket_attempt_cap
 
 logger = logging.getLogger(__name__)
 
@@ -1944,7 +1944,9 @@ async def rebuild_screened_image(
             ticket.status = TicketStatus.EXPIRED
             ticket.deadline = now
             ticket.retry_after = now
-            ticket.manual_retry_grants += 1
+            ticket.manual_retry_grants += max(
+                1, ticket.attempt_count - ticket_attempt_cap(ticket) + 1
+            )
 
         old_image_sha256 = agent.screened_image_sha256
         old_upload_id = agent.screened_image_upload_id
@@ -2071,7 +2073,9 @@ async def refresh_benchmark_contract(
             # The replacement dataset is a new contract even though its public
             # benchmark version is unchanged. Grant one clean lease without
             # erasing the historical attempt counter.
-            ticket.manual_retry_grants += 1
+            ticket.manual_retry_grants += max(
+                1, ticket.attempt_count - ticket_attempt_cap(ticket) + 1
+            )
 
         await append_audit_entry(
             session,

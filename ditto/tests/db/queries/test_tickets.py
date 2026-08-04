@@ -3487,7 +3487,7 @@ class TestExpiry:
         assert claimed is not None
         assert claimed.agent_id == next_agent
 
-    async def test_expired_ticket_gets_one_retry_after_cooldown(
+    async def test_expired_ticket_does_not_retry_without_a_grant(
         self, session: AsyncSession
     ) -> None:
         aid = await _seed_evaluating(session)
@@ -3508,9 +3508,12 @@ class TestExpiry:
                 bench_version=_BENCH,
             )
 
-        assert retried is not None and retried.agent_id == aid
-        assert retried.attempt_count == 2
-        assert retried.issued_at == _AFTER_COOLDOWN
+        assert retried is None
+        async with session.begin():
+            ticket = await session.get(ValidatorTicket, (aid, _BENCH, "5V1"))
+        assert ticket is not None
+        assert ticket.status == TicketStatus.EXPIRED
+        assert ticket.attempt_count == 1
 
     async def test_never_attempted_agent_precedes_eligible_retry(
         self, session: AsyncSession
@@ -3543,7 +3546,7 @@ class TestExpiry:
         assert claimed is not None
         assert claimed.agent_id == untouched
 
-    async def test_second_expiry_exhausts_same_version_retry_budget(
+    async def test_first_expiry_exhausts_same_version_retry_budget(
         self, session: AsyncSession
     ) -> None:
         aid = await _seed_evaluating(session)
@@ -3556,29 +3559,20 @@ class TestExpiry:
                 bench_version=_BENCH,
             )
         async with session.begin():
-            await issue_ticket(
+            retry = await issue_ticket(
                 session,
                 validator_hotkey="5V1",
                 now=_AFTER_COOLDOWN,
                 ttl=_TTL,
                 bench_version=_BENCH,
             )
-        after_second_expiry = _AFTER_COOLDOWN + timedelta(hours=7)
-        async with session.begin():
-            third = await issue_ticket(
-                session,
-                validator_hotkey="5V1",
-                now=after_second_expiry,
-                ttl=_TTL,
-                bench_version=_BENCH,
-            )
 
-        assert third is None
+        assert retry is None
         async with session.begin():
             ticket = await session.get(ValidatorTicket, (aid, _BENCH, "5V1"))
         assert ticket is not None
         assert ticket.status == TicketStatus.EXPIRED
-        assert ticket.attempt_count == 2
+        assert ticket.attempt_count == 1
 
     async def test_benchmark_version_change_resets_retry_budget(
         self, session: AsyncSession
