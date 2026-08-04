@@ -30,6 +30,7 @@ import type {
   AcceptedScore,
   ActivityEntry,
   BenchmarkProgress,
+  InferenceRun,
   PipelinePayload,
   ScreeningAttempt,
   ValidationAttempt,
@@ -715,6 +716,91 @@ function ValidationAttemptRow(props: { attempt: ValidationAttempt }): JSX.Elemen
   );
 }
 
+function formatMicrousd(value: number | null | undefined): string {
+  const dollars = Math.max(0, Number(value) || 0) / 1_000_000;
+  return "$" + dollars.toFixed(dollars >= 1 ? 2 : 4);
+}
+
+function formatCount(value: number | null | undefined): string {
+  return Math.max(0, Number(value) || 0).toLocaleString();
+}
+
+function InferenceRuns(props: { runs: InferenceRun[] }): JSX.Element {
+  const runs = createMemo(() =>
+    props.runs
+      .slice()
+      .sort(
+        (a, b) => new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime(),
+      ),
+  );
+  const totalCost = createMemo(() =>
+    runs().reduce((sum, run) => sum + Math.max(0, Number(run.cost_microusd) || 0), 0),
+  );
+  const status = (run: InferenceRun): [string, string] => {
+    if (run.status === "exhausted") return ["Allowance exhausted", "bad"];
+    if (run.status === "active") return ["Running", "progress"];
+    if (run.status === "pending") return ["Preparing", "progress"];
+    return ["Closed", ""];
+  };
+  return (
+    <Show when={runs().length}>
+      <section class="pipeline-section" aria-labelledby="pipeline-inference-spend">
+        <div class="pipeline-section-heading inference-spend-heading">
+          <div>
+            <h4 id="pipeline-inference-spend">Benchmark inference cost</h4>
+            <p>
+              Platform-metered chat and embedding spend. Each row is one validator benchmark run.
+            </p>
+          </div>
+          <strong class="inference-spend-total">{formatMicrousd(totalCost())} total</strong>
+        </div>
+        <div class="inference-run-list">
+          <For each={runs()}>
+            {(run) => {
+              const state = () => status(run);
+              const chatTokens = () =>
+                (Number(run.prompt_tokens) || 0) + (Number(run.completion_tokens) || 0);
+              return (
+                <div class="inference-run">
+                  <div class="inference-run-cost">{formatMicrousd(run.cost_microusd)}</div>
+                  <div class="inference-run-main">
+                    <div class="inference-run-title">
+                      <span class="bench-version-badge">
+                        {run.bench_version == null
+                          ? "Bench unknown"
+                          : "Bench v" + run.bench_version}
+                      </span>
+                      <EntityButton
+                        kind="validator"
+                        id={run.validator_hotkey}
+                        label={"Validator " + shortKey(run.validator_hotkey)}
+                      />
+                      <span class={"stage" + (state()[1] ? " " + state()[1] : "")}>
+                        {state()[0]}
+                      </span>
+                    </div>
+                    <div class="inference-run-meta">
+                      {formatCount(run.requests)} of {formatCount(run.request_budget)} chat requests
+                      {" · "}
+                      {formatCount(chatTokens())} of {formatCount(run.token_budget)} chat tokens
+                      {" · "}
+                      {formatCount(run.embedding_requests)} embedding requests /{" "}
+                      {formatCount(run.embedding_tokens)} tokens
+                    </div>
+                  </div>
+                  <div class="attempt-time" title={String(run.updated_at || run.created_at || "")}>
+                    {relTime(run.updated_at || run.created_at)}
+                  </div>
+                </div>
+              );
+            }}
+          </For>
+        </div>
+      </section>
+    </Show>
+  );
+}
+
 // ── The drawer body ──────────────────────────────────────────────────────────
 //
 export function AgentEvidence(props: AgentEvidenceProps): JSX.Element {
@@ -1059,6 +1145,7 @@ export function AgentEvidence(props: AgentEvidenceProps): JSX.Element {
                     </Show>
                   </div>
                 </section>
+                <InferenceRuns runs={detail().inference_runs || []} />
                 <AcceptedScores pipeline={detail()} config={config} glossary={glossaryData} />
                 <ConfirmationScores pipeline={detail()} entries={entries} />
                 <section class="pipeline-section" aria-labelledby="pipeline-validator-history">

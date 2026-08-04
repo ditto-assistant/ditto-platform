@@ -23,7 +23,11 @@ export function attemptLabel(status: string | null | undefined, role: string): C
   return (status != null && labels[status]) || [String(status || "Unknown").replace(/_/g, " "), ""];
 }
 
-export function validatorFailureLabel(reason: string | null | undefined): string {
+export function validatorFailureLabel(
+  reason: string | null | undefined,
+  code?: string | null,
+): string {
+  if (code === "inference_allowance_exhausted") return "Inference allowance exhausted";
   const labels: Record<string, string> = {
     sandbox_oom: "Sandbox out of memory",
     infrastructure: "Validator infrastructure failure",
@@ -93,13 +97,18 @@ export function validationAttemptView(a: ValidationAttempt): ValidationAttemptVi
   if (a.purpose === "continual_retest" && a.status === "expired") {
     label = ["Retest expired", "warn"];
   }
-  const failureLabel = validatorFailureLabel(a.failure_reason);
+  const failureLabel = validatorFailureLabel(a.failure_reason, a.failure_code);
   const priorFailure =
     !!failureLabel &&
     (a.status === "scored" ||
       Boolean(a.failed_at && a.issued_at && new Date(a.failed_at) < new Date(a.issued_at)));
   const currentFailure = !!failureLabel && !priorFailure;
-  if (!a.actively_running && currentFailure) label = [failureLabel + " · deferred", "warn"];
+  if (!a.actively_running && currentFailure) {
+    label =
+      a.failure_code === "inference_allowance_exhausted"
+        ? [failureLabel, "bad"]
+        : [failureLabel + " · deferred", "warn"];
+  }
   const continual = a.purpose === "continual_retest";
   const canonical = a.purpose === "canonical_quorum";
   const purposeLabel = continual
@@ -110,9 +119,11 @@ export function validationAttemptView(a: ValidationAttempt): ValidationAttemptVi
         ? "Legacy lease draining · "
         : "Legacy lease unclassified · ";
   const retryTip =
-    canonical && (a.actively_running ? "running" : a.status) === "expired"
-      ? VALIDATOR_RETRY_EXPLANATION
-      : null;
+    a.failure_code === "inference_allowance_exhausted" && currentFailure
+      ? "The agent exhausted its request or token allowance, or sent one request larger than the run token allowance. It is not validator infrastructure and does not receive an automatic infrastructure retry."
+      : canonical && (a.actively_running ? "running" : a.status) === "expired"
+        ? VALIDATOR_RETRY_EXPLANATION
+        : null;
   let meta = "";
   if (a.actively_running) meta += " is running the benchmark";
   else if (a.status === "issued") meta += " has this assignment";
@@ -120,7 +131,9 @@ export function validationAttemptView(a: ValidationAttempt): ValidationAttemptVi
   else meta += " submitted a score";
   const attemptCount = Number((a as { attempt_count?: number | null }).attempt_count) || 1;
   if (attemptCount > 1) meta += " on attempt " + attemptCount;
-  if (currentFailure) meta += " · reported " + failureLabel.toLowerCase();
+  if (currentFailure && a.failure_code === "inference_allowance_exhausted") {
+    meta += " · exceeded the run inference allowance";
+  } else if (currentFailure) meta += " · reported " + failureLabel.toLowerCase();
   else if (priorFailure) meta += " · an earlier attempt reported " + failureLabel.toLowerCase();
   if (a.deadline && (a.actively_running || a.status === "issued")) {
     meta += " · score due " + new Date(a.deadline).toLocaleString();

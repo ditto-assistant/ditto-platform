@@ -2140,10 +2140,42 @@ class PublicValidationAttempt(BaseModel):
     failure_reason: Literal["infrastructure", "scoring_error", "sandbox_oom"] | None = (
         None
     )
+    failure_code: Literal["inference_allowance_exhausted"] | None = None
+    """Allowlisted terminal cause behind ``failure_reason``.
+
+    The validator's free-form diagnostic remains private. This field publishes
+    only machine codes whose meaning is safe and useful to a miner; it is never
+    derived from arbitrary message text.
+    """
     failed_at: datetime | None = None
     attempt_count: Annotated[int, Field(ge=1)] = 1
     """Leases issued to this validator for this agent/bench version. Greater
     than one means earlier attempts preceded the one described here."""
+
+
+class PublicInferenceRun(BaseModel):
+    """Platform-metered inference spend for one validator benchmark lease.
+
+    One inference grant is minted per lease, so this is the durable run-level
+    accounting ledger. It exposes aggregate counts and cost only: no provider
+    route, prompts, responses, request bodies, or per-case content.
+    """
+
+    validator_hotkey: Annotated[str, Field(pattern=_SS58_PATTERN)]
+    bench_version: Annotated[int, Field(ge=1)]
+    ticket_deadline: datetime
+    status: Literal["pending", "active", "revoked", "exhausted"]
+    request_budget: Annotated[int, Field(ge=1)]
+    requests: Annotated[int, Field(ge=0)]
+    prompt_tokens: Annotated[int, Field(ge=0)]
+    completion_tokens: Annotated[int, Field(ge=0)]
+    token_budget: Annotated[int, Field(ge=1)]
+    embedding_requests: Annotated[int, Field(ge=0)]
+    embedding_tokens: Annotated[int, Field(ge=0)]
+    cost_microusd: Annotated[int, Field(ge=0)]
+    accounting_version: Annotated[int, Field(ge=1)]
+    created_at: datetime
+    updated_at: datetime
 
 
 class PublicConfirmationScore(BaseModel):
@@ -2442,6 +2474,7 @@ class PublicSubmissionPipeline(BaseModel):
     ]
     screening_attempts: list[PublicScreeningAttempt] = Field(default_factory=list)
     validation_attempts: list[PublicValidationAttempt] = Field(default_factory=list)
+    inference_runs: list[PublicInferenceRun] = Field(default_factory=list)
     dispute: PublicScreeningDispute | None = None
 
 

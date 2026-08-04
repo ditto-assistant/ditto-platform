@@ -90,6 +90,7 @@ from ditto.api_models import (
     PublicEfficiencyStatus,
     PublicEmissionRecipient,
     PublicHealthResponse,
+    PublicInferenceRun,
     PublicKothEmissions,
     PublicLeaderboardEntry,
     PublicLeaderboardResponse,
@@ -203,6 +204,7 @@ from ditto.db.models import (
     BenchmarkDataset,
     BenchmarkRollout,
     ConfirmationScore,
+    InferenceGrant,
     Score,
     ScreeningDispute,
     ScreeningQuarantine,
@@ -4422,6 +4424,17 @@ async def agent_pipeline(
             )
         )
     )
+    inference_grants = list(
+        await session.scalars(
+            select(InferenceGrant)
+            .where(InferenceGrant.agent_id == agent_id)
+            .order_by(
+                InferenceGrant.created_at,
+                InferenceGrant.validator_hotkey,
+                InferenceGrant.ticket_deadline,
+            )
+        )
+    )
     now = datetime.now(UTC)
     active_work = [
         work
@@ -4736,10 +4749,38 @@ async def agent_pipeline(
                     Literal["infrastructure", "scoring_error", "sandbox_oom"] | None,
                     ticket.failure_reason,
                 ),
+                failure_code=(
+                    "inference_allowance_exhausted"
+                    if ticket.failure_detail == "inference_allowance_exhausted"
+                    else None
+                ),
                 failed_at=ticket.failed_at,
                 attempt_count=ticket.attempt_count,
             )
             for ticket in tickets
+        ],
+        inference_runs=[
+            PublicInferenceRun(
+                validator_hotkey=grant.validator_hotkey,
+                bench_version=grant.bench_version,
+                ticket_deadline=grant.ticket_deadline,
+                status=cast(
+                    Literal["pending", "active", "revoked", "exhausted"],
+                    grant.status,
+                ),
+                request_budget=grant.request_budget,
+                requests=grant.request_count,
+                prompt_tokens=grant.prompt_tokens,
+                completion_tokens=grant.completion_tokens,
+                token_budget=grant.token_budget,
+                embedding_requests=grant.embedding_request_count,
+                embedding_tokens=grant.embedding_tokens,
+                cost_microusd=grant.cost_microusd + grant.embedding_cost_microusd,
+                accounting_version=grant.usage_accounting_version,
+                created_at=grant.created_at,
+                updated_at=grant.updated_at,
+            )
+            for grant in inference_grants
         ],
         dispute=_public_dispute(dispute) if dispute is not None else None,
     )
