@@ -102,7 +102,7 @@ class AdminRetirementRequest(BaseModel):
     expected_snapshot: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
     reason: Annotated[
         str,
-        StringConstraints(strip_whitespace=True, min_length=8, max_length=500),
+        StringConstraints(strip_whitespace=True, min_length=8),
     ]
     confirmation: Literal["RETIRE PREVIOUS GENERATION"]
 
@@ -133,7 +133,7 @@ class AdminRetirementBatchRequest(BaseModel):
 
     reason: Annotated[
         str,
-        StringConstraints(strip_whitespace=True, min_length=8, max_length=500),
+        StringConstraints(strip_whitespace=True, min_length=8),
     ]
     confirmation: Literal["RETIRE PREVIOUS GENERATION"]
     items: Annotated[
