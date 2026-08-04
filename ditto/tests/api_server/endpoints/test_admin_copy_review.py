@@ -397,6 +397,52 @@ async def test_clearing_manual_hold_restores_live_status(
     assert resolved.json()["agent_status"] == AgentStatus.LIVE
 
 
+async def test_detailed_manual_hold_reasons_are_preserved_without_truncation(
+    app: FastAPI, client: httpx.AsyncClient, maker: async_sessionmaker[AsyncSession]
+) -> None:
+    agent_id, sha256 = await _seed_scored_agent(maker)
+    _install(app, maker)
+    hold_reason = "Detailed source evidence for the hold. " + "h" * 1_000
+    resolution_reason = (
+        "Detailed adjudication evidence for the decision. " + "r" * 1_000
+    )
+
+    opened = await client.post(
+        f"/api/v1/admin/copy-reviews/{agent_id}/open",
+        json={
+            "expected_sha256": sha256,
+            "expected_score_count": 3,
+            "reason": hold_reason,
+        },
+        headers=_HEADERS,
+    )
+    assert opened.status_code == 200
+    assert opened.json()["review"]["original"]["reason"] == hold_reason
+
+    resolved = await client.post(
+        f"/api/v1/admin/copy-reviews/{agent_id}/resolve",
+        json={"resolution": "clear", "reason": resolution_reason},
+        headers=_HEADERS,
+    )
+    assert resolved.status_code == 200
+    assert resolved.json()["review"]["resolution_reason"] == resolution_reason
+
+    audit = await client.get(
+        f"/api/v1/admin/copy-reviews/{agent_id}/audit", headers=_HEADERS
+    )
+    assert audit.status_code == 200
+    assert audit.json()["action_history"][-1]["reason"] == resolution_reason
+
+    async with maker() as session:
+        agent = await session.get(Agent, agent_id)
+        review = await session.scalar(
+            select(AthReview).where(AthReview.agent_id == agent_id)
+        )
+        assert agent is not None and review is not None
+        assert agent.review_reason == hold_reason
+        assert review.resolution_reason == resolution_reason
+
+
 async def test_resolved_review_reopens_without_rewriting_original_evidence(
     app: FastAPI, client: httpx.AsyncClient, maker: async_sessionmaker[AsyncSession]
 ) -> None:

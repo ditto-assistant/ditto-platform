@@ -207,9 +207,7 @@ class AdminCopyReviewResolveRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     # release/ban remain accepted for Backroom #20 wire compatibility.
     resolution: Literal["clear", "reject", "release", "ban"]
-    reason: Annotated[
-        str, StringConstraints(strip_whitespace=True, min_length=3, max_length=500)
-    ]
+    reason: Annotated[str, StringConstraints(strip_whitespace=True, min_length=3)]
 
 
 class AdminCopyReviewOpenRequest(BaseModel):
@@ -218,9 +216,7 @@ class AdminCopyReviewOpenRequest(BaseModel):
         str, StringConstraints(strip_whitespace=True, pattern=r"^[0-9a-f]{64}$")
     ]
     expected_score_count: Annotated[int, Field(ge=0)]
-    reason: Annotated[
-        str, StringConstraints(strip_whitespace=True, min_length=3, max_length=500)
-    ]
+    reason: Annotated[str, StringConstraints(strip_whitespace=True, min_length=3)]
 
 
 class AdminCopyReviewOpenResponse(BaseModel):

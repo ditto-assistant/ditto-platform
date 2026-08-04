@@ -530,7 +530,7 @@ class AthReview(Base):
             "AND resolution IS NOT NULL "
             "AND resolution IN ('clear', 'reject') "
             "AND resolution_reason IS NOT NULL "
-            "AND length(trim(resolution_reason)) BETWEEN 3 AND 500)",
+            "AND length(trim(resolution_reason)) >= 3)",
             name="ath_reviews_lifecycle_check",
         ),
         Index("ath_reviews_status_opened_idx", "status", "opened_at", "review_id"),
@@ -561,7 +561,7 @@ class AthReviewAction(Base):
             name="ath_review_actions_action_check",
         ),
         CheckConstraint(
-            "length(trim(reason)) BETWEEN 3 AND 500",
+            "length(trim(reason)) >= 3",
             name="ath_review_actions_reason_check",
         ),
         CheckConstraint(
