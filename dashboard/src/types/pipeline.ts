@@ -55,10 +55,10 @@ export type AthSnapshot = ActivityPayloadBase<AthReview>;
 /**
  * `/public/agent/{id}/summary` — glance-level state for opening ONE agent card
  * (`PublicAgentSummary`, #648). It is the direct-link hot path: the screening,
- * score, and validator histories are deliberately absent, and the drawer loads
- * `PipelinePayload` only once a reader expands that evidence. `score_composite`
- * and `active_benchmarks` are what let the summary alone state where the
- * submission stands.
+ * score, and validator histories are deliberately absent. The drawer starts
+ * this summary and `PipelinePayload` concurrently. `score_composite` and
+ * `active_benchmarks` let the summary paint where the submission stands
+ * without waiting on history.
  */
 export interface AgentSummaryPayload extends ActivityEntry {
   generated_at?: string;

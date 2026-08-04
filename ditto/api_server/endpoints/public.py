@@ -4241,8 +4241,8 @@ async def agent_summary(
 
     This route is the direct-link hot path. It deliberately avoids the global
     activity population, queue preview, artifact-release calculation, and full
-    attempt/score history. Those remain available from the deferred pipeline
-    route when the reader expands the evidence.
+    attempt/score history. Those remain available from the independent pipeline
+    route, which clients may load concurrently without blocking this response.
     """
     response.headers["Cache-Control"] = "public, max-age=10"
     now = datetime.now(UTC)

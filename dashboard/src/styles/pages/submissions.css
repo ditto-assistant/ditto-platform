@@ -229,44 +229,77 @@
 .pipeline-history {
   display: grid;
   gap: var(--detail-space-xl);
-  padding-top: var(--detail-space-xl);
 }
-/* The deferred-history disclosure (#648). The summary states the cost of
-   opening it in the affordance itself — "Load details", not a bare caret —
-   because the click is a fetch, not a reveal. */
-.pipeline-history-disclosure {
+.pipeline-history-region {
   margin-top: var(--detail-space-xl);
   border-top: 1px solid color-mix(in oklab, var(--border) 72%, transparent);
+  padding-top: var(--detail-space-lg);
 }
-.pipeline-history-disclosure > summary {
+.pipeline-history-heading {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: var(--detail-space-md);
-  padding: var(--detail-space-lg) 0;
+}
+.pipeline-history-heading h4 {
+  margin: 0;
   color: var(--text);
   font-size: 13px;
   font-weight: 750;
-  cursor: pointer;
-  list-style: none;
 }
-.pipeline-history-disclosure > summary::-webkit-details-marker {
-  display: none;
-}
-.pipeline-history-disclosure > summary::after {
-  content: "Load details";
+.pipeline-refreshing,
+.pipeline-loading-kicker {
   color: var(--text-faint);
   font: 650 10.5px/1.3 var(--mono);
+  letter-spacing: 0.04em;
   text-transform: uppercase;
 }
-.pipeline-history-disclosure[open] > summary::after {
-  content: "Hide details";
+.pipeline-history-body {
+  padding-top: var(--detail-space-md);
 }
-.pipeline-history-disclosure > summary:hover {
-  color: var(--accent);
+.pipeline-section-loading {
+  display: grid;
+  gap: var(--detail-space-sm);
+  margin-top: var(--detail-space-lg);
+  padding: var(--detail-space-lg) 0;
+  border-top: 1px solid color-mix(in oklab, var(--border) 62%, transparent);
 }
-.pipeline-history-disclosure-body[aria-busy="true"] {
+.pipeline-loading-line,
+.pipeline-skeleton-section {
+  display: block;
+  border-radius: 6px;
+  background: color-mix(in oklab, var(--text-faint) 18%, transparent);
+  animation: pulse 1.4s ease-in-out infinite;
+}
+.pipeline-loading-line {
+  width: min(420px, 76%);
+  height: 14px;
+}
+.pipeline-history-skeleton {
+  display: grid;
+  gap: var(--detail-space-md);
   color: var(--text-faint);
+  font-size: 12.5px;
+}
+.pipeline-skeleton-section {
+  width: 100%;
+  height: 76px;
+}
+.pipeline-skeleton-section.short {
+  width: min(560px, 72%);
+  height: 54px;
+}
+.pipeline-history-error {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--detail-space-md);
+  padding: var(--detail-space-md) 0;
+  color: var(--warn);
+}
+.pipeline-history-error p {
+  margin: 0;
 }
 .pipeline-section-heading {
   display: flex;

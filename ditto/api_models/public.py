@@ -2293,8 +2293,8 @@ class PublicAgentSummary(BaseModel):
     """Glance-level state for opening one agent card.
 
     The full screening, score, and validator histories are intentionally absent.
-    Clients load ``PublicSubmissionPipeline`` only when the reader expands that
-    evidence.
+    Clients can request ``PublicSubmissionPipeline`` concurrently while using
+    this smaller response for the first paint.
     """
 
     generated_at: datetime

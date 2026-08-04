@@ -56,6 +56,24 @@ describe("getJSON", () => {
     await expect(getJSON("/x")).rejects.toBe(failure);
   });
 
+  it("cancels a request when its query signal becomes obsolete", async () => {
+    const queryController = new AbortController();
+    const mock = stubFetch(
+      (_url, init) =>
+        new Promise<Response>((_resolve, reject) => {
+          init.signal?.addEventListener("abort", () => {
+            reject(new DOMException("The operation was aborted.", "AbortError"));
+          });
+        }),
+    );
+    const pending = getJSON("/agent/old", queryController.signal);
+    queryController.abort("route changed");
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    const call = mock.mock.calls[0];
+    expect(call).toBeDefined();
+    expect((call as Parameters<FetchFn>)[1].signal).toHaveProperty("aborted", true);
+  });
+
   it("aborts the request after the 8s timeout", async () => {
     vi.useFakeTimers();
     stubFetch(
