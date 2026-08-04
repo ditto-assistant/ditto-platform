@@ -2525,14 +2525,20 @@ async def request_job(
             if (
                 heartbeat_capabilities is not None
                 and heartbeat_capabilities.scorer_benchmarks is not None
-                and target_version >= 7
             ):
                 v7_calibration = heartbeat_capabilities.scorer_benchmarks.v7_calibration
             if heartbeat_capabilities is None or (
                 heartbeat is None
                 or heartbeat.protocol_version < (11 if target_version >= 7 else 10)
                 or not heartbeat_capabilities.ticket_inference
-                or (target_version >= 7 and v7_calibration is None)
+                or (
+                    target_version == 7
+                    and (
+                        heartbeat_capabilities.scorer_benchmarks is None
+                        or heartbeat_capabilities.scorer_benchmarks.v7_calibration
+                        is None
+                    )
+                )
             ):
                 target_inference_ready = False
         slot_id = payload.slot_id or "slot-0"
@@ -3857,7 +3863,10 @@ async def request_top5_confirmation_job(
             except ValidationError as exc:
                 raise HTTPException(
                     status_code=428,
-                    detail="fresh benchmark v7 inference capability is required",
+                    detail=(
+                        f"fresh benchmark v{canonical_version} inference capability "
+                        "is required"
+                    ),
                 ) from exc
             if capabilities.scorer_benchmarks is not None:
                 v7_calibration = capabilities.scorer_benchmarks.v7_calibration
@@ -3865,11 +3874,14 @@ async def request_top5_confirmation_job(
                 heartbeat is None
                 or heartbeat.protocol_version < 11
                 or not capabilities.ticket_inference
-                or v7_calibration is None
+                or (canonical_version == 7 and v7_calibration is None)
             ):
                 raise HTTPException(
                     status_code=428,
-                    detail="fresh benchmark v7 inference capability is required",
+                    detail=(
+                        f"fresh benchmark v{canonical_version} inference capability "
+                        "is required"
+                    ),
                 )
         emission_members, wave_members, members = await _current_retest_cohort(
             session,
