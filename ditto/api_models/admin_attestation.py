@@ -96,5 +96,5 @@ class AdminOwnerAttestationsResponse(BaseModel):
 class AdminAttestationRevokeRequest(BaseModel):
     """Body of ``POST /admin/owner-attestations/{attestation_id}/revoke``."""
 
-    reason: Annotated[str, Field(min_length=8, max_length=500)]
+    reason: Annotated[str, Field(min_length=8)]
     """Why the link is being withdrawn. Recorded on the row for audit."""

@@ -208,7 +208,7 @@ class AdminValidationRetryRequest(BaseModel):
     expected_snapshot: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
     reason: Annotated[
         str,
-        StringConstraints(strip_whitespace=True, min_length=3, max_length=500),
+        StringConstraints(strip_whitespace=True, min_length=3),
     ]
 
 
@@ -224,7 +224,7 @@ class AdminValidationQueueWithdrawalRequest(BaseModel):
     expected_snapshot: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
     reason: Annotated[
         str,
-        StringConstraints(strip_whitespace=True, min_length=8, max_length=500),
+        StringConstraints(strip_whitespace=True, min_length=8),
     ]
     confirmation: Literal["REMOVE FROM VALIDATOR QUEUE"]
 
@@ -255,7 +255,7 @@ class AdminValidationQueueEvictionRequest(BaseModel):
     expected_snapshot: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
     reason: Annotated[
         str,
-        StringConstraints(strip_whitespace=True, min_length=8, max_length=500),
+        StringConstraints(strip_whitespace=True, min_length=8),
     ]
     confirmation: Literal["EVICT LIVE VALIDATOR LEASES"]
 
@@ -299,7 +299,7 @@ class AdminValidationQueueReinstatementRequest(BaseModel):
     """Return an operator-removed submission to the queue in its own era.
 
     Carries the same three interlocks as the two removal routes — an exact
-    ``expected_snapshot``, a written ``reason`` of the same 8–500 characters, and
+    ``expected_snapshot``, a written ``reason`` of the same at least 8 characters, and
     a literal confirmation phrase — because reversing an emissions-relevant
     action against a paying miner deserves the same deliberation as taking it.
 
@@ -316,7 +316,7 @@ class AdminValidationQueueReinstatementRequest(BaseModel):
     expected_snapshot: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
     reason: Annotated[
         str,
-        StringConstraints(strip_whitespace=True, min_length=8, max_length=500),
+        StringConstraints(strip_whitespace=True, min_length=8),
     ]
     confirmation: Literal["REINSTATE TO VALIDATOR QUEUE"]
 
@@ -353,7 +353,7 @@ class AdminBatchRetryRequest(BaseModel):
 
     reason: Annotated[
         str,
-        StringConstraints(strip_whitespace=True, min_length=3, max_length=500),
+        StringConstraints(strip_whitespace=True, min_length=3),
     ]
     items: Annotated[list[AdminBatchRetryItem], Field(min_length=1, max_length=100)]
 
@@ -409,7 +409,7 @@ class AdminValidatorScoreReplacementRequest(BaseModel):
     ]
     reason: Annotated[
         str,
-        StringConstraints(strip_whitespace=True, min_length=8, max_length=500),
+        StringConstraints(strip_whitespace=True, min_length=8),
     ]
 
 
@@ -440,7 +440,7 @@ class AdminValidatorScoreRetestQueueRequest(BaseModel):
 
     reason: Annotated[
         str,
-        StringConstraints(strip_whitespace=True, min_length=8, max_length=500),
+        StringConstraints(strip_whitespace=True, min_length=8),
     ]
     items: Annotated[
         list[AdminValidatorScoreRetestQueueItem], Field(min_length=1, max_length=100)
@@ -483,7 +483,7 @@ class AdminValidatorScoreRetestReleaseRequest(BaseModel):
     expected_deadline: datetime
     reason: Annotated[
         str,
-        StringConstraints(strip_whitespace=True, min_length=8, max_length=500),
+        StringConstraints(strip_whitespace=True, min_length=8),
     ]
 
 
