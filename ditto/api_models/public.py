@@ -421,6 +421,21 @@ class PublicSubmissionFamily(BaseModel):
     members: list[PublicSubmissionFamilyMember] = Field(default_factory=list)
 
 
+class PublicLeaderboardFamilyMember(BaseModel):
+    """One compact, unranked child in a leaderboard owner grouping."""
+
+    agent_id: UUID
+    agent_name: str
+    agent_version: Annotated[int | None, Field(default=None, ge=1)] = None
+    canonical_composite: Annotated[float, Field(gt=0.0, le=1.0)]
+
+
+class PublicLeaderboardFamily(BaseModel):
+    """Only the grouped children needed by the expandable leaderboard row."""
+
+    members: list[PublicLeaderboardFamilyMember] = Field(default_factory=list)
+
+
 class PublicLeaderboardEntry(BaseModel):
     """One miner's best score, aggregate-only, for public display.
 
@@ -518,12 +533,12 @@ class PublicLeaderboardEntry(BaseModel):
         ),
     ] = None
     artifact_release: PublicArtifactRelease | None = None
-    submission_family: PublicSubmissionFamily | None = Field(
+    submission_family: PublicLeaderboardFamily | None = Field(
         default=None,
         description=(
-            "Finalized, full-benchmark submissions sharing this entry's payment-"
-            "time ownership slot. The representative is the only independently "
-            "ranked member; the others remain visible for score transparency."
+            "Compact finalized children sharing this entry's owner slot. Only "
+            "identity/version and canonical score are included; full family "
+            "evidence is loaded from the agent detail endpoint."
         ),
     )
     miner_hotkey: Annotated[
@@ -2244,6 +2259,11 @@ class PublicProvisionalScore(BaseModel):
     model_use: PublicModelUse | None = None
     token_efficiency: PublicTokenEfficiency | None = None
     composite_breakdown: PublicCompositeBreakdown | None = None
+    calibration_brier: Annotated[
+        float | None,
+        Field(default=None, ge=0.0, le=1.0, description="Advisory Brier score."),
+    ] = None
+    calibration_n: Annotated[int | None, Field(default=None, ge=0)] = None
     seed: Annotated[
         str,
         Field(
