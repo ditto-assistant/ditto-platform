@@ -1,10 +1,10 @@
 {
   "bundles": {
-    "reference_lexical_v2.bin": 137352,
-    "reference_normalized_v2.bin": 120312,
-    "reference_prompt_v2.bin": 226601
+    "reference_lexical_v2.bin": 138274,
+    "reference_normalized_v2.bin": 121147,
+    "reference_prompt_v2.bin": 226952
   },
-  "commit_set_sha256": "2963f9c74d79261fd95b5a60a6ab6e9d20e7e62ef567d8e7dba6ef661f4f2ca8",
+  "commit_set_sha256": "0c8e9c6ab1303de2e42ae04c1d9ed41d15c8493f9f6aed1b94dfc8f4cce0d9d5",
   "commits": [
     "01481bc596d01de5291849bab5f6a53cb318682d",
     "095102e4c3b8027180da84c9f56c9ac76d9711fe",
@@ -33,6 +33,7 @@
     "64e9a99e188481148e4859df0496f7659dca8e37",
     "66cc92e1814cb365e6adf2a287bbecd0f198e5a7",
     "69540a98ab26a4900ad0d2fcd73783a429af6b0e",
+    "6e1efb112a0d53f01ed5a043d3d4a23ad3f50c98",
     "6e5375e90d4c92285dbf26872532ba113b0a417b",
     "7084c489f45f50e973316b1651761c11753804ec",
     "7b027482624dcf85bd712e579549dc7d85ca3123",
@@ -45,6 +46,7 @@
     "a702798327cedb877bb7dac1d08d88a97d618ecf",
     "a7434c5648a995996ec1f3f09fc85174443ab398",
     "a81db807696d8175aa0d0a308146f67b9f329561",
+    "aa15654130e1fe3c67b531191786ac8bd4d59d1b",
     "ae3dd10975cd7c6a7f64cbcb956db0c85a2b2797",
     "b11934ee7687e5dfc0569d9e75c619676b399058",
     "b2660315527d28657f76d519afc12bd6d2fa9649",
@@ -61,7 +63,7 @@
   ],
   "format": "sorted-big-endian-uint64-v1",
   "requested_revision": "origin/main",
-  "revision": "e7a9187eeceedd89658dce34bc41a90eddaf5533",
+  "revision": "aa15654130e1fe3c67b531191786ac8bd4d59d1b",
   "source": "https://github.com/ditto-assistant/dittobench-starter-kit",
-  "unique_blobs": 245
+  "unique_blobs": 260
 }
