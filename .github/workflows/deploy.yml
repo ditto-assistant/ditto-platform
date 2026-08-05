@@ -203,10 +203,10 @@ jobs:
         # GitHub secret (a public on-chain receive address); update.sh upserts it
         # into the VM's .env.deploy before (re)starting. The workflow checks out
         # the target first so the first deployment of an updater change executes
-        # the new script rather than the old process inode. The optional Taostats
-        # API key is read on the VM from `platform-taostats-api-key` in Secret
-        # Manager via the attached runtime service account, never passed through
-        # this job.
+        # the new script rather than the old process inode. Optional Taostats and
+        # archive-RPC API keys are read on the VM from Secret Manager via the
+        # attached runtime service account, never passed through this job. A
+        # missing archive key leaves the public archive fallback active.
         #
         # This checkout deliberately duplicates update.sh's own fetch/reset, and
         # it is the reason update.sh cannot simply "migrate before checking out":
