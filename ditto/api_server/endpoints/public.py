@@ -314,7 +314,7 @@ router = APIRouter(prefix="/public", tags=["public"])
 # instead of showing empty panels for a round trip. The window is deliberately
 # short here, so a stale board is never more than a couple of minutes old.
 _CACHE_CONTROL = "public, max-age=30, stale-while-revalidate=120"
-_OPERATIONS_CACHE_CONTROL = "public, max-age=5"
+_OPERATIONS_CACHE_CONTROL = "public, max-age=5, stale-while-revalidate=30"
 _TIMELINE_CACHE_CONTROL = "public, max-age=300, stale-while-revalidate=3600"
 # v1 predates the memory subscore, so it has nothing to plot on this axis.
 _TIMELINE_MIN_BENCH_VERSION = 2
