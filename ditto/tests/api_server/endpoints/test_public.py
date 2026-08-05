@@ -2698,6 +2698,7 @@ class TestPublicLeaderboard:
         assert entry["agent_id"] == representative
         family = entry["submission_family"]
         assert family["member_count"] == 2
+        assert family["selection_rule"] == "best_official_score_per_payment_owner"
         assert [member["agent_id"] for member in family["members"]] == [
             representative,
             hidden_generation,
