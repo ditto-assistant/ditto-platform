@@ -442,6 +442,7 @@ class TestContinuationFloor:
 
         assert rows
         details = rows[0].details
+        assert isinstance(details, dict)
         assert set(details) == {"composite_stderr", "confirmation_seeds"}
         assert details["confirmation_seeds"] is None
 
